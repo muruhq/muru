@@ -867,7 +867,16 @@ impl LinkPool {
             let waiting = Waiting(&self.waiting);
             let (permit, borrowed) = worker.take(mount, upgrade).await?;
             drop(waiting);
-            let idle = worker.idle.lock().expect("pool poisoned").pop();
+
+            // A request sent again (issue 986) takes a new connection:
+            // one kept idle may lead to the worker that would not take
+            // it, a connection that worker has yet to close having come
+            // back from another request since.
+
+            let idle = match avoid {
+                Some(_) => None,
+                None => worker.idle.lock().expect("pool poisoned").pop(),
+            };
 
             // Section 4.8: a worker that cannot be connected to has seen
             // nothing of the request, so another is tried while one is left;
@@ -899,6 +908,17 @@ impl LinkPool {
                 woken: None,
             });
         }
+    }
+
+    /// Close the idle connections kept to a worker: one of them has
+    /// shown the worker to be stopping or gone, and the rest lead to the
+    /// same process (issue 986).
+    fn forget_idle(&self, worker: usize) {
+        self.workers[worker]
+            .idle
+            .lock()
+            .expect("pool poisoned")
+            .clear();
     }
 
     fn put_back(&self, worker: usize, conn: Conn) {
@@ -2057,286 +2077,345 @@ async fn handle_inner(
     let mut avoid: Option<usize> = None;
     let mut retried = false;
 
-    let (back, mut reader, mut writer, end, upgrading) = loop {
-        let queued = Instant::now();
+    // Section 5.3 (issue 986): a worker that is stopping says so in
+    // place of a response to a request it did not start, and that
+    // request goes once more as well, when all of it is still here to
+    // send.
 
-        let acquired = tokio::time::timeout(
-            queue_timeout,
-            pool.acquire_avoiding(&head.mount, avoid, upgrade.is_some()),
-        )
-        .await;
+    let (back, mut reader, response, upgrading, dispatched) = 'send: loop {
+        let (back, mut reader, mut writer, end, upgrading) = loop {
+            let queued = Instant::now();
 
-        // The time waited is recorded whether a worker was found or not,
-        // so a 503 for a full queue logs the whole wait.
+            let acquired = tokio::time::timeout(
+                queue_timeout,
+                pool.acquire_avoiding(&head.mount, avoid, upgrade.is_some()),
+            )
+            .await;
 
-        recording.record.queue = queued.elapsed();
+            // The time waited is recorded whether a worker was found or not,
+            // so a 503 for a full queue logs the whole wait.
 
-        let lease = match acquired {
-            Ok(Ok(lease)) => lease,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "no worker connection");
-                let mut problem = Problem::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "no_workers",
-                    "No worker is available to handle the request.",
-                );
-                problem.retry_after = Some(1);
-                *failing.recording.lock().expect("recording poisoned") = Some(recording);
-                return failing.respond(problem);
-            }
-            Err(_) => {
-                // Section 7.6: the queue wait is bounded by queue_timeout.
-                // A pool waiting for a wake had no worker to be busy: the
-                // group was at zero, its host was starting, or its
-                // workers were on their way (section 7.4).
+            recording.record.queue = queued.elapsed();
 
-                let mut problem = if pool.wakes().is_some() {
-                    Problem::new(
+            let lease = match acquired {
+                Ok(Ok(lease)) => lease,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "no worker connection");
+                    let mut problem = Problem::new(
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "cold_start_timeout",
-                        "No worker had started for the request within the queue timeout.",
-                    )
-                } else {
-                    Problem::new(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "queue_full",
-                        "Every worker stayed busy for the whole queue timeout.",
-                    )
-                };
-                problem.retry_after = Some(1);
-                *failing.recording.lock().expect("recording poisoned") = Some(recording);
-                return failing.respond(problem);
-            }
-        };
-
-        let Lease {
-            conn,
-            permit,
-            worker,
-            number,
-            borrowed,
-            on_loop,
-            websockets,
-            records,
-            woken,
-        } = lease;
-        head.borrowed = borrowed;
-
-        if let Some(woken) = woken {
-            pool = woken;
-        }
-
-        let Conn { reader, mut writer } = conn;
-        recording.record.worker = Some(number);
-        recording.record.retried = retried;
-        recording.in_flight.dispatched(number, on_loop);
-
-        // Section 5.6: a worker that takes websocket scopes gets the
-        // upgrade as one, with no body; any other worker sees an ordinary
-        // request.
-
-        let upgrading = upgrade.is_some() && websockets;
-        head.scope = if upgrading {
-            pb::Scope::Websocket as i32
-        } else {
-            pb::Scope::Http as i32
-        };
-
-        // Section 11.7: a development run that keeps records asks the
-        // worker for its part of the record of a client's request, sent
-        // after the response; not for a sub-request of the edge's own.
-
-        let noted = context
-            .noted
-            .as_ref()
-            .filter(|noted| noted.recorded())
-            .filter(|_| records && !upgrading && !precheck && context.handler.is_none());
-        head.record = noted.is_some();
-
-        let end = upgrading
-            || buffered.as_ref().map_or_else(
-                || body.as_ref().is_none_or(|body| body.is_end_stream()),
-                Bytes::is_empty,
-            );
-        let frame_flags = if end { flag::END } else { 0 };
-
-        // Section 5.7: stored uploads go with the request head, attached
-        // to its first bytes.
-
-        let written = match &received {
-            Some(upload) if !upload.files.is_empty() => {
-                let encoded = frame::encode(kind::REQUEST, frame_flags, &head.encode_to_vec());
-                muru_proto::descriptors::write_with_fds(&mut writer, &encoded, &upload.fds()).await
-            }
-            _ => {
-                frame::write(
-                    &mut writer,
-                    kind::REQUEST,
-                    frame_flags,
-                    head.encode_to_vec().into(),
-                )
-                .await
-            }
-        };
-
-        match written {
-            Ok(()) => {
-                let back = Return::new(Arc::clone(&pool), worker, permit);
-
-                if let Some(noted) = noted {
-                    back.expect_record(Arc::clone(noted));
+                        "no_workers",
+                        "No worker is available to handle the request.",
+                    );
+                    problem.retry_after = Some(1);
+                    *failing.recording.lock().expect("recording poisoned") = Some(recording);
+                    return failing.respond(problem);
                 }
+                Err(_) => {
+                    // Section 7.6: the queue wait is bounded by queue_timeout.
+                    // A pool waiting for a wake had no worker to be busy: the
+                    // group was at zero, its host was starting, or its
+                    // workers were on their way (section 7.4).
 
-                break (back, reader, writer, end, upgrading);
+                    let mut problem = if pool.wakes().is_some() {
+                        Problem::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "cold_start_timeout",
+                            "No worker had started for the request within the queue timeout.",
+                        )
+                    } else {
+                        Problem::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "queue_full",
+                            "Every worker stayed busy for the whole queue timeout.",
+                        )
+                    };
+                    problem.retry_after = Some(1);
+                    *failing.recording.lock().expect("recording poisoned") = Some(recording);
+                    return failing.respond(problem);
+                }
+            };
+
+            let Lease {
+                conn,
+                permit,
+                worker,
+                number,
+                borrowed,
+                on_loop,
+                websockets,
+                records,
+                woken,
+            } = lease;
+            head.borrowed = borrowed;
+
+            if let Some(woken) = woken {
+                pool = woken;
             }
-            Err(error) if !retried => {
-                tracing::debug!(%error, worker, "the worker closed its connection before reading the request; sending it again");
-                drop(permit);
-                retried = true;
-                avoid = Some(worker);
+
+            let Conn { reader, mut writer } = conn;
+            recording.record.worker = Some(number);
+            recording.record.retried = retried;
+            recording.in_flight.dispatched(number, on_loop);
+
+            // Section 5.6: a worker that takes websocket scopes gets the
+            // upgrade as one, with no body; any other worker sees an ordinary
+            // request.
+
+            let upgrading = upgrade.is_some() && websockets;
+            head.scope = if upgrading {
+                pb::Scope::Websocket as i32
+            } else {
+                pb::Scope::Http as i32
+            };
+
+            // Section 11.7: a development run that keeps records asks the
+            // worker for its part of the record of a client's request, sent
+            // after the response; not for a sub-request of the edge's own.
+
+            let noted = context
+                .noted
+                .as_ref()
+                .filter(|noted| noted.recorded())
+                .filter(|_| records && !upgrading && !precheck && context.handler.is_none());
+            head.record = noted.is_some();
+
+            let end = upgrading
+                || buffered.as_ref().map_or_else(
+                    || body.as_ref().is_none_or(|body| body.is_end_stream()),
+                    Bytes::is_empty,
+                );
+            let frame_flags = if end { flag::END } else { 0 };
+
+            // Section 5.7: stored uploads go with the request head, attached
+            // to its first bytes.
+
+            let written = match &received {
+                Some(upload) if !upload.files.is_empty() => {
+                    let encoded = frame::encode(kind::REQUEST, frame_flags, &head.encode_to_vec());
+                    muru_proto::descriptors::write_with_fds(&mut writer, &encoded, &upload.fds())
+                        .await
+                }
+                _ => {
+                    frame::write(
+                        &mut writer,
+                        kind::REQUEST,
+                        frame_flags,
+                        head.encode_to_vec().into(),
+                    )
+                    .await
+                }
+            };
+
+            match written {
+                Ok(()) => {
+                    let back = Return::new(Arc::clone(&pool), worker, permit);
+
+                    if let Some(noted) = noted {
+                        back.expect_record(Arc::clone(noted));
+                    }
+
+                    break (back, reader, writer, end, upgrading);
+                }
+                Err(error) if !retried => {
+                    tracing::debug!(%error, worker, "the worker closed its connection before reading the request; sending it again");
+                    pool.forget_idle(worker);
+                    drop(permit);
+                    retried = true;
+                    avoid = Some(worker);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, worker, "writing the request head failed again");
+                    pool.forget_idle(worker);
+                    drop(permit);
+                    *failing.recording.lock().expect("recording poisoned") = Some(recording);
+                    return failing.respond(Problem::new(
+                        StatusCode::BAD_GATEWAY,
+                        "worker_unavailable",
+                        "The worker closed its connection before reading the request.",
+                    ));
+                }
             }
-            Err(error) => {
-                tracing::warn!(%error, worker, "writing the request head failed again");
-                drop(permit);
-                *failing.recording.lock().expect("recording poisoned") = Some(recording);
-                return failing.respond(Problem::new(
-                    StatusCode::BAD_GATEWAY,
-                    "worker_unavailable",
-                    "The worker closed its connection before reading the request.",
-                ));
-            }
+        };
+
+        let dispatched = Instant::now();
+        let _ = failing.dispatched.set(dispatched);
+        *failing.recording.lock().expect("recording poisoned") = Some(recording);
+
+        // The stored files stay until the request ends: an unnamed one
+        // vanishes with its last descriptor, a named one is removed. The
+        // request can be sent again while all of it is still here, which a
+        // body passed on as it arrives is not.
+
+        let mut resendable = true;
+
+        if let Some(upload) = received.take() {
+            back.hold(upload);
         }
+
+        match buffered.clone() {
+            _ if upgrading && upgrade.is_some() => back.give_writer(Some(writer)),
+            Some(data) if !data.is_empty() => {
+                match frame::write(&mut writer, kind::BODY, flag::END, data).await {
+                    Ok(()) => back.give_writer(Some(writer)),
+                    Err(error) => {
+                        tracing::warn!(%error, "writing the request body failed");
+                        back.give_writer(None);
+                    }
+                }
+            }
+            Some(_) => back.give_writer(Some(writer)),
+            None if end => back.give_writer(Some(writer)),
+            None => match body.take() {
+                Some(body) => {
+                    resendable = false;
+                    back.body_pending();
+                    tokio::spawn(pump_body(
+                        body,
+                        writer,
+                        Arc::clone(&back),
+                        expect_continue,
+                        limits.body_idle_timeout,
+                    ));
+                }
+                None => back.give_writer(Some(writer)),
+            },
+        }
+
+        let request_mount = head.mount.clone();
+
+        let response = loop {
+            let next =
+                match tokio::time::timeout_at(deadline.into(), frame::read(&mut reader)).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        // Section 7.6: the deadline cancels the request. Dropping
+                        // the connection stops the application's iteration.
+
+                        back.give_reader(None);
+                        back.abort_request();
+                        return failing.respond(Problem::new(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "deadline",
+                            "The application did not respond within the request deadline.",
+                        ));
+                    }
+                };
+
+            match next {
+                Ok(Some(next)) if next.kind == kind::CONTINUE => back.continue_request(),
+                Ok(Some(next)) if next.kind == kind::DETACH => {
+                    // Section 6.14: the request was handed across in the
+                    // worker, so it counts on the other side now.
+
+                    let detach = pb::Detach::decode(next.payload).unwrap_or_default();
+                    let to_loop = detach.target == pb::detach::Target::Loop as i32;
+                    back.detach(to_loop, &request_mount);
+
+                    if let Some(recording) = failing
+                        .recording
+                        .lock()
+                        .expect("recording poisoned")
+                        .as_mut()
+                    {
+                        recording.record.handoff = Some(if to_loop { "asgi" } else { "wsgi" });
+                        recording.in_flight.handed(to_loop);
+                    }
+                }
+                Ok(Some(next)) if next.kind == kind::RESPONSE => {
+                    if back.client_stalled.load(Ordering::Relaxed) {
+                        // The client stopped sending its body; what the worker
+                        // produced for a partial request is not delivered.
+
+                        back.give_reader(None);
+                        return failing.close(Problem::new(
+                            StatusCode::REQUEST_TIMEOUT,
+                            "client_timeout",
+                            "The request body stopped arriving.",
+                        ));
+                    }
+
+                    break next;
+                }
+                Ok(Some(next)) if next.kind == kind::END => {
+                    // The application failed before producing a head: the
+                    // worker says why, and the connection is still good.
+
+                    back.give_reader(Some(reader));
+                    back.abort_request();
+                    let end = pb::End::decode(next.payload).unwrap_or_default();
+                    return failing.worker_failed(end);
+                }
+                Ok(Some(next)) if next.kind == kind::STOPPING => {
+                    // The worker is stopping and did not start the request.
+                    // The other connections kept to it are as good as
+                    // closed, so they go, and the next one made to its path
+                    // reaches whatever listens there now.
+
+                    let again = resendable && !retried;
+                    let record = back.record.lock().expect("record poisoned").take();
+                    pool.forget_idle(back.worker);
+                    back.abort_request();
+                    let taken = failing.recording.lock().expect("recording poisoned").take();
+
+                    match taken {
+                        Some(taken) if again => {
+                            tracing::debug!(
+                                worker = back.worker,
+                                "the worker is stopping and did not start the request; sending it again"
+                            );
+                            received = back.uploads.lock().expect("uploads poisoned").take();
+                            back.give_reader(None);
+                            retried = true;
+                            avoid = Some(back.worker);
+                            recording = taken;
+                            continue 'send;
+                        }
+                        taken => {
+                            // The request's record is still owed by a
+                            // worker that will not send it.
+
+                            *back.record.lock().expect("record poisoned") = record;
+                            back.give_reader(None);
+                            *failing.recording.lock().expect("recording poisoned") = taken;
+                            return failing.respond(Problem::new(
+                                StatusCode::BAD_GATEWAY,
+                                "worker_unavailable",
+                                "The worker stopped before reading the request.",
+                            ));
+                        }
+                    }
+                }
+                Ok(Some(next)) => {
+                    // Issue 734: a frame out of place says something other
+                    // than a worker that went away, so the two are told apart.
+
+                    tracing::warn!(
+                        kind = next.kind,
+                        "the worker sent an unexpected frame before the response head"
+                    );
+                    back.give_reader(None);
+                    return failing.worker_crashed(&format!(
+                    "The worker sent an unexpected frame, of type {}, before the response head.",
+                    next.kind
+                ));
+                }
+                Ok(None) => {
+                    back.give_reader(None);
+                    return failing.worker_crashed("The worker sent no response head.");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "reading the response head failed");
+                    back.give_reader(None);
+                    return failing.worker_crashed("The worker failed.");
+                }
+            }
+        };
+
+        break 'send (back, reader, response, upgrading, dispatched);
     };
 
     let upgrade = upgrade.filter(|_| upgrading);
     let kept = buffered.clone();
-    let dispatched = Instant::now();
-    let _ = failing.dispatched.set(dispatched);
-    *failing.recording.lock().expect("recording poisoned") = Some(recording);
-
-    // The stored files stay until the request ends: an unnamed one
-    // vanishes with its last descriptor, a named one is removed.
-
-    if let Some(upload) = received {
-        back.hold(upload);
-    }
-
-    match buffered {
-        _ if upgrade.is_some() => back.give_writer(Some(writer)),
-        Some(data) if !data.is_empty() => {
-            match frame::write(&mut writer, kind::BODY, flag::END, data).await {
-                Ok(()) => back.give_writer(Some(writer)),
-                Err(error) => {
-                    tracing::warn!(%error, "writing the request body failed");
-                    back.give_writer(None);
-                }
-            }
-        }
-        Some(_) => back.give_writer(Some(writer)),
-        None if end => back.give_writer(Some(writer)),
-        None => match body.take() {
-            Some(body) => {
-                back.body_pending();
-                tokio::spawn(pump_body(
-                    body,
-                    writer,
-                    Arc::clone(&back),
-                    expect_continue,
-                    limits.body_idle_timeout,
-                ));
-            }
-            None => back.give_writer(Some(writer)),
-        },
-    }
-
-    let request_mount = head.mount.clone();
-
-    let response = loop {
-        let next = match tokio::time::timeout_at(deadline.into(), frame::read(&mut reader)).await {
-            Ok(next) => next,
-            Err(_) => {
-                // Section 7.6: the deadline cancels the request. Dropping
-                // the connection stops the application's iteration.
-
-                back.give_reader(None);
-                back.abort_request();
-                return failing.respond(Problem::new(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "deadline",
-                    "The application did not respond within the request deadline.",
-                ));
-            }
-        };
-
-        match next {
-            Ok(Some(next)) if next.kind == kind::CONTINUE => back.continue_request(),
-            Ok(Some(next)) if next.kind == kind::DETACH => {
-                // Section 6.14: the request was handed across in the
-                // worker, so it counts on the other side now.
-
-                let detach = pb::Detach::decode(next.payload).unwrap_or_default();
-                let to_loop = detach.target == pb::detach::Target::Loop as i32;
-                back.detach(to_loop, &request_mount);
-
-                if let Some(recording) = failing
-                    .recording
-                    .lock()
-                    .expect("recording poisoned")
-                    .as_mut()
-                {
-                    recording.record.handoff = Some(if to_loop { "asgi" } else { "wsgi" });
-                    recording.in_flight.handed(to_loop);
-                }
-            }
-            Ok(Some(next)) if next.kind == kind::RESPONSE => {
-                if back.client_stalled.load(Ordering::Relaxed) {
-                    // The client stopped sending its body; what the worker
-                    // produced for a partial request is not delivered.
-
-                    back.give_reader(None);
-                    return failing.close(Problem::new(
-                        StatusCode::REQUEST_TIMEOUT,
-                        "client_timeout",
-                        "The request body stopped arriving.",
-                    ));
-                }
-
-                break next;
-            }
-            Ok(Some(next)) if next.kind == kind::END => {
-                // The application failed before producing a head: the
-                // worker says why, and the connection is still good.
-
-                back.give_reader(Some(reader));
-                back.abort_request();
-                let end = pb::End::decode(next.payload).unwrap_or_default();
-                return failing.worker_failed(end);
-            }
-            Ok(Some(next)) => {
-                // Issue 734: a frame out of place says something other
-                // than a worker that went away, so the two are told apart.
-
-                tracing::warn!(
-                    kind = next.kind,
-                    "the worker sent an unexpected frame before the response head"
-                );
-                back.give_reader(None);
-                return failing.worker_crashed(&format!(
-                    "The worker sent an unexpected frame, of type {}, before the response head.",
-                    next.kind
-                ));
-            }
-            Ok(None) => {
-                back.give_reader(None);
-                return failing.worker_crashed("The worker sent no response head.");
-            }
-            Err(error) => {
-                tracing::warn!(%error, "reading the response head failed");
-                back.give_reader(None);
-                return failing.worker_crashed("The worker failed.");
-            }
-        }
-    };
 
     let response_end = response.is_end();
     let Ok(head) = pb::ResponseHead::decode(response.payload) else {

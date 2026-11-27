@@ -114,6 +114,40 @@ def test_a_debug_reply_larger_than_the_default_limit_arrives(runtime: Path) -> N
         server.stop()
 
 
+def test_a_control_connection_that_ends_is_made_again(runtime: Path) -> None:
+    """Issue 988: a run connects again to a host that closed its control
+    connection, and asks its workers things as before."""
+
+    server = start(runtime)
+
+    try:
+        # A host has one supervisor, so another connection to its control
+        # socket has it close the run's, as it does when a send to a run
+        # that has stalled does not complete.
+
+        [control] = runtime.rglob("control.sock")
+        other = socket.socket(socket.AF_UNIX)
+        other.connect(str(control))
+        again = "the control connection to the host ended and was made again"
+        assert server.wait_for_log(again), server.log()
+        other.close()
+
+        answer = muructl(
+            runtime,
+            "debug",
+            "exec",
+            "plain-wsgi",
+            "--worker",
+            "0",
+            "--",
+            "print(6 * 7)",
+            cwd=support.FIXTURES,
+        ).stdout
+        assert "42" in answer, answer
+    finally:
+        server.stop()
+
+
 def test_the_commands_reach_a_development_run(runtime: Path) -> None:
     server = start(runtime, args=["--timeout", "deadline=2s"])
 

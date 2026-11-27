@@ -48,6 +48,7 @@ Every frame is a six byte header followed by its payload: a 32 bit little-endian
 | FILE | 11 | worker to edge | FileHint | The response body is a range of the file whose descriptor is attached to the frame, or with the PATH_HINT flag a file the worker opened for a path hint (section 5.7). Phase 2 |
 | DETACH | 12 | worker to edge | Detach | The request moved from an application thread to the event loop, or back, so the edge counts it against async slots or slots accordingly (section 6.14) |
 | RECORD | 13 | worker to edge | WorkerRecord | The worker's part of a development run's request record, after the response's end, sent only when the request head asked for it (section 11.7) |
+| STOPPING | 14 | worker to edge | empty | The worker is stopping and takes no more requests on the connection, which it closes. A request the edge wrote on it that has had no frame of a response was not started (section 5.3) |
 
 Flags: END (0x01) on the last frame of a direction; TEXT (0x02) on a text MESSAGE; MORE (0x04) reserved for message fragments if max_message_size ever needs to be exceeded.
 
@@ -93,6 +94,8 @@ sequenceDiagram
 ```
 
 A connection is idle again when both directions have ended: the request direction with END, the END flag or ABORT, and the response direction with END or the END flag, followed by a RECORD frame when the request head asked for one (section 11.7). The edge reads that frame before it returns the connection to the pool, waiting up to 10 s for it, since with a declared Content-Length the body can end before the application's close() returns; a connection whose RECORD does not come is closed. Either side closing the connection abandons the request on it; the edge answers the client with 502 if no response head has been sent, and the worker stops the application's iteration.
+
+- **A worker that stops says so (issue 986, ADR 0089).** A worker told to stop takes no more requests. On each link connection it writes STOPPING and closes: at once on one with no request, and after the response, and the RECORD frame where one was asked for, on one that has a request. The edge keeps connections to a worker idle between requests and does not read them while they are idle, so it may write a request to one in the moment the worker stops; it then reads STOPPING where the response head would be, which says the request was not started, where a connection that only closed says nothing of how far the request got. The worker decides by one flag (`Shared::stop_link`): a connection waits for a request's first bytes or the flag, the flag first, and looks at the flag again once it has counted itself busy with the request, so the worker either waits for that request as one in flight or the connection answers STOPPING. A request no thread would take, the pools having closed, is answered STOPPING too. The worker keeps its runtime up to half a second at the end, within its stop budget, while a connection has still to write the frame. What the edge does with it is in section 4.8. An edge from before the frame takes it as a worker that failed, as it took the closed connection.
 
 ## 5.4 Streaming and flush policy
 

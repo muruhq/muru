@@ -12,6 +12,7 @@ import json
 import os
 import re
 import signal
+import socket
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -39,6 +40,42 @@ def serving_pid(server: support.Server) -> int | None:
 
     response = server.get("/info")
     return json.loads(response.body)["pid"] if response.status == 200 else None
+
+
+def sent_events(control: Path, wanted: int) -> list[dict[str, Any]]:
+    """Connect to a host's control socket as a supervisor does and return
+    the events it sends, up to the load, which follows the last of them
+    when none is wanted, acknowledging nothing."""
+
+    events: list[dict[str, Any]] = []
+
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(10)
+        connection.connect(str(control))
+        lines = connection.makefile("rb")
+        state: set[str] = set()
+
+        # The host sends its state first and the events it holds last,
+        # so with none held the restart's progress is the end of it.
+
+        while len(events) < wanted or "restart" not in state:
+            message = json.loads(lines.readline())
+            state.add(message["type"])
+
+            if message["type"] == "event":
+                events.append(message)
+
+        if wanted == 0:
+            connection.settimeout(0.5)
+
+            try:
+                while line := lines.readline():
+                    message = json.loads(line)
+                    assert message["type"] != "event", message
+            except TimeoutError:
+                pass
+
+    return events
 
 
 def replacements(log: str) -> list[str]:
@@ -294,6 +331,33 @@ def test_recycling_under_the_daemon_moves_traffic_with_no_request_failed(
         second.stop(shutdown=True)
 
 
+def test_recycling_with_the_daemon_stopped_fails_no_request(tmp_path: Path) -> None:
+    """Issue 986: workers replaced under load with no daemon to tell the
+    edge, which goes on sending to the worker that is leaving."""
+
+    first = start_daemon(tmp_path)
+
+    try:
+        assert (
+            first.deploy("shop", SHOP, "--processes", "2", "--max-requests", "300")
+            == "muru: release shop@r1 is ready and serving"
+        )
+        assert "detached" in first.muructl("daemon", "stop").stdout
+        first.process.wait(timeout=30)
+        log = first.base / "logs" / "apps" / "shop" / "r1.log"
+
+        with Load(first.port, path="/info") as load:
+            wait_for(
+                lambda: log.read_text(errors="replace").count("worker.recycled: ") >= 6,
+                timeout=60,
+            )
+            time.sleep(0.3)
+
+        load.check("recycling with the daemon stopped")
+    finally:
+        start_daemon(tmp_path, run_dir=first.run_dir, port=first.port).stop(shutdown=True)
+
+
 def test_events_of_a_recycle_begun_while_the_daemon_is_stopped_are_recorded_with_their_times(
     tmp_path: Path,
 ) -> None:
@@ -334,6 +398,19 @@ def test_events_of_a_recycle_begun_while_the_daemon_is_stopped_are_recorded_with
         wait_for(lambda: log.read_text(errors="replace").count(") is ready\n") == 3)
         wait_for(lambda: serving_pid(first) not in (None, before, replacement))
         started = int(time.time() * 1000)
+
+        # Issue 982: something that connects, is sent the events and goes
+        # without saying it recorded them, as a daemon that stops reading
+        # does, leaves them held for the next.
+
+        assert [event["kind"] for event in sent_events(sockets / "control.sock", 6)] == [
+            "worker.started",
+            "worker.ready",
+            "worker.recycled",
+            "worker.exited",
+            "worker.started",
+            "worker.ready",
+        ]
         second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
 
         # The daemon that starts takes the host over, learning its
@@ -387,6 +464,17 @@ def test_events_of_a_recycle_begun_while_the_daemon_is_stopped_are_recorded_with
 
         wait_for(lambda: not (sockets / "worker-0.sock").exists())
         assert second.get("/info").status == 200
+
+        # The daemon told the host the events are recorded, which the
+        # host has read once it has answered a question asked after, so
+        # whatever connects next is sent none of them, and the daemon,
+        # which connects again in its turn, records none twice.
+
+        second.muructl("debug", "status", "shop")
+        assert sent_events(sockets / "control.sock", 0) == []
+        second.wait_for_log("release shop@r1: the host control connection ended and was made again")
+        second.muructl("debug", "status", "shop")
+        assert len([event for event in recorded() if event["type"].startswith("worker.")]) == 6
     finally:
         if second is None:
             second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)

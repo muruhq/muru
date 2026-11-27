@@ -2962,29 +2962,50 @@ fn group_sockets_from(
         .collect()
 }
 
-/// Connect to a host's control socket for the run (section 5.9), or,
-/// when the host has none, a receiver that never yields.
+/// Keep a control connection to a host for the run (section 5.9, issue
+/// 988): the first connection, when one could be made, and the receiver
+/// of everything after it, what the host says and the end of each
+/// connection, which the run's loop answers with whether to connect
+/// again. A host with no connection yet is tried again in the background.
 async fn host_control(
     host: &HostProcess,
 ) -> (
     Option<muru_controller::host::HostControl>,
-    tokio::sync::mpsc::Receiver<muru_controller::host::HostMessage>,
+    tokio::sync::mpsc::Receiver<muru_controller::host::ControlEvent>,
 ) {
+    use muru_controller::host::ControlEvent;
+
     // Section 10.14: a new host has no restart of every worker under
     // way, whatever the last one was doing; one that has says so once
     // connected.
 
     run_admin::set_restart(None);
 
-    match muru_controller::host::HostControl::connect(&host.control_path()).await {
-        Ok((control, messages)) => (Some(control), messages),
-        Err(error) => {
-            muru_common::muru_println!("no control connection to the host: {error:#}");
-            let (_sender, receiver) = tokio::sync::mpsc::channel(1);
-            std::mem::forget(_sender);
-            (None, receiver)
+    let (sender, mut events) = tokio::sync::mpsc::channel(32);
+
+    tokio::spawn(muru_controller::host::keep_control(
+        sender,
+        host.control_path(),
+        None,
+        |event| event,
+    ));
+
+    // The first thing said is the connection, or that none could be made.
+
+    let control = match events.recv().await {
+        Some(ControlEvent::Attached { control, .. }) => Some(control),
+        Some(ControlEvent::Ended { failed, answer, .. }) => {
+            if let Some(error) = failed {
+                muru_common::muru_println!("no control connection to the host: {error:#}");
+            }
+
+            let _ = answer.send(true);
+            None
         }
-    }
+        Some(ControlEvent::Message(_)) | None => None,
+    };
+
+    (control, events)
 }
 
 /// What a worker takes at once, as its HELLO declared it: the threads of
@@ -5500,6 +5521,10 @@ async fn run_with(
 
     let mut signalled = false;
 
+    // Issue 982: the last event recorded from the host, by its number.
+
+    let mut events_recorded = muru_controller::host::Recorded::default();
+
     let outcome = loop {
         tokio::select! {
             served = &mut serving => {
@@ -5516,7 +5541,28 @@ async fn run_with(
             status = current.exited() => {
                 break Err(anyhow::anyhow!("the host exited with {}", status?));
             }
-            Some(message) = host_messages.recv() => {
+            Some(event) = host_messages.recv() => {
+                // Issue 988: a control connection that ended is made
+                // again while the host runs. A host that has exited is
+                // not connected to; the branch above says so a moment
+                // later.
+
+                let message = match event {
+                    muru_controller::host::ControlEvent::Message(message) => *message,
+                    muru_controller::host::ControlEvent::Attached { control, .. } => {
+                        muru_common::muru_println!(
+                            "the control connection to the host ended and was made again"
+                        );
+                        host_link.lock().expect("host link poisoned").reattach(Some(control));
+                        continue;
+                    }
+                    muru_controller::host::ControlEvent::Ended { answer, .. } => {
+                        host_link.lock().expect("host link poisoned").reattach(None);
+                        let _ = answer.send(matches!(current.try_exited(), Ok(None)));
+                        continue;
+                    }
+                };
+
                 if let Some(health) = &health {
                     health.host_heard();
                 }
@@ -5575,7 +5621,22 @@ async fn run_with(
                             }
                         }
                     }
-                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason, evidence, time_unix_ms } => {
+                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason, evidence, time_unix_ms, number } => {
+                        // Issue 982: the host is told the event is
+                        // recorded, and one it sends again, to a
+                        // connection made again before it heard so, is
+                        // not recorded twice.
+
+                        if let Some(number) = number {
+                            let new = events_recorded.take(number);
+                            host_link.lock().expect("host link poisoned").recorded(number.seq);
+
+                            if !new {
+                                continue;
+                            }
+                        }
+
+
                         // The host has logged the event, and its line is
                         // the one the terminal shows; the run counts it
                         // and keeps it for muructl events, and its

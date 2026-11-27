@@ -87,6 +87,13 @@ CREATE TABLE IF NOT EXISTS events (
     level TEXT NOT NULL,
     message TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS host_events (
+    app TEXT NOT NULL,
+    release TEXT NOT NULL,
+    stream INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    PRIMARY KEY (app, release)
+);
 CREATE TABLE IF NOT EXISTS event_sinks (
     name TEXT PRIMARY KEY,
     delivered INTEGER NOT NULL
@@ -197,7 +204,59 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
+
+/// Insert an event that happened at `happened_unix_ms`, or now when none
+/// is given, and drop those past retention. A time ahead of the clock is
+/// taken as now.
+fn insert_event(
+    connection: &Connection,
+    kind: &str,
+    subject: &str,
+    level: &'static str,
+    message: &str,
+    happened_unix_ms: Option<u64>,
+) -> Result<Event, StoreError> {
+    let now = now_unix_ms();
+    let time_unix_ms = happened_unix_ms.map_or(now, |happened| happened.min(now));
+    connection.execute(
+        "INSERT INTO events (time_unix_ms, type, subject, level, message) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![time_unix_ms as i64, kind, subject, level, message],
+    )?;
+    let sequence = connection.last_insert_rowid() as u64;
+    connection.execute(
+        "DELETE FROM events WHERE sequence <= ?1",
+        [sequence.saturating_sub(EVENT_RETENTION) as i64],
+    )?;
+
+    Ok(Event {
+        sequence,
+        time_unix_ms,
+        kind: kind.to_owned(),
+        subject: subject.to_owned(),
+        level,
+        message: message.to_owned(),
+    })
+}
+
+/// An event a release's host raised and numbered (section 11.5).
+#[derive(Debug, Clone, Copy)]
+pub struct HostEvent<'a> {
+    /// The application.
+    pub app: &'a str,
+    /// The release.
+    pub release: &'a str,
+    /// Which of the host's events it is.
+    pub number: crate::host::EventNumber,
+    /// The event type.
+    pub kind: &'a str,
+    /// The level.
+    pub level: &'static str,
+    /// What happened.
+    pub message: &'a str,
+    /// When it happened, for one the host held; none for now.
+    pub happened_unix_ms: Option<u64>,
+}
 
 /// The store.
 pub struct Store {
@@ -243,7 +302,9 @@ impl Store {
         // added to an older table here, and version 22 the number of each
         // release (issue 948), given here to the releases of an older
         // store, and version 23 the preview secret of each release
-        // (issue 928), given here to the releases that have none.
+        // (issue 928), given here to the releases that have none, and
+        // version 24 the last event recorded from each release's host
+        // (issue 982).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -881,6 +942,10 @@ impl Store {
                 params![app, id],
             )?;
             connection.execute(
+                "DELETE FROM host_events WHERE app = ?1 AND release = ?2",
+                params![app, id],
+            )?;
+            connection.execute(
                 "DELETE FROM import_reports WHERE app = ?1 AND release = ?2",
                 params![app, id],
             )?;
@@ -1014,6 +1079,7 @@ impl Store {
             connection.execute("DELETE FROM maintenance WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM runs WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM gates WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM host_events WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM apps WHERE name = ?1", [name])?;
             Ok(())
         })
@@ -1556,28 +1622,65 @@ impl Store {
         message: &str,
         happened_unix_ms: Option<u64>,
     ) -> Result<Event, StoreError> {
-        let now = now_unix_ms();
-        let time_unix_ms = happened_unix_ms.map_or(now, |happened| happened.min(now));
         self.with(|connection| {
-            connection.execute(
-                "INSERT INTO events (time_unix_ms, type, subject, level, message) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![time_unix_ms as i64, kind, subject, level, message],
-            )?;
-            let sequence = connection.last_insert_rowid() as u64;
-            connection.execute(
-                "DELETE FROM events WHERE sequence <= ?1",
-                [sequence.saturating_sub(EVENT_RETENTION) as i64],
-            )?;
-
-            Ok(Event {
-                sequence,
-                time_unix_ms,
-                kind: kind.to_owned(),
-                subject: subject.to_owned(),
-                level,
-                message: message.to_owned(),
-            })
+            insert_event(connection, kind, subject, level, message, happened_unix_ms)
         })
+    }
+
+    /// Append an event a release's host raised, unless it is recorded
+    /// already (section 11.5, issue 982): a host numbers its events and
+    /// sends again those nobody has told it are recorded, so the number
+    /// of the last one recorded from each release's host is kept, and
+    /// written with the event in one transaction. Returns the event, or
+    /// none for one recorded before. Another stream is another host of
+    /// the release, whose numbers start again.
+    pub fn append_host_event(&self, raised: &HostEvent<'_>) -> Result<Option<Event>, StoreError> {
+        let HostEvent {
+            app,
+            release,
+            number,
+            kind,
+            level,
+            message,
+            happened_unix_ms,
+        } = *raised;
+
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection.transaction()?;
+        let last: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT stream, seq FROM host_events WHERE app = ?1 AND release = ?2",
+                params![app, release],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        if last
+            .is_some_and(|(stream, seq)| stream == number.stream as i64 && seq >= number.seq as i64)
+        {
+            return Ok(None);
+        }
+
+        let event = insert_event(
+            &transaction,
+            kind,
+            &format!("{app}@{release}"),
+            level,
+            message,
+            happened_unix_ms,
+        )?;
+
+        // A release that has been removed since has nothing to keep
+        // the number for.
+
+        transaction.execute(
+            "INSERT INTO host_events (app, release, stream, seq) \
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM releases WHERE app = ?1 AND id = ?2) \
+             ON CONFLICT (app, release) DO UPDATE SET stream = excluded.stream, seq = excluded.seq",
+            params![app, release, number.stream as i64, number.seq as i64],
+        )?;
+        transaction.commit()?;
+        Ok(Some(event))
     }
 
     /// The sequence of the latest event, or 0 before any.
@@ -3038,6 +3141,47 @@ pub(crate) mod tests {
         store.set_host_maintenance("blog", None).unwrap();
         store.delete_host("shop").unwrap();
         assert!(store.host_maintenance().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_hosts_event_sent_again_is_recorded_once() {
+        use crate::host::EventNumber;
+
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        store.create_release("shop", "r1", &spec()).unwrap();
+        let first = EventNumber { stream: 7, seq: 1 };
+        let record = |number: EventNumber| {
+            store
+                .append_host_event(&HostEvent {
+                    app: "shop",
+                    release: "r1",
+                    number,
+                    kind: "worker.started",
+                    level: "info",
+                    message: "started",
+                    happened_unix_ms: None,
+                })
+                .unwrap()
+        };
+
+        // Issue 982: an event with a number already recorded from the
+        // same host is not recorded again, one after it is, and another
+        // host of the release starts its numbers again.
+
+        assert_eq!(record(first).unwrap().subject, "shop@r1");
+        assert!(record(first).is_none());
+        assert!(record(EventNumber { stream: 7, seq: 3 }).is_some());
+        assert!(record(EventNumber { stream: 7, seq: 2 }).is_none());
+        assert!(record(EventNumber { stream: 8, seq: 1 }).is_some());
+        assert_eq!(store.last_event_sequence().unwrap(), 3);
+
+        // The number goes with the release, and none is kept for a
+        // release the store does not hold.
+
+        store.delete_release("shop", "r1").unwrap();
+        assert!(record(EventNumber { stream: 8, seq: 1 }).is_some());
+        assert!(record(EventNumber { stream: 8, seq: 1 }).is_some());
     }
 
     #[test]

@@ -1422,7 +1422,7 @@ def test_events_raised_with_no_supervisor_are_held_and_sent_with_their_times(
     ]
 
     # A supervisor that connects is sent them oldest first, each with the
-    # time it happened and none with its evidence.
+    # time it happened and its number, and none with its evidence.
 
     supervisor = connect(instance)
     instance.send_held_events()
@@ -1435,27 +1435,59 @@ def test_events_raised_with_no_supervisor_are_held_and_sent_with_their_times(
     assert (events[0]["group"], events[0]["reason"]) == ("default", "max_requests")
     assert all(before <= event["time_unix_ms"] <= after for event in events)
     assert all("evidence" not in event for event in events)
-    assert not instance.held_events
+    assert [event["seq"] for event in events] == [1, 2, 3]
+    assert {event["stream"] for event in events} == {instance.event_stream}
 
-    # With one connected, an event is sent as it happens, with no time of
-    # its own, and nothing is held.
 
-    instance.emit("worker.recycled", "info", "four")
+def test_an_event_is_held_until_a_supervisor_says_it_is_recorded(tmp_path: Path) -> None:
+    """Issue 982: a send that succeeds does not say the event was read."""
+
+    instance = unsupervised_host(tmp_path)
+    supervisor = connect(instance)
+
+    # With a supervisor connected an event is sent as it happens, with no
+    # time of its own, and held all the same.
+
+    instance.emit("worker.recycled", "info", "one")
+    instance.emit("worker.exited", "error", "two")
+    stream = instance.event_stream
     assert received(supervisor) == [
-        {"type": "event", "kind": "worker.recycled", "level": "info", "message": "four"}
+        {
+            "type": "event",
+            "kind": "worker.recycled",
+            "level": "info",
+            "message": "one",
+            "stream": stream,
+            "seq": 1,
+        },
+        {
+            "type": "event",
+            "kind": "worker.exited",
+            "level": "error",
+            "message": "two",
+            "stream": stream,
+            "seq": 2,
+        },
     ]
-    assert not instance.held_events
+    assert [event["seq"] for event in instance.held_events] == [1, 2]
 
-    # One whose send fails is held for the next supervisor.
+    # The supervisor says the first is recorded and goes before it has
+    # said so of the second, which the next one is sent again, with the
+    # time it happened.
 
+    supervisor.sendall(b'{"type":"recorded","seq":1}\n')
+    instance.read_supervisor()
+    assert [event["seq"] for event in instance.held_events] == [2]
     supervisor.close()
-    instance.emit("worker.exited", "error", "five")
-    assert instance.supervisor is None
-    assert [event["message"] for event in instance.held_events] == ["five"]
 
     later = connect(instance)
     instance.send_held_events()
-    assert [event["message"] for event in received(later)] == ["five"]
+    [again] = received(later)
+    assert (again["message"], again["seq"], again["stream"]) == ("two", 2, stream)
+    assert "time_unix_ms" in again
+    later.sendall(b'{"type":"recorded","seq":2}\n')
+    instance.read_supervisor()
+    assert not instance.held_events
 
 
 def test_past_the_bound_the_oldest_held_events_go_and_the_supervisor_is_told(
@@ -1471,7 +1503,7 @@ def test_past_the_bound_the_oldest_held_events_go_and_the_supervisor_is_told(
 
     # The log says so once, when the first is dropped.
 
-    said = "events are held with nothing connected to record them: the oldest are dropped"
+    said = "events wait to be recorded, with nothing connected that records them: the oldest"
     assert capfd.readouterr().err.count(said) == 1
 
     # The supervisor hears how many were dropped ahead of the ones kept.
@@ -1499,18 +1531,29 @@ def test_past_the_bound_the_oldest_held_events_go_and_the_supervisor_is_told(
         3,
     )
     assert events[0]["message"] == (
-        "3 events raised while nothing was connected to record them were dropped, the "
-        f"oldest: {host.HELD_EVENTS} are held at most, and the release's log has a line for each"
+        "3 events that nothing had recorded were dropped, the oldest: "
+        f"{host.HELD_EVENTS} are held at most, and the release's log has a line for each"
     )
+
+    # The warning takes the number of the last event dropped, so it is
+    # recorded once and ahead of the events kept.
+
+    assert (events[0]["seq"], events[1]["seq"]) == (3, 4)
     assert events[1]["message"] == "event 3"
     assert events[-1]["message"] == f"event {host.HELD_EVENTS + 2}"
+
+    # A supervisor that has recorded the warning is not told again, and
+    # the next is sent only what has not been recorded.
+
+    supervisor.sendall(b'{"type":"recorded","seq":3}\n')
+    instance.read_supervisor()
     assert instance.events_dropped == 0
-
-    # The next supervisor is not told again.
-
+    assert len(instance.held_events) == host.HELD_EVENTS
+    supervisor.sendall(b'{"type":"recorded","seq":%d}\n' % (host.HELD_EVENTS + 3))
+    instance.read_supervisor()
     instance.emit("worker.recycled", "info", "sent")
-    instance.send_held_events()
-    assert [event["kind"] for event in received(supervisor)] == ["worker.recycled"]
+    assert [event["message"] for event in received(supervisor)] == ["sent"]
+    assert [event["message"] for event in instance.held_events] == ["sent"]
 
 
 def test_a_host_with_no_control_socket_holds_no_events(tmp_path: Path) -> None:

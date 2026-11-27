@@ -14,4 +14,4 @@ Added the `--https` flag to `muructl run`, which serves HTTPS on port 8443
 with a locally trusted development certificate.
 ```
 
-Check the result with `uv run towncrier build --draft`.
+Check the result with `just changelog-draft`.

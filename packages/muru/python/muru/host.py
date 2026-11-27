@@ -461,8 +461,9 @@ def resolve_app(
 
 UNNAMED_EVENTS = frozenset({"worker.started", "worker.ready"})
 
-# Section 11.5: how many events a host holds while no supervisor is
-# connected, for the next one. Past it the oldest held goes.
+# Section 11.5: how many events a host holds that no supervisor has said
+# it recorded, for the one that connects next. Past it the oldest held
+# goes.
 
 HELD_EVENTS = 256
 
@@ -1638,12 +1639,19 @@ class Host:
         self.loaded: dict[str, Any] | None = None
         self.loaded_sent = False
 
-        # Section 11.5: the events raised with no supervisor connected,
-        # each with the time it happened, for the next one, and how many
-        # were dropped for want of room since the last was told.
+        # Section 11.5 (issue 982): the events no supervisor has said it
+        # recorded, oldest first, each with the time it happened, and how
+        # many more were dropped as the bound was passed, up to which
+        # number. The host numbers its events from 1 and names itself by
+        # the time it started, so a supervisor tells an event sent again
+        # from one it has, and the events of the host that replaces this
+        # one from this one's.
 
         self.held_events: deque[dict[str, Any]] = deque()
         self.events_dropped = 0
+        self.events_dropped_through = 0
+        self.event_stream = time.time_ns()
+        self.event_seq = 0
 
         # Section 6.7: the interfaces the workers settled themselves, by
         # mount, for an application imported in each worker or made by a
@@ -2636,7 +2644,7 @@ class Host:
         self.send_held_events()
 
     def hold_event(self, event: dict[str, Any]) -> None:
-        """Keep an event for the next supervisor, with the time it happened.
+        """Keep an event until a supervisor says it is recorded, with the time it happened.
 
         Only events are held: the workers, the load, the import report and
         the progress of a restart are state, which a supervisor is sent
@@ -2653,15 +2661,16 @@ class Host:
         held["time_unix_ms"] = int(time.time() * 1000)
 
         if len(self.held_events) >= HELD_EVENTS:
-            self.held_events.popleft()
+            oldest = self.held_events.popleft()
 
             if self.events_dropped == 0:
                 log(
-                    f"more than {HELD_EVENTS} events are held with nothing connected to "
-                    "record them: the oldest are dropped from here on"
+                    f"more than {HELD_EVENTS} events wait to be recorded, with nothing "
+                    "connected that records them: the oldest are dropped from here on"
                 )
 
             self.events_dropped += 1
+            self.events_dropped_through = oldest["seq"]
 
         self.held_events.append(held)
 
@@ -2669,8 +2678,9 @@ class Host:
         """Send a supervisor that has connected the events held for it, oldest first.
 
         An event saying how many were dropped goes ahead of them, since
-        the ones dropped were the oldest. What a failed send leaves stays
-        held for the next supervisor.
+        the ones dropped were the oldest; it takes the number of the last
+        one dropped. The events stay held until the supervisor says they
+        are recorded, so what a failed send leaves is sent to the next.
         """
 
         dropped = self.events_dropped
@@ -2682,25 +2692,36 @@ class Host:
                     "kind": "host.events_dropped",
                     "level": "warning",
                     "message": (
-                        f"{dropped} event{'' if dropped == 1 else 's'} raised while nothing "
-                        f"was connected to record them {'was' if dropped == 1 else 'were'} "
-                        f"dropped, the oldest: {HELD_EVENTS} are held at most, and the "
-                        "release's log has a line for each"
+                        f"{dropped} event{'' if dropped == 1 else 's'} that nothing had "
+                        f"recorded {'was' if dropped == 1 else 'were'} dropped, the oldest: "
+                        f"{HELD_EVENTS} are held at most, and the release's log has a line "
+                        "for each"
                     ),
                     "dropped": dropped,
+                    "stream": self.event_stream,
+                    "seq": self.events_dropped_through,
                 }
             )
 
             if not sent:
                 return
 
-            self.events_dropped = 0
-
-        while self.held_events:
-            if not self.send_to_supervisor(self.held_events[0]):
+        for held in list(self.held_events):
+            if not self.send_to_supervisor(held):
                 return
 
+    def events_recorded(self, seq: int) -> None:
+        """Take the supervisor's word that the events up to a number are recorded.
+
+        Issue 982: they are held no longer. The count of events dropped
+        goes once the event that says it is among them.
+        """
+
+        while self.held_events and self.held_events[0]["seq"] <= seq:
             self.held_events.popleft()
+
+        if self.events_dropped and self.events_dropped_through <= seq:
+            self.events_dropped = 0
 
     def send_imports(self) -> None:
         """Send the load's import report to the supervisor, in parts, if there is one."""
@@ -2928,7 +2949,7 @@ class Host:
             self.relay.close()
 
     def read_supervisor(self) -> None:
-        """Read the supervisor's acknowledgements."""
+        """Read the supervisor's acknowledgements and requests."""
 
         assert self.supervisor is not None
 
@@ -2956,6 +2977,8 @@ class Host:
             if message.get("type") == "applied":
                 self.acked = max(self.acked, int(message.get("version", 0)))
                 self.edge_applied()
+            elif message.get("type") == "recorded":
+                self.events_recorded(int(message.get("seq", 0)))
             elif message.get("type") == "request":
                 self.take_request(message)
 
@@ -3216,12 +3239,23 @@ class Host:
         kind, except for the start-up lines every worker has. `evidence`
         names the requests the event is about, with the stacks of the
         threads serving them, for a development run's records (issue 706).
-        An event raised with no supervisor connected, or whose send
-        failed, is held for the next one (section 11.5).
+        The event is numbered and held until a supervisor says it is
+        recorded, and sent again to the one that connects next if none
+        does (section 11.5, issue 982): a send that succeeds says only
+        that the event is in a socket's buffer, which a supervisor that
+        is stopping never reads.
         """
 
         log(message if kind in UNNAMED_EVENTS else f"{kind}: {message}")
-        event: dict[str, Any] = {"type": "event", "kind": kind, "level": level, "message": message}
+        self.event_seq += 1
+        event: dict[str, Any] = {
+            "type": "event",
+            "kind": kind,
+            "level": level,
+            "message": message,
+            "stream": self.event_stream,
+            "seq": self.event_seq,
+        }
 
         if group is not None:
             event["group"] = group
@@ -3232,8 +3266,8 @@ class Host:
         if evidence is not None:
             event["evidence"] = evidence
 
-        if not self.send_to_supervisor(event):
-            self.hold_event(event)
+        self.hold_event(event)
+        self.send_to_supervisor(event)
 
     # Section 11.7: the supervisor's questions, answered by the host or
     # passed to the workers.
