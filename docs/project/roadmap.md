@@ -156,12 +156,9 @@ taken up between the steps of the major goals, in no fixed order.
   Muru's own signals
   ([#123](https://github.com/muruhq/muru/issues/123)),
   configuration changes exported to a backup directory
-  ([#94](https://github.com/muruhq/muru/issues/94)), per-group
-  recycling limits and `max_surge`
-  ([#150](https://github.com/muruhq/muru/issues/150),
-  [#151](https://github.com/muruhq/muru/issues/151)), and rollouts
-  whose capacity follows traffic, with a guide to upgrading in place on
-  a host with limited memory
+  ([#94](https://github.com/muruhq/muru/issues/94)), and rollouts
+  whose capacity follows traffic, the releases of an upgrade sharing
+  one total of workers on a host sized for one copy
   ([#321](https://github.com/muruhq/muru/issues/321)).
 
 - **Edge and HTTP:** ACME certificates

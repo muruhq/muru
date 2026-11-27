@@ -62,6 +62,12 @@ Recipes for specific tasks, assuming you already know the basics. The
   and previewing.
 - [Rollouts](rollouts.md): canaries and blue/green switches judged by
   gates.
+- [Upgrading in place on a host with limited memory](upgrading-in-place.md):
+  a canary by hand, with the releases sized at each step, on a node
+  that cannot hold two full copies.
+- [A worker that needs a resource to itself](exclusive-workers.md): one
+  worker stopped before its replacement starts, and a deploy that stops
+  the old release first.
 - [Overlays](overlays.md): configuration laid over the routes by hand or
   on a schedule.
 - [Conditions](conditions.md): when something holds over Muru's own
@@ -179,6 +185,8 @@ instances
 named-instances
 traffic
 rollouts
+upgrading-in-place
+exclusive-workers
 overlays
 conditions
 client-classes

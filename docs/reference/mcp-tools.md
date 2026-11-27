@@ -45,7 +45,7 @@ it out.
 | `preview` | reads | `muructl preview --print`: a one-time entry link to the preview of a release, a detour or any release the daemon routes to, valid for a minute or for `valid_for`, for an address whose name reaches this machine, with the `Muru-Preview` header value, which holds the release's preview secret and is given when there is no link too, with why | `target` (`APP@RELEASE`, an application or a detour), `host`, `name`, `valid_for` |
 | `skill_status` | reads | `muructl mcp skill status` | none |
 | `docs` | reads | The user guide embedded in `muructl`: the list of pages, or one page's Markdown | `page` |
-| `set_app_settings` | changes | `muructl app set` | `app`, `env`, `secrets`, `processes`, `threads`, `sync_threads`, `concurrency`, `max_requests`, `max_lifetime`, `timeouts`, `memory`, `replace` |
+| `set_app_settings` | changes | `muructl app set` | `app`, `env`, `secrets`, `processes`, `threads`, `sync_threads`, `concurrency`, `max_requests`, `max_lifetime`, `max_surge`, `max_unavailable`, `timeouts`, `memory`, `replace` |
 | `unset_app_settings` | changes | `muructl app unset` | `app`, `keys`, `all` |
 | `deploy` | changes | `muructl deploy` | `app`, `source`, `entrypoint`, `python`, `hold`, `wait` (default true), `dry_run` |
 | `promote` | changes | `muructl rollout bluegreen` | `release` |
@@ -56,7 +56,7 @@ it out.
 | `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code`, `ok` and `message`, as a tool error unless `ok`: the command exited with 0 and was not stopped; with `detach`, `muructl command run --detach`, answering with the `run` id at once | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references), `detach` |
 | `stop_command_run` | changes | `muructl command stop` | `run` |
 | `detour_traffic` | changes | `muructl detour traffic` | `detour`, `traffic` (preview, all, share=N, class=NAME), `for` (a duration, after which the detour takes preview again), `paths` (the client URL paths it takes requests under alone), `all_paths` (every path again) |
-| `restart` | changes | `muructl restart` | `target`, `worker`, `all`, `force` |
+| `restart` | changes | `muructl restart`: one worker, or with `all` or `group` every worker in turn, and `cancel` ends such a restart | `target`, `worker`, `all`, `group`, `cancel`, `no_wait`, `force` |
 | `overlay` | changes | `muructl overlay activate`, `end` or `promote` | `action`, `name`, `for` |
 | `maintenance` | changes | `muructl maintenance on` or `off` | `app` or `host`, `on` |
 | `apply` | changes | `muructl apply` | `file`, `dry_run`, `hold`, `wait` (default true) |

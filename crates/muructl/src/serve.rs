@@ -134,6 +134,16 @@ pub struct ServeArgs {
     #[arg(long, value_name = "DURATION")]
     max_lifetime: Option<String>,
 
+    /// Workers a group may run over its count while workers are swapped
+    /// (default 1); with 0 the old worker stops first.
+    #[arg(long, value_name = "N")]
+    max_surge: Option<String>,
+
+    /// Workers a group may run under its count while workers are
+    /// swapped (default 0).
+    #[arg(long, value_name = "N")]
+    max_unavailable: Option<String>,
+
     /// A memory setting as KEY=VALUE, as muructl run takes it.
     /// Repeatable.
     #[arg(long = "memory", value_name = "KEY=VALUE")]
@@ -282,6 +292,8 @@ const KEYS: &[(&str, Kind)] = &[
     ("max_body_size", Kind::Text),
     ("max_requests", Kind::Text),
     ("max_lifetime", Kind::Text),
+    ("max_surge", Kind::Text),
+    ("max_unavailable", Kind::Text),
     ("memory", Kind::List),
     ("max_connections", Kind::Text),
     ("max_connections_per_client", Kind::Text),
@@ -382,6 +394,8 @@ fn from_flags(args: &ServeArgs) -> BTreeMap<&'static str, Value> {
     text("max_body_size", &args.max_body_size);
     text("max_requests", &args.max_requests);
     text("max_lifetime", &args.max_lifetime);
+    text("max_surge", &args.max_surge);
+    text("max_unavailable", &args.max_unavailable);
     text("max_connections", &args.max_connections);
     text(
         "max_connections_per_client",
@@ -973,6 +987,8 @@ fn prepare(
         ("max_body_size", "--max-body-size"),
         ("max_requests", "--max-requests"),
         ("max_lifetime", "--max-lifetime"),
+        ("max_surge", "--max-surge"),
+        ("max_unavailable", "--max-unavailable"),
         ("max_connections", "--max-connections"),
         ("max_connections_per_client", "--max-connections-per-client"),
         (
@@ -1053,6 +1069,8 @@ const APPLICATION_KEYS: &[&str] = &[
     "hooks",
     "max_requests",
     "max_lifetime",
+    "max_surge",
+    "max_unavailable",
 ];
 
 /// Serve's keys whose values are numbers, which a layer holds as text.

@@ -540,6 +540,18 @@ fn workers(
             table.max_lifetime,
             None,
         ),
+        max_surge: writer.one(
+            "max_surge",
+            request.max_surge,
+            table.max_surge,
+            Some(muru_config::DEFAULT_MAX_SURGE),
+        ),
+        max_unavailable: writer.one(
+            "max_unavailable",
+            request.max_unavailable,
+            table.max_unavailable,
+            Some(muru_config::DEFAULT_MAX_UNAVAILABLE),
+        ),
         timeouts: (timeouts != muru_config::Timeouts::default()).then_some(timeouts),
         max_body_size: table.max_body_size,
         memory: (memory != muru_config::Memory::default()).then_some(memory),

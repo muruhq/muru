@@ -7,6 +7,7 @@ where it is, and `muructl deploy --dry-run` says what a deploy would do.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -124,11 +125,30 @@ def test_a_command_line_is_written_as_the_release_it_describes(tmp_path: Path) -
     ) in unnamed.stderr, unnamed.stderr
 
     # What a deploy records of where the code came from is written too:
-    # the flags, over what the source's git checkout says.
+    # the flags, over what the source's git checkout says. The checkout
+    # is one made here, so the test does not depend on the tree it runs
+    # from being one (issue 967).
+
+    checkout = tmp_path / "shop"
+    shutil.copytree(SHOP, checkout, ignore=shutil.ignore_patterns("__pycache__"))
+    identity = ["-c", "user.name=Muru", "-c", "user.email=m@example.com"]
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(checkout), *identity, "-c", "commit.gpgsign=false", *arguments],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("add", ".")
+    git("commit", "-q", "-m", "shop")
 
     recorded = rendered(
         "shop",
-        str(SHOP),
+        str(checkout),
         "--git-metadata",
         "--metadata",
         "description=the first",
@@ -136,7 +156,7 @@ def test_a_command_line_is_written_as_the_release_it_describes(tmp_path: Path) -
         "ref=",
     )["app"]["shop"]["release"]["r1"]["metadata"]  # type: ignore[index]
     assert recorded["description"] == "the first" and "ref" not in recorded, recorded
-    assert len(recorded["commit"]) == 40, recorded
+    assert recorded["commit"] == git("rev-parse", "HEAD"), recorded
 
     # With no source it is the current directory, in full; a source given
     # is written as given.

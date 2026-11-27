@@ -79,6 +79,19 @@ impl Budget {
             parts.push(format!("{:.1} of {cpu} cores", used.cpu));
         }
 
+        // Section 7.9: the room held for swaps is part of what is held.
+
+        if used.surge > 0 && !parts.is_empty() {
+            parts.push(format!(
+                "{} held for swaps",
+                if used.surge == 1 {
+                    "1 worker".to_owned()
+                } else {
+                    format!("{} workers", used.surge)
+                }
+            ));
+        }
+
         if parts.is_empty() {
             "no limits".to_owned()
         } else {
@@ -106,6 +119,9 @@ pub struct Usage {
     pub memory: u64,
     /// CPU cores.
     pub cpu: f64,
+    /// How many of the workers are surge allowances (section 7.9): room
+    /// held for a swap, with no worker in it between swaps.
+    pub surge: u32,
 }
 
 impl Usage {
@@ -116,11 +132,18 @@ impl Usage {
         self.cpu += cost.cpu.unwrap_or(0.0) * count as f64;
     }
 
+    /// Add a surge allowance of `count` workers of `cost`.
+    pub fn add_surge(&mut self, count: u32, cost: Cost) {
+        self.add(count, cost);
+        self.surge += count;
+    }
+
     /// Add what another holds.
     pub fn add_usage(&mut self, other: &Usage) {
         self.workers += other.workers;
         self.memory += other.memory;
         self.cpu += other.cpu;
+        self.surge += other.surge;
     }
 }
 
@@ -230,6 +253,102 @@ pub fn admit<K: Ord>(budget: &Budget, mut used: Usage, mut asks: Vec<Ask<K>>) ->
         .collect()
 }
 
+/// Why a group's surge allowance is less than its `max_surge` (section
+/// 7.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Short {
+    /// Its release takes no share of its application's traffic.
+    Traffic,
+    /// The budget has no room, by this limit.
+    Budget(Limit),
+}
+
+impl Short {
+    /// One word for the host and the admin API: `traffic`, `workers`,
+    /// `memory` or `cpu`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Short::Traffic => "traffic",
+            Short::Budget(Limit::Workers) => "workers",
+            Short::Budget(Limit::Memory) => "memory",
+            Short::Budget(Limit::Cpu) => "cpu",
+        }
+    }
+}
+
+/// A group's surge allowance (section 7.9): how many workers it may run
+/// over its count during a swap, and why that is less than its
+/// `max_surge` when it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Surge {
+    /// The workers allowed over the count.
+    pub allowance: u32,
+    /// What left it short of the group's `max_surge`.
+    pub short: Option<Short>,
+}
+
+/// One group's wish for a surge allowance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurgeAsk<K> {
+    /// Which group.
+    pub key: K,
+    /// Its application's priority.
+    pub priority: i32,
+    /// The group's `max_surge`.
+    pub max_surge: u32,
+    /// What each worker costs.
+    pub cost: Cost,
+    /// Whether its release takes a share of its application's traffic.
+    pub traffic: bool,
+}
+
+/// Grant each group its surge allowance over what the node holds without
+/// any (section 7.9): none for a release that takes no traffic, and for
+/// the rest as much of `max_surge` as the budget still has room for,
+/// admitted as scale-ups are, the highest priority first and in key
+/// order within one. With no budget every group that takes traffic has
+/// its `max_surge`.
+pub fn grant_surges<K: Ord + Clone>(
+    budget: &Budget,
+    used: Usage,
+    asks: Vec<SurgeAsk<K>>,
+) -> BTreeMap<K, Surge> {
+    let mut granted = BTreeMap::new();
+    let mut admitted = Vec::new();
+
+    for ask in asks {
+        if ask.traffic {
+            admitted.push(Ask {
+                key: ask.key,
+                priority: ask.priority,
+                from: 0,
+                to: ask.max_surge,
+                cost: ask.cost,
+            });
+        } else {
+            granted.insert(
+                ask.key,
+                Surge {
+                    allowance: 0,
+                    short: (ask.max_surge > 0).then_some(Short::Traffic),
+                },
+            );
+        }
+    }
+
+    for given in admit(budget, used, admitted) {
+        granted.insert(
+            given.ask.key,
+            Surge {
+                allowance: given.to,
+                short: given.limit.map(Short::Budget),
+            },
+        );
+    }
+
+    granted
+}
+
 /// Whether bringing a group from `held` to `floor` workers of `cost`
 /// fits the budget over `used`, which counts the `held`; why not when it
 /// does not.
@@ -273,6 +392,9 @@ pub struct View {
     /// Where the limits the daemon file leaves out come from, such as
     /// ` (memory from memory.max 2.0GB less 205MB of headroom)`, or empty.
     pub sources: String,
+    /// Whether the memory limit is the daemon's cgroup's, the daemon's
+    /// file setting none (issue 961).
+    pub memory_from_cgroup: bool,
 }
 
 impl View {
@@ -444,6 +566,100 @@ mod tests {
     }
 
     #[test]
+    fn surge_allowances_are_granted_within_the_budget_and_only_with_traffic() {
+        let surge = |key: &str, priority, max_surge, traffic| SurgeAsk {
+            key: key.to_owned(),
+            priority,
+            max_surge,
+            cost: Cost {
+                memory: Some(100 * MB),
+                cpu: None,
+            },
+            traffic,
+        };
+        let asks = || {
+            vec![
+                surge("blog", 0, 1, true),
+                surge("held", 5, 1, false),
+                surge("off", 0, 0, false),
+                surge("shop", 5, 2, true),
+            ]
+        };
+
+        // Section 7.9: with no budget, a group that takes traffic has
+        // its max_surge, and one that takes none has no allowance.
+
+        let free = grant_surges(&Budget::default(), Usage::default(), asks());
+        assert_eq!(
+            free["shop"],
+            Surge {
+                allowance: 2,
+                short: None
+            }
+        );
+        assert_eq!(
+            free["blog"],
+            Surge {
+                allowance: 1,
+                short: None
+            }
+        );
+        assert_eq!(
+            free["held"],
+            Surge {
+                allowance: 0,
+                short: Some(Short::Traffic)
+            }
+        );
+        assert_eq!(free["off"], Surge::default());
+
+        // With room for two more workers the higher priority is granted
+        // first, and the other is told which limit left it none.
+
+        let budget = Budget {
+            memory: Some(600 * MB),
+            ..Budget::default()
+        };
+        let used = Usage {
+            workers: 4,
+            memory: 400 * MB,
+            ..Usage::default()
+        };
+        let tight = grant_surges(&budget, used, asks());
+        assert_eq!(
+            tight["shop"],
+            Surge {
+                allowance: 2,
+                short: None
+            }
+        );
+        assert_eq!(
+            tight["blog"],
+            Surge {
+                allowance: 0,
+                short: Some(Short::Budget(Limit::Memory))
+            }
+        );
+        assert_eq!(Short::Budget(Limit::Memory).as_str(), "memory");
+        assert_eq!(Short::Traffic.as_str(), "traffic");
+
+        // What is granted counts as workers held, and is named.
+
+        let mut held = used;
+        held.add_surge(
+            2,
+            Cost {
+                memory: Some(100 * MB),
+                cpu: None,
+            },
+        );
+        assert_eq!(
+            budget.describe(&held),
+            "600MB of 600MB memory, 2 workers held for swaps"
+        );
+    }
+
+    #[test]
     fn the_table_is_checked() {
         let table = muru_config::Budget {
             workers: Some(16),
@@ -484,6 +700,7 @@ mod tests {
             workers: 6,
             memory: 600 * MB,
             cpu: 0.0,
+            surge: 0,
         };
         let admitted = admit(
             &budget,
@@ -514,6 +731,7 @@ mod tests {
             workers: 4,
             memory: 700 * MB,
             cpu: 1.0,
+            surge: 0,
         };
         let cost = Cost {
             memory: Some(200 * MB),

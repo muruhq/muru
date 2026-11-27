@@ -449,17 +449,29 @@ impl Admin for Service {
         let info = &self.handle.info;
         let apps = self.handle.store.apps().map_err(internal)?;
         let releases = self.handle.store.releases(None).map_err(internal)?;
-        let budget = {
+        let (budget, budget_memory, budget_memory_from) = {
             let view = &info.defined.read().expect("defined names poisoned").budget;
 
-            if view.budget.is_set() {
+            let described = if view.budget.is_set() {
                 format!("{}{}", view.budget.describe(&view.used), view.sources)
             } else {
                 String::new()
-            }
+            };
+
+            // Issue 961: whether the node has a memory limit, and whose.
+
+            let from = match (view.budget.memory, view.memory_from_cgroup) {
+                (None, _) => "",
+                (Some(_), true) => "cgroup",
+                (Some(_), false) => "file",
+            };
+
+            (described, view.budget.memory, from.to_owned())
         };
 
         Ok(Response::new(pb::Status {
+            budget_memory,
+            budget_memory_from,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             pid: std::process::id(),
             instance_id: info.instance_id.to_string(),
@@ -2323,6 +2335,7 @@ impl Admin for Service {
         request: Request<pb::DebugRequest>,
     ) -> Result<Response<pb::DebugResponse>, Status> {
         let request = request.into_inner();
+        refuse_host_request(&request.op).map_err(Status::invalid_argument)?;
         let release = self.current_release(&request.app, &request.release)?;
 
         let args: serde_json::Value = if request.args_json.trim().is_empty() {
@@ -2399,6 +2412,67 @@ impl Admin for Service {
                 .collect(),
             release,
             host_json,
+        }))
+    }
+
+    /// Section 10.14: every worker of a release replaced in turn by its
+    /// host, which holds the marks.
+    async fn restart_release(
+        &self,
+        request: Request<pb::RestartReleaseRequest>,
+    ) -> Result<Response<pb::RestartReleaseResponse>, Status> {
+        let request = request.into_inner();
+        let release = self.current_release(&request.app, &request.release)?;
+        let marked = self
+            .ask_host(
+                &request.app,
+                &release,
+                "restart_all",
+                serde_json::json!({ "group": request.group }),
+            )
+            .await?;
+
+        // Its host says how far it has got, and nothing once it has
+        // finished; a release that stops meanwhile has no restart either.
+
+        if request.wait && !marked.is_empty() {
+            let deadline = tokio::time::Instant::now() + restart_wait(request.wait_timeout_ms);
+
+            while self.restart_of(&request.app, &release).is_some()
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(RESTART_POLL).await;
+            }
+        }
+
+        Ok(Response::new(pb::RestartReleaseResponse {
+            restart: self.restart_of(&request.app, &release),
+            app: request.app,
+            release,
+            workers: marked,
+        }))
+    }
+
+    async fn cancel_restart(
+        &self,
+        request: Request<pb::CancelRestartRequest>,
+    ) -> Result<Response<pb::RestartReleaseResponse>, Status> {
+        let request = request.into_inner();
+        let release = self.current_release(&request.app, &request.release)?;
+        let left = self
+            .ask_host(
+                &request.app,
+                &release,
+                "restart_cancel",
+                serde_json::json!({}),
+            )
+            .await?;
+
+        Ok(Response::new(pb::RestartReleaseResponse {
+            restart: self.restart_of(&request.app, &release),
+            app: request.app,
+            release,
+            workers: left,
         }))
     }
 
@@ -4546,6 +4620,63 @@ impl Service {
         Ok(release)
     }
 
+    /// Ask a release's host something of its own (section 10.14), and
+    /// answer with the workers it names.
+    async fn ask_host(
+        &self,
+        app: &str,
+        release: &str,
+        op: &str,
+        args: serde_json::Value,
+    ) -> Result<Vec<pb::Worker>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Debug {
+                app: app.to_owned(),
+                id: release.to_owned(),
+                op: op.to_owned(),
+                worker: None,
+                args,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let answered = tokio::time::timeout(HOST_ANSWER_WAIT, done_rx)
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "the host did not answer in {} seconds",
+                    HOST_ANSWER_WAIT.as_secs()
+                ))
+            })?
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+
+        Ok(answered
+            .into_iter()
+            .map(|reply| pb::Worker {
+                index: reply.index,
+                pid: reply.pid,
+                group: reply.group,
+                ..pb::Worker::default()
+            })
+            .collect())
+    }
+
+    /// The restart of every worker a release's host has under way, as
+    /// the daemon last published it.
+    fn restart_of(&self, app: &str, release: &str) -> Option<pb::RestartStatus> {
+        self.handle
+            .info
+            .live
+            .lock()
+            .expect("live poisoned")
+            .get(&(app.to_owned(), release.to_owned()))
+            .and_then(|live| live.restart.as_ref())
+            .map(restart_status)
+    }
+
     /// Send a rollout action to the daemon and answer with the rollout.
     async fn control_rollout(
         &self,
@@ -4797,6 +4928,54 @@ async fn await_host_report(handle: &Handle, release: &Release) {
     }
 }
 
+/// How long a host gets to answer a request of its own.
+const HOST_ANSWER_WAIT: Duration = Duration::from_secs(20);
+
+/// How often a waiting RestartRelease looks at how far the restart has
+/// got.
+const RESTART_POLL: Duration = Duration::from_millis(200);
+
+/// How long RestartRelease waits when asked to: what the request says,
+/// or ten minutes.
+pub fn restart_wait(wait_timeout_ms: u64) -> Duration {
+    if wait_timeout_ms == 0 {
+        Duration::from_secs(600)
+    } else {
+        Duration::from_millis(wait_timeout_ms)
+    }
+}
+
+/// Section 10.14: the requests a host takes for itself are not debug
+/// operations, and are refused as one with what to call instead.
+pub fn refuse_host_request(op: &str) -> Result<(), String> {
+    match op {
+        "restart_all" | "restart_cancel" => Err(format!(
+            "{op} is not a debug operation: call RestartRelease or CancelRestart"
+        )),
+        "surge" => Err("surge is not a debug operation".to_owned()),
+        _ => Ok(()),
+    }
+}
+
+/// A restart's progress as the admin API gives it.
+pub fn restart_status(progress: &crate::daemon::RestartProgress) -> pb::RestartStatus {
+    pb::RestartStatus {
+        total: progress.total,
+        left: progress.left,
+        started_unix_ms: progress.started_unix_ms,
+        group: progress.group.clone(),
+    }
+}
+
+/// What left a group's surge allowance short of its `max_surge`, as the
+/// API names it, or empty (section 7.9).
+fn surge_short(surge: Option<&crate::budget::Surge>) -> String {
+    surge
+        .and_then(|surge| surge.short)
+        .map_or("", crate::budget::Short::as_str)
+        .to_owned()
+}
+
 fn release_message(release: Release, handle: &Handle) -> pb::Release {
     let serving = handle
         .store
@@ -4892,7 +5071,23 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         String::new()
     };
 
+    // Section 7.8: a managed server's instances are not swapped.
+
+    let (max_surge, max_unavailable) = if release.spec.http.is_some() {
+        (0, 0)
+    } else {
+        release.spec.swap()
+    };
+
     pb::Release {
+        restart: live.restart.as_ref().map(restart_status),
+        max_surge,
+        max_unavailable,
+        surge_allowance: live
+            .surge
+            .get(muru_edge::routing::DEFAULT_GROUP)
+            .map(|surge| surge.allowance),
+        surge_short: surge_short(live.surge.get(muru_edge::routing::DEFAULT_GROUP)),
         traffic: String::new(),
         detour: None,
         metadata: release.spec.metadata.clone(),
@@ -5014,6 +5209,10 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                 hosts: group.host.clone(),
                 methods: group.method.clone(),
                 mounts: group.mounts.clone(),
+                max_surge: group.max_surge.unwrap_or(max_surge),
+                max_unavailable: group.max_unavailable.unwrap_or(max_unavailable),
+                surge_allowance: live.surge.get(&group.name).map(|surge| surge.allowance),
+                surge_short: surge_short(live.surge.get(&group.name)),
             })
             .collect(),
         detected_interface,

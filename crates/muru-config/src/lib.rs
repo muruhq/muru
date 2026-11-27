@@ -858,6 +858,38 @@ pub struct Group {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the release's"))]
     pub max_lifetime: Option<String>,
+    /// How many workers the group may run over its count while workers
+    /// are swapped (section 7.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
+    pub max_surge: Option<u32>,
+    /// How many workers the group may run under its count while workers
+    /// are swapped (section 7.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the release's"))]
+    pub max_unavailable: Option<u32>,
+}
+
+/// How many workers a group may run over its count while workers are
+/// swapped, when nothing sets `max_surge` (section 7.8).
+pub const DEFAULT_MAX_SURGE: u32 = 1;
+
+/// How many workers a group may run under its count while workers are
+/// swapped, when nothing sets `max_unavailable` (section 7.8).
+pub const DEFAULT_MAX_UNAVAILABLE: u32 = 0;
+
+/// Check a resolved `max_surge` and `max_unavailable` (section 7.8):
+/// with both 0 no worker could be swapped.
+pub fn check_swap(max_surge: u32, max_unavailable: u32) -> Result<(), String> {
+    if max_surge == 0 && max_unavailable == 0 {
+        return Err(
+            "max_surge and max_unavailable are both 0, so no worker could be replaced; \
+             set max_unavailable = 1 to stop a worker before its replacement starts"
+                .to_owned(),
+        );
+    }
+
+    Ok(())
 }
 
 /// Check a worker group's `match` table (ADR 0033): it must ask
@@ -1062,6 +1094,18 @@ pub struct Release {
     /// example 1h, with jitter; off when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime: Option<String>,
+    /// How many workers a group may run over its count while workers are
+    /// swapped: recycled, or restarted on request (section 7.8). A
+    /// replacement is started before the old worker stops while the
+    /// group is within it; with 0 the old worker stops first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1))]
+    pub max_surge: Option<u32>,
+    /// How many workers a group may run under its count while workers
+    /// are swapped (section 7.8). Both this and `max_surge` 0 is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 0))]
+    pub max_unavailable: Option<u32>,
     /// The timeouts the host enforces on its workers (section 7.6), and
     /// those of a request the release serves, which the edge enforces
     /// (section 4.6).
@@ -5227,7 +5271,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
     }
 
     let timeouts = table.timeouts.as_ref();
-    let worker_keys: [(&str, bool); 27] = [
+    let worker_keys: [(&str, bool); 29] = [
         ("entrypoint", !table.entrypoint.is_empty()),
         ("interface", table.interface.is_some()),
         ("handoff", table.handoff.is_some()),
@@ -5250,6 +5294,8 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
         ("logging", table.logging.is_some()),
         ("max_requests", table.max_requests.is_some()),
         ("max_lifetime", table.max_lifetime.is_some()),
+        ("max_surge", table.max_surge.is_some()),
+        ("max_unavailable", table.max_unavailable.is_some()),
         ("memory", table.memory.is_some()),
         ("accel_redirect", table.accel_redirect.is_some()),
         ("cgi_local_redirect", table.cgi_local_redirect.is_some()),
@@ -5678,6 +5724,16 @@ pub struct App {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "the source's, else never"))]
     pub max_lifetime: Option<String>,
+    /// How many workers a group may run over its count while workers are
+    /// swapped, for every release, over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 1"))]
+    pub max_surge: Option<u32>,
+    /// How many workers a group may run under its count while workers
+    /// are swapped, for every release, over the source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the source's, else 0"))]
+    pub max_unavailable: Option<u32>,
     /// The host's timeouts for every release, each over the source's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<HostTimeouts>,
@@ -5715,6 +5771,8 @@ impl App {
             concurrency,
             max_requests,
             max_lifetime,
+            max_surge,
+            max_unavailable,
             timeouts,
             memory,
         } = self;
@@ -5737,6 +5795,8 @@ impl App {
             || concurrency.is_some()
             || max_requests.is_some()
             || max_lifetime.is_some()
+            || max_surge.is_some()
+            || max_unavailable.is_some()
             || timeouts.is_some()
             || memory.is_some()
     }
@@ -5765,6 +5825,8 @@ impl App {
             concurrency,
             max_requests,
             max_lifetime,
+            max_surge,
+            max_unavailable,
             timeouts,
             memory,
         } = other;
@@ -5787,6 +5849,8 @@ impl App {
         self.concurrency = concurrency;
         self.max_requests = max_requests;
         self.max_lifetime = max_lifetime;
+        self.max_surge = max_surge;
+        self.max_unavailable = max_unavailable;
         self.timeouts = timeouts;
         self.memory = memory;
 
@@ -6649,6 +6713,16 @@ pub struct ServeSettings {
     /// How long a worker lives before it is replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime: Option<String>,
+    /// How many workers a group may run over its count while workers are
+    /// swapped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1))]
+    pub max_surge: Option<u32>,
+    /// How many workers a group may run under its count while workers
+    /// are swapped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 0))]
+    pub max_unavailable: Option<u32>,
     /// The memory policy as KEY=VALUE.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Vec<String>>,
@@ -6896,6 +6970,18 @@ pub struct ToolMuru {
     /// How long a worker lives before it is replaced (section 7.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime: Option<String>,
+    /// How many workers a group may run over its count while workers are
+    /// swapped: recycled, or restarted on request (section 7.8). A
+    /// replacement is started before the old worker stops while the
+    /// group is within it; with 0 the old worker stops first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1))]
+    pub max_surge: Option<u32>,
+    /// How many workers a group may run under its count while workers
+    /// are swapped (section 7.8). Both this and `max_surge` 0 is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 0))]
+    pub max_unavailable: Option<u32>,
     /// The timeouts the host enforces on its workers (section 7.6), and
     /// those of a request the release serves, which the edge enforces
     /// (section 4.6).

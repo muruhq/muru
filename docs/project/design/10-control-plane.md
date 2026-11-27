@@ -35,7 +35,7 @@ The reconciler is level-triggered and idempotent: each pass compares desired and
 ## 10.2 State store, persistence and recovery
 
 - SQLite in WAL mode in the state directory (section 13.8), holding desired state, release records, rollout history, events within retention, the audit log and the period each log file was last seen in (section 11.3). Schema migrations are forward-compatible for one version, so a failed daemon upgrade can be reversed.
-- Each host is started with a random token and a run directory containing its control socket. After a daemon restart the daemon scans run directories, verifies tokens and process start times, and re-adopts hosts. Hosts not in desired state are drained and removed after a grace period.
+- Each host is started with a random token and a run directory containing its control socket. After a daemon restart the daemon scans run directories, verifies tokens and process start times, and re-adopts hosts, each of which then sends it the events it held while no daemon was connected (section 11.5). Hosts not in desired state are drained and removed after a grace period.
 - muructl daemon backup and restore save and load the whole store.
 
 ## 10.3 Configuration files
@@ -80,8 +80,7 @@ flowchart LR
 | --- | --- |
 | Live, no disruption | route, limit, proxy, error page, weight and certificate changes, applied in the next snapshot |
 | Scaling | workers to fork or drain, schedules to activate |
-| Rolling restart | thread counts, max_requests, memory policy or hook changes, per group, with the max_surge that will be used |
-| New release | code, interpreter, environment, entrypoint or mount changes, including any build step and how traffic would move under the application's default strategy |
+| New release | code, interpreter, environment, entrypoint or mount changes, and thread count, max_requests, max_lifetime, max_surge, max_unavailable, memory policy or hook changes, including any build step and how traffic would move under the application's default strategy |
 | Removal | releases, routes or hosts to drain and delete (only with --prune) |
 
 muructl deploy --dry-run asks the daemon the same of one deploy: the id the release would take, each setting with the layer it would come from (the flags, the application's settings, the source's settings, or the default), whether an environment would be built, what becomes of the release that serves, and what would refuse the deploy: an id already taken, a deploy freeze, a setting that fails its check or a release the node's memory budget has no room for. It installs nothing, so an interpreter a deploy would fetch is reported as missing. A deploy always plans a change, so its exit code is 0 when it would go ahead and 1 when it would be refused.
@@ -98,11 +97,12 @@ For scripts and CI: --json gives the same report in machine-readable form, and t
 | --- | --- | --- |
 | Hosts, routes, weights, limits, timeouts, error pages, proxies, certificates | snapshot swap | none |
 | Worker counts, scaling settings, schedules | host forks or drains | none |
-| Thread counts, max_requests, memory policy, hooks | rolling worker restart per group | none, bounded by max_surge |
-| Code, interpreter, environment, entrypoints, mounts | new release | none |
+| Code, interpreter, environment, entrypoints, mounts, thread counts, max_requests, max_lifetime, max_surge, max_unavailable, memory policy, hooks | new release | none |
 | Edge pools and process counts | edge processes added or replaced with handoff | none |
 | Edge or daemon binary | handoff or re-exec | none to traffic |
 | New listener address | daemon creates socket, edge adopts it | none for existing listeners |
+
+- **A running release's settings are not changed in place (issue 920, ADR 0085).** A release is immutable: an apply refuses a changed release under an id the daemon has, and an application's settings reach the releases deployed after the change (section 3.3). A change to thread counts, `max_requests`, `max_lifetime`, `max_surge`, `max_unavailable`, the memory policy or the hooks therefore reaches traffic as a new release, with the drain and rollback every release has, and a plan lists it under "New release". Nothing restarts the workers of a running release because a setting changed, and a plan has no class for it. The workers of a release are replaced one group at a time, with its settings unchanged, by the restart call of section 10.14.
 
 ## 10.6 Admin API and access
 
@@ -228,3 +228,15 @@ What the daemon serves is held in deployments (ADRs 0080 and 0082).
 - **An application is the files' or the command line's.** One that applied files declare gets its releases and its settings from them; one that no file declares gets them from muructl deploy and muructl app set. A deploy on a declared application works, for an emergency, and always warns that the release is not in the files and what the next apply does with it. muructl app set and unset are refused on an application a named deployment owns, and in `default` app set warns when the settings were last written by an apply. A route in a file may name an application no file declares.
 - **An application's own settings are declared in one file of an apply.** A second file that sets any key of `[app.NAME]`, `env` among them, is refused, as a host declared twice is. Releases of one application add up across files.
 - **A deployment file is written for one node.** `[app.NAME]` is the home of what belongs to this node (section 3.3). Nodes that share most of a deployment split it across files with the same key.
+
+## 10.14 The restart call
+
+The admin API restarts every worker of a running release with one call (issue 871, ADR 0085), for an application whose workers are to start again on the same release: after a change to something they read at start that is not part of the release, or to clear state they have built up.
+
+- **RestartRelease** names the application, the release (the serving release without one) and optionally one worker group. It is a call of its own, apart from Debug, so that an allowlist can admit restarts without the debug operations. The daemon tells the release's host to replace every worker of the groups named that was started before the call, and the host takes the turns: each marked worker joins its group's queue of swaps (section 7.8) and is replaced under the group's `max_surge` and `max_unavailable`, as a recycle is. The settings of the release do not change, since a release is immutable (section 10.5).
+- **It returns at once,** saying how many workers were marked. The events `restart.started`, the `worker.restarted` of each worker and `restart.finished` give its progress, and the release's description says that a restart is under way and how many workers are still to go. With `wait` the call returns once the host has finished, or says that it is still under way when `wait_timeout_ms` passes.
+- **The host holds the marks,** so a restart carries on while the daemon is stopped or upgrading, and a daemon that starts again reads how far it has got from the host. A worker that goes another way meanwhile, by a recycle, a crash or a scale-in, is no longer marked. A worker being debugged is pinned, as for every policy, and is replaced once its last session ends. A second call while one is under way marks the workers started since the first.
+- **CancelRestart** clears the marks: the workers not yet replaced stay, a replacement already started is finished, and `restart.finished` says how many were left.
+- `muructl restart APP --all` and `--group NAME` are this call, waiting by default. Restarting one worker by its index stays a Debug operation (section 7.6), is not queued, and follows the order of section 7.8.
+- **Details fixed by the implementation.** The daemon, a run and a serve all serve both calls. Each asks the host with the control request `restart_all` (`{"group": NAME}`) or `restart_cancel`, which Debug refuses as operations, and the host answers with the workers it marked or left. The host keeps a `RestartAll`: the pids marked and not yet being replaced, those whose replacement is under way, the total and when it began. `Host.advance_restart`, run at each tick, gives each marked worker that is ready to `Host.swap` with the cause `restart`, in the order of the workers' indices, drops one that has gone another way, and raises `restart.finished` once none is left, its reason `cancelled` after a cancel. A marked worker's wait for its turn raises no `worker.swap_waiting`, since `restart.started` has said they take turns, unless it waits for the node's budget. The host tells its supervisor how far it has got with a `restart` message (`total`, `left`, `started_unix_ms`, `group`) whenever that changes and when a supervisor connects, so a daemon that starts again has it within a moment; `Release.restart` carries it while one is under way, and `muructl release show` prints it. With `wait`, the call polls that record until the host says nothing is left, the release stops or `wait_timeout_ms` passes, ten minutes when 0, and answers with the `restart` still under way when it timed out. The wait reads the release's record and never the events, so no caller is left waiting by an event that went astray, and a daemon that starts again has no record of a restart until a host tells it of one. The events the host raises while no daemon is connected, a `worker.restarted` or the `restart.finished` among them, it holds and sends to the daemon that connects (section 11.5). `muructl restart --cancel` is CancelRestart, and `--force` is refused with `--all` and `--group`, a forced restart being of one worker.
+

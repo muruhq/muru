@@ -64,6 +64,9 @@ connections still open on the old edge are closed when it exits.
 The command waits until the upgraded daemon answers with its new edge.
 The daemon checks that the installed binary runs before it commits, and
 the `daemon.upgraded` and `edge.replaced` events record what happened.
+What the hosts did meanwhile, a worker recycled or restarted, is
+recorded once the upgraded daemon has taken them over, each
+[event](events.md) with the time it happened.
 `muructl status` shows the daemon's version afterwards.
 
 A daemon of a version before 0.1.0a37 is not upgraded in place. Those

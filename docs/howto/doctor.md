@@ -41,6 +41,7 @@ ok      releases      3 releases in the store, 1 with a host or instances that r
 ok      edge          the edge (pid 4133) serves snapshot 12, the one the daemon last sent
 ok      versions      the daemon and its edge run version 1.0.0, as this muructl is, and so does the runtime library of 1 hosts
 ok      disk          each location belongs to root and has room: state 41.2GB, run 1.9GB, log 41.2GB, cache 41.2GB free
+ok      budget        the node's memory budget is 12.0GB, from the daemon's configuration file
 ```
 
 It checks one installation: the daemon whose locations the command's
@@ -96,6 +97,7 @@ development run's directory of files that no live run names.
 | `edge` | The edge that answers is the process the daemon and its record name, and the routing it serves is the routing the daemon last sent it. |
 | `versions` | The daemon and its edge run the version of this `muructl`. A release keeps the runtime library it started with through an [upgrade](upgrading.md#releases), so the releases on another version are named and are no failure. |
 | `disk` | Each of the state, run, log and cache directories belongs to the daemon's user, who may write to it, no other user may write to the run directory, and each has 64MB free or more. |
+| `budget` | Always: it says where the node's memory limit comes from, and warns when there is none. |
 
 A check that fails says what it found, and names the command that puts
 it right where one does:
@@ -112,6 +114,7 @@ ok      releases      3 releases in the store, 1 with a host or instances that r
 ok      edge          the edge (pid 4133) serves snapshot 12, the one the daemon last sent
 FAILED  versions      the daemon (pid 4120) runs version 1.0.0, and this muructl is version 1.1.0; see muructl daemon upgrade
 ok      disk          each location belongs to root and has room: state 41.2GB, run 1.9GB, log 41.2GB, cache 41.2GB free
+ok      budget        the node's memory budget is 12.0GB, from the daemon's configuration file
 $ echo $?
 1
 ```
@@ -127,6 +130,31 @@ $ echo $?
 | `muructl release prune` | Removes releases that no longer serve, with their environments and logs, for the room. |
 
 Doctor repairs nothing itself.
+
+## A node with no memory limit
+
+The [node's budget](scaling.md#the-nodes-budget) limits memory only
+when it is given a limit: `memory` in the `[daemon.budget]` table of
+the daemon's configuration file, or else a memory limit on the systemd
+unit or the container the daemon runs in. A daemon with neither has no
+memory budget, and doctor says so:
+
+```
+warning budget        the node has no memory limit, so every scale-out is admitted and every release starts whatever memory the machine has, no worker is replaced for the node's memory, and what stops a node that takes too much is swap or the kernel's OOM killer: set memory in the [daemon.budget] table of the daemon's configuration file, or a memory limit on the unit or container the daemon runs in; see muructl daemon config set daemon.budget.memory SIZE
+```
+
+It is a warning and not a failure: doctor still exits 0, and in the
+JSON document the check has `ok` true and `warning` true. Muru takes no
+limit from the machine's own memory. To give the node one:
+
+```
+muructl daemon config set daemon.budget.memory 12GB
+```
+
+or, under systemd, `MemoryMax=` in the daemon's unit, or the memory
+limit of its container. With no daemon running, doctor reads the
+configuration file alone, and says that a limit of the unit or
+container is known once the daemon runs.
 
 ## The state store
 

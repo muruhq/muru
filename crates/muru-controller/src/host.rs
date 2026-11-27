@@ -79,6 +79,10 @@ pub enum HostMessage {
         /// the requests it names (issue 706), which only a development
         /// run keeps.
         evidence: Option<muru_edge::recorder::Evidence>,
+        /// When it happened, in Unix milliseconds, for an event the host
+        /// held while no supervisor was connected (section 11.5); none
+        /// for one sent as it happened.
+        time_unix_ms: Option<u64>,
     },
     /// Evidence for request records that is no event of its own (issue
     /// 706): that a request past its deadline has since ended.
@@ -93,6 +97,21 @@ pub enum HostMessage {
         /// The workers being replaced for memory, which the memory guard
         /// counts as its one at a time (section 13.9, issue 662).
         memory_replacements: Vec<MemoryReplacement>,
+        /// The voluntary swaps waiting their turn, by group (section
+        /// 7.8).
+        swaps_waiting: std::collections::BTreeMap<String, u32>,
+    },
+    /// How far a restart of every worker has got (section 10.14), sent
+    /// when it changes and to a supervisor that connects during one.
+    Restart {
+        /// The workers marked.
+        total: u32,
+        /// Those not yet replaced; 0 once it has finished.
+        left: u32,
+        /// When it began, in Unix milliseconds.
+        started_unix_ms: u64,
+        /// The one group it restarts; every group when empty.
+        group: String,
     },
     /// The workers' answers to a request (section 11.7).
     Response {
@@ -391,6 +410,7 @@ impl HostMessage {
                 group: value["group"].as_str().unwrap_or_default().to_owned(),
                 reason: value["reason"].as_str().unwrap_or_default().to_owned(),
                 evidence: value.get("evidence").map(|_| evidence(&value)),
+                time_unix_ms: value["time_unix_ms"].as_u64(),
             }),
             "capture" => Some(Self::Capture(evidence(&value))),
             "loaded" => Some(Self::Loaded {
@@ -406,6 +426,12 @@ impl HostMessage {
                 part: value["part"].as_u64().unwrap_or(0) as usize,
                 parts: value["parts"].as_u64().unwrap_or(1) as usize,
                 data: value["data"].as_str().unwrap_or_default().to_owned(),
+            }),
+            "restart" => Some(Self::Restart {
+                total: value["total"].as_u64().unwrap_or(0) as u32,
+                left: value["left"].as_u64().unwrap_or(0) as u32,
+                started_unix_ms: value["started_unix_ms"].as_u64().unwrap_or(0),
+                group: value["group"].as_str().unwrap_or_default().to_owned(),
             }),
             "response" => Some(Self::Response {
                 id: value["id"].as_u64().unwrap_or(0),
@@ -490,6 +516,17 @@ impl HostMessage {
                                     .to_owned(),
                                 index: replacement["index"].as_u64().unwrap_or(0) as u32,
                                 pid: replacement["pid"].as_u64().unwrap_or(0) as u32,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                swaps_waiting: value["swaps_waiting"]
+                    .as_object()
+                    .map(|groups| {
+                        groups
+                            .iter()
+                            .map(|(group, count)| {
+                                (group.clone(), count.as_u64().unwrap_or(0) as u32)
                             })
                             .collect()
                     })
@@ -739,6 +776,12 @@ pub struct HostSpec {
     pub max_requests: Option<u64>,
     /// How long a worker lives before it is replaced (section 7.7).
     pub max_lifetime: Option<Duration>,
+    /// How many workers a group may run over its count while workers are
+    /// swapped (section 7.8).
+    pub max_surge: u32,
+    /// How many workers a group may run under its count while workers
+    /// are swapped.
+    pub max_unavailable: u32,
     /// How long a request may run before it is interrupted (section
     /// 7.6); off when absent.
     pub soft_timeout: Option<Duration>,
@@ -1102,6 +1145,12 @@ pub struct HostGroup {
     /// How long a worker lives before it is replaced, resolved over the
     /// release's.
     pub max_lifetime: Option<Duration>,
+    /// How many workers the group may run over its count while workers
+    /// are swapped, resolved over the release's (section 7.8).
+    pub max_surge: u32,
+    /// How many workers the group may run under its count while workers
+    /// are swapped, resolved over the release's.
+    pub max_unavailable: u32,
     /// Whether the release is ready without the group's workers (ADR
     /// 0033).
     pub optional: bool,
@@ -1398,6 +1447,10 @@ impl HostProcess {
                     |lifetime| lifetime.as_secs_f64().to_string()
                 ),
             ));
+            command.arg("--group-swap").arg(format!(
+                "{}={},{}",
+                group.name, group.max_surge, group.max_unavailable
+            ));
         }
 
         if let Some(level) = spec.logging.level {
@@ -1454,6 +1507,12 @@ impl HostProcess {
             .arg(spec.loop_stall_timeout.as_secs_f64().to_string())
             .arg("--gil-stall-timeout")
             .arg(spec.gil_stall_timeout.as_secs_f64().to_string());
+
+        command
+            .arg("--max-surge")
+            .arg(spec.max_surge.to_string())
+            .arg("--max-unavailable")
+            .arg(spec.max_unavailable.to_string());
 
         if let Some(count) = spec.max_requests {
             command.arg("--max-requests").arg(count.to_string());
@@ -3200,6 +3259,40 @@ mod tests {
     }
 
     #[test]
+    fn a_restarts_progress_is_read() {
+        let parsed = HostMessage::parse(
+            r#"{"type":"restart","total":4,"left":3,"started_unix_ms":1700000000000,"group":"reports"}"#,
+        );
+        assert!(matches!(
+            parsed,
+            Some(HostMessage::Restart { total: 4, left: 3, started_unix_ms: 1_700_000_000_000, ref group })
+                if group == "reports"
+        ));
+    }
+
+    #[test]
+    fn a_status_carries_the_swaps_waiting_in_each_group() {
+        let parsed = HostMessage::parse(
+            r#"{"type":"status","host":{},"workers":[],"memory_replacements":[],
+                "swaps_waiting":{"default":2,"reports":0}}"#,
+        );
+        let Some(HostMessage::Status { swaps_waiting, .. }) = parsed else {
+            panic!("not a status");
+        };
+
+        assert_eq!(swaps_waiting.get("default"), Some(&2));
+        assert_eq!(swaps_waiting.get("reports"), Some(&0));
+
+        // A host from before the queue says nothing of it.
+
+        let old = HostMessage::parse(r#"{"type":"status","host":{},"workers":[]}"#);
+        assert!(matches!(
+            old,
+            Some(HostMessage::Status { swaps_waiting, .. }) if swaps_waiting.is_empty()
+        ));
+    }
+
+    #[test]
     fn a_hosts_load_is_an_event_with_the_import_reports_figures() {
         let parsed = HostMessage::parse(
             r#"{"type":"loaded","outcome":"fork","ms":519.6,"first":true,
@@ -3282,7 +3375,24 @@ mod tests {
         let plain = HostMessage::parse(r#"{"type":"event","kind":"worker.exited","message":"x"}"#);
         assert!(matches!(
             plain,
-            Some(HostMessage::Event { evidence: None, .. })
+            Some(HostMessage::Event {
+                evidence: None,
+                time_unix_ms: None,
+                ..
+            })
+        ));
+
+        // Section 11.5: an event the host held carries when it happened.
+
+        let held = HostMessage::parse(
+            r#"{"type":"event","kind":"worker.recycled","message":"x","time_unix_ms":1700000000000}"#,
+        );
+        assert!(matches!(
+            held,
+            Some(HostMessage::Event {
+                time_unix_ms: Some(1_700_000_000_000),
+                ..
+            })
         ));
 
         let ended = HostMessage::parse(

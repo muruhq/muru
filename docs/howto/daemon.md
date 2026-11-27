@@ -252,8 +252,9 @@ creates it, so they can be in place before its first release.
 
 `muructl app set` takes the deploy flags for the variables and secrets,
 `--processes`, `--threads`, `--sync-threads`, `--concurrency`,
-`--max-requests`, `--max-lifetime`, `--timeout NAME=DURATION` and
-`--memory KEY=VALUE`, and `--replace` removes the settings not given.
+`--max-requests`, `--max-lifetime`, `--max-surge`, `--max-unavailable`,
+`--timeout NAME=DURATION` and `--memory KEY=VALUE`, and `--replace`
+removes the settings not given.
 The entrypoint, interface, interpreter and the other settings that say
 what the code is stay with the source and the deploy, as do the tables.
 `muructl app unset` removes settings by key, and `muructl app show`
@@ -359,8 +360,9 @@ two files set: the keys of its `[app.NAME]` table go in one file.
 The application's own table holds the [settings on the
 application](#settings-on-the-application) that `muructl app set` sets,
 with the same keys: `env`, `processes`, `threads`, `sync_threads`,
-`concurrency`, `max_requests`, `max_lifetime`, a `timeouts` table of the
-host's timeouts and a `memory` table. The file states them in full, as
+`concurrency`, `max_requests`, `max_lifetime`, `max_surge`,
+`max_unavailable`, a `timeouts` table of the host's timeouts and a
+`memory` table. The file states them in full, as
 it states the application's user, so applying a file whose application
 has none removes those `muructl app set` gave, and `muructl deployment
 export` writes them, so settings made at a terminal can be kept in a
@@ -1354,7 +1356,11 @@ webhooks; the [events guide](events.md) has the details.
 host keep serving exactly as they were. The next `muructl daemon start`
 (or `up`, or a service manager restarting the unit) finds them through
 the records in `run` under the state directory, takes them over, and carries on,
-so a daemon restart or upgrade never costs a request. `muructl daemon
+so a daemon restart or upgrade never costs a request. The events a host
+raises with no daemon, a worker replaced or exited among them, it holds
+and sends to the daemon that takes it over, which records each with the
+time it happened; the [events guide](events.md) has the details.
+`muructl daemon
 stop --shutdown` drains every release, stops the hosts and the edge, and
 then exits, for taking a node out of service. It leaves no records
 behind, and the next daemon starts the current releases afresh.

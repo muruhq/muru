@@ -4775,6 +4775,18 @@ pub struct ReleaseArgs {
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     pub(crate) max_lifetime: Option<Duration>,
 
+    /// Workers a group may run over its count while workers are swapped
+    /// (default 1): a replacement starts before the old worker stops
+    /// while the group is within it, and with 0 the old worker stops
+    /// first.
+    #[arg(long, value_name = "N")]
+    pub(crate) max_surge: Option<u32>,
+
+    /// Workers a group may run under its count while workers are
+    /// swapped (default 0).
+    #[arg(long, value_name = "N")]
+    pub(crate) max_unavailable: Option<u32>,
+
     /// A host timeout as NAME=DURATION: soft (interrupt a request that
     /// runs this long; off), hard (replace a worker whose request runs
     /// this long; off), hard_drain_grace (10s), shutdown (5s),
@@ -5265,6 +5277,8 @@ impl ReleaseArgs {
             max_lifetime_ms: self
                 .max_lifetime
                 .map(|lifetime| lifetime.as_millis() as u64),
+            max_surge: self.max_surge,
+            max_unavailable: self.max_unavailable,
             soft_timeout_ms: timeout_ms(&self.timeouts, "soft"),
             accel_redirect: None,
             cgi_local_redirect: None,
@@ -5810,8 +5824,8 @@ pub enum ScaleCommand {
     },
 }
 
-/// What `restart` takes: one worker of a release, by index or pid, or
-/// every worker in turn, gracefully or at once.
+/// What `restart` takes: one worker of a release, by index or pid,
+/// gracefully or at once, or every worker in turn.
 #[derive(Args)]
 pub struct RestartArgs {
     /// The release as app@release, or an application for its current
@@ -5830,18 +5844,26 @@ pub struct RestartArgs {
     #[arg(long, value_name = "PID", conflicts_with = "all")]
     pid: Option<u32>,
 
-    /// Every worker of the release, one at a time so capacity holds.
-    #[arg(long, required_unless_present_any = ["worker", "pid"])]
+    /// Every worker of the release, each in its turn: as many at once
+    /// as the max_surge and max_unavailable of its group allow, one at a
+    /// time by default, so capacity holds. The release's host takes the
+    /// turns, so the restart carries on if the daemon is stopped.
+    #[arg(long, required_unless_present_any = ["worker", "pid", "group", "cancel"])]
     all: bool,
 
-    /// With --all, the workers of one group only.
-    #[arg(long, value_name = "NAME", requires = "all")]
+    /// Every worker of one worker group, each in its turn.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["worker", "pid"])]
     group: Option<String>,
+
+    /// End a restart of every worker that is under way: the workers not
+    /// yet replaced stay as they are.
+    #[arg(long, conflicts_with_all = ["worker", "pid", "all", "group", "force", "no_wait"])]
+    cancel: bool,
 
     /// Take the worker out of routing and kill it at once, its stacks
     /// written to the log; the requests it is serving fail, and a
-    /// debugger session in it ends.
-    #[arg(long)]
+    /// debugger session in it ends. For one worker.
+    #[arg(long, conflicts_with_all = ["all", "group"])]
     force: bool,
 
     /// Return once the restart is under way, without waiting for the
@@ -5866,6 +5888,10 @@ const RESTART_POLL: Duration = Duration::from_millis(250);
 
 /// Replace one worker of a release, or each in turn, with a fresh one.
 pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
+    if args.cancel || args.all || args.group.is_some() {
+        return restart_release(args).await;
+    }
+
     let status = ask(
         &args.socket,
         args.target.as_deref().unwrap_or_default(),
@@ -5903,13 +5929,7 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
         None => status.release.clone(),
     };
 
-    let chosen: Vec<(WorkerName, u32)> = if args.all {
-        serving
-            .iter()
-            .filter(|(_, _, group)| args.group.as_ref().is_none_or(|wanted| wanted == group))
-            .map(|(name, pid, _)| (name.clone(), *pid))
-            .collect()
-    } else if let Some(pid) = args.pid {
+    let chosen: Vec<(WorkerName, u32)> = if let Some(pid) = args.pid {
         serving
             .iter()
             .find(|(_, candidate, _)| *candidate == pid)
@@ -5919,22 +5939,13 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
         let wanted = args
             .worker
             .as_ref()
-            .expect("clap requires --worker, --pid or --all");
+            .expect("clap requires --worker or --pid without --all");
         serving
             .iter()
             .find(|(name, _, _)| name == wanted)
             .map(|(name, pid, _)| vec![(name.clone(), *pid)])
             .ok_or_else(|| anyhow::anyhow!("{release} has no serving worker {wanted}"))?
     };
-
-    if chosen.is_empty() {
-        let group = args
-            .group
-            .as_ref()
-            .map(|group| format!(" in group {group}"))
-            .unwrap_or_default();
-        anyhow::bail!("{release} has no serving worker{group}");
-    }
 
     // With --json, one object for each worker replaced, printed together
     // at the end.
@@ -5961,7 +5972,13 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
             .unwrap_or_default();
         let how = if args.force { ", killed at once" } else { "" };
 
-        if !args.output.json {
+        // Section 7.8: a worker that stops first has no successor yet.
+
+        if !args.output.json && new_pid == 0 {
+            println!(
+                "muru: worker {name} (pid {pid}) is stopping, and is replaced once it has stopped{how}"
+            );
+        } else if !args.output.json {
             println!("muru: worker {name} (pid {pid}) is being replaced by pid {new_pid}{how}");
         }
 
@@ -5991,6 +6008,108 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// `restart --all`, `--group` and `--cancel`: every worker of a release,
+/// or of one group, replaced in turn by one call of the admin API, which
+/// the release's host carries out, or such a restart cancelled.
+async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
+    let target = args.target.as_deref().unwrap_or_default();
+
+    let (app, release) = match target {
+        "" => ("", ""),
+        target => split_target(target)?,
+    };
+
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
+
+    if args.cancel {
+        let answer = client
+            .cancel_restart(pb::CancelRestartRequest {
+                app: app.to_owned(),
+                release: release.to_owned(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+
+        if args.output.json {
+            return print_answer(&answer);
+        }
+
+        println!(
+            "muru: the restart of {} is cancelled: {} left as {} {}",
+            release_name(&answer.app, &answer.release),
+            counted(answer.workers.len(), "worker", "workers"),
+            if answer.workers.len() == 1 {
+                "it"
+            } else {
+                "they"
+            },
+            if answer.workers.len() == 1 {
+                "was"
+            } else {
+                "were"
+            },
+        );
+        return Ok(());
+    }
+
+    let answer = client
+        .restart_release(pb::RestartReleaseRequest {
+            app: app.to_owned(),
+            release: release.to_owned(),
+            group: args.group.clone().unwrap_or_default(),
+            wait: !args.no_wait,
+            wait_timeout_ms: 0,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+    let name = release_name(&answer.app, &answer.release);
+    let scope = args
+        .group
+        .as_ref()
+        .map(|group| format!(" of the group {group}"))
+        .unwrap_or_default();
+
+    if answer.workers.is_empty() {
+        anyhow::bail!("{name} has no worker{scope} to restart");
+    }
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else {
+        println!(
+            "muru: {}{scope} of {name} marked to be replaced, each in its turn",
+            counted(answer.workers.len(), "worker", "workers"),
+        );
+    }
+
+    match (&answer.restart, args.no_wait) {
+        (Some(restart), false) => anyhow::bail!(
+            "the restart of {name} is still under way: {} of {} left; muructl release show \
+             says how far it has got, and muructl restart --cancel ends it",
+            counted(restart.left as usize, "worker", "workers"),
+            restart.total
+        ),
+        (None, false) if !args.output.json => {
+            println!("muru: the restart of {name} has finished");
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// A release as a line names it: app@release, or the release alone for
+/// the one application of a run that named none.
+fn release_name(app: &str, release: &str) -> String {
+    if app.is_empty() {
+        release.to_owned()
+    } else {
+        format!("{app}@{release}")
+    }
 }
 
 /// Wait until the worker at `index` is one other than `old_pid`, ready,
@@ -6696,7 +6815,8 @@ pub enum AppCommand {
 
     /// Remove release settings from the application, by key: processes,
     /// threads, sync_threads, concurrency, max_requests, max_lifetime,
-    /// timeouts.KEY, memory.KEY, env.NAME, or env for every variable.
+    /// max_surge, max_unavailable, timeouts.KEY, memory.KEY, env.NAME,
+    /// or env for every variable.
     Unset(Box<AppUnsetArgs>),
 
     /// Show the release settings the application gives its releases.
@@ -6742,6 +6862,18 @@ pub struct AppSetArgs {
     /// Replace a worker after this long, for example 1h, with jitter.
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     max_lifetime: Option<Duration>,
+
+    /// Workers a group may run over its count while workers are swapped
+    /// (default 1): a replacement starts before the old worker stops
+    /// while the group is within it, and with 0 the old worker stops
+    /// first.
+    #[arg(long, value_name = "N")]
+    max_surge: Option<u32>,
+
+    /// Workers a group may run under its count while workers are
+    /// swapped (default 0).
+    #[arg(long, value_name = "N")]
+    max_unavailable: Option<u32>,
 
     /// A host timeout as NAME=DURATION, as deploy --timeout takes it:
     /// soft, hard, hard_drain_grace, shutdown, websocket_drain_grace,
@@ -6832,6 +6964,8 @@ impl AppSetArgs {
             max_lifetime_ms: self
                 .max_lifetime
                 .map(|lifetime| lifetime.as_millis() as u64),
+            max_surge: self.max_surge,
+            max_unavailable: self.max_unavailable,
             soft_timeout_ms: timeout("soft"),
             hard_timeout_ms: timeout("hard"),
             hard_drain_grace_ms: timeout("hard_drain_grace"),
@@ -8798,6 +8932,43 @@ fn workers_column(release: &pb::Release) -> String {
 }
 
 /// Show one release.
+/// A release's or a group's `max_surge` and `max_unavailable` in words,
+/// with the order its swaps take.
+fn swap_settings(max_surge: u32, max_unavailable: u32) -> String {
+    let order = if max_surge == 0 {
+        "the old worker stops first"
+    } else {
+        "the new worker starts first"
+    };
+
+    format!("max_surge {max_surge}, max_unavailable {max_unavailable} ({order})")
+}
+
+/// What a release's description says of a surge allowance the daemon
+/// granted short of `max_surge`, or nothing when it is whole or no host
+/// runs.
+fn surge_granted(max_surge: u32, allowance: Option<u32>, short: &str) -> String {
+    let Some(allowance) = allowance.filter(|allowance| *allowance < max_surge) else {
+        return String::new();
+    };
+
+    let why = match short {
+        "traffic" => "the release takes no traffic".to_owned(),
+        "workers" => "the node's worker budget has no room".to_owned(),
+        "memory" => "the node's memory budget has no room".to_owned(),
+        "cpu" => "the node's CPU budget has no room".to_owned(),
+        _ => "the node's budget has no room".to_owned(),
+    };
+
+    if allowance == 0 && short == "traffic" {
+        format!("; no surge allowance now, since {why}, so the old worker stops first")
+    } else if allowance == 0 {
+        format!("; no surge allowance now, since {why}")
+    } else {
+        format!("; a surge allowance of {allowance} now, since {why}")
+    }
+}
+
 pub async fn release_show(release: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
     let mut client = client::connect(&socket.endpoint()?).await?;
@@ -9011,6 +9182,49 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
                     group.sync_threads
                 ),
                 if group.optional { ", optional" } else { "" }
+            ) + &if (group.max_surge, group.max_unavailable)
+                == (release.max_surge, release.max_unavailable)
+            {
+                String::new()
+            } else {
+                format!(
+                    ", {}",
+                    swap_settings(group.max_surge, group.max_unavailable)
+                )
+            } + &surge_granted(group.max_surge, group.surge_allowance, &group.surge_short),
+        ));
+    }
+
+    // Section 7.8: how far a group may move from its count while its
+    // workers are swapped. A release of another kind has neither.
+
+    if release.max_surge + release.max_unavailable > 0 {
+        lines.push((
+            "swaps".to_owned(),
+            swap_settings(release.max_surge, release.max_unavailable)
+                + &surge_granted(
+                    release.max_surge,
+                    release.surge_allowance,
+                    &release.surge_short,
+                ),
+        ));
+    }
+
+    // Section 10.14: a restart of every worker under way.
+
+    if let Some(restart) = &release.restart {
+        lines.push((
+            "restart".to_owned(),
+            format!(
+                "{} of {}{} still to be replaced, each in its turn; muructl restart --cancel \
+                 leaves them",
+                restart.left,
+                counted(restart.total, "worker", "workers"),
+                if restart.group.is_empty() {
+                    String::new()
+                } else {
+                    format!(" of the group {}", restart.group)
+                }
             ),
         ));
     }

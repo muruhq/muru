@@ -13,6 +13,7 @@ import socket
 import sqlite3
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -125,6 +126,7 @@ def test_doctor_lists_an_installation_and_fails_on_what_is_wrong(base: Path) -> 
 
         checks = {check["check"]: check for check in document["checks"]}
         assert sorted(checks) == [
+            "budget",
             "disk",
             "edge",
             "locks",
@@ -138,6 +140,41 @@ def test_doctor_lists_an_installation_and_fails_on_what_is_wrong(base: Path) -> 
         assert "the one the daemon last sent" in checks["edge"]["detail"]
         assert "the daemon and its edge run version " in checks["versions"]["detail"]
         assert "has room: state " in checks["disk"]["detail"]
+
+        # Issue 961: a node with no memory limit, from the daemon's file
+        # or its own cgroup, is warned of, which fails nothing. Where the
+        # tests run under a cgroup's limit, that is the node's budget.
+
+        budget = checks["budget"]
+        assert budget["ok"], budget
+
+        if budget.get("warning"):
+            assert budget["detail"].startswith("the node has no memory limit, so every scale-out")
+            assert "[daemon.budget]" in budget["detail"]
+            assert budget["fix"] == "muructl daemon config set daemon.budget.memory SIZE"
+            assert "\nwarning budget " in doctor(daemon).stdout
+        else:
+            assert "from the memory limit of the daemon's cgroup" in budget["detail"], budget
+
+        # With a limit in the daemon's file there is nothing to warn of.
+
+        (daemon.base / "muru.toml").write_text("[daemon.budget]\nmemory = '2GB'\n")
+        daemon.muructl("daemon", "reload")
+        deadline = time.monotonic() + 20
+
+        while True:
+            budget = {check["check"]: check for check in report(daemon)[1]["checks"]}["budget"]
+
+            if "configuration file" in budget["detail"] or time.monotonic() > deadline:
+                break
+
+            time.sleep(0.5)
+
+        assert budget == {
+            "check": "budget",
+            "ok": True,
+            "detail": "the node's memory budget is 2.0GB, from the daemon's configuration file",
+        }, budget
 
         # A daemon that runs says where its files are, so its run
         # directory alone finds it.

@@ -126,6 +126,10 @@ struct Check {
     /// The command that puts a failure right, when one does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fix: Option<String>,
+    /// Whether what was found is worth knowing though nothing is wrong:
+    /// a warning, which does not fail doctor.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    warning: bool,
 }
 
 /// Everything `muructl doctor` reports.
@@ -165,6 +169,7 @@ impl Report {
             ok: true,
             detail,
             fix: None,
+            warning: false,
         });
     }
 
@@ -174,6 +179,19 @@ impl Report {
             ok: false,
             detail,
             fix: fix.map(str::to_owned),
+            warning: false,
+        });
+    }
+
+    /// Something that is not a fault and that whoever runs the node
+    /// should know: it passes, and is printed as a warning.
+    fn warn(&mut self, check: &str, detail: String, fix: Option<&str>) {
+        self.checks.push(Check {
+            check: check.to_owned(),
+            ok: true,
+            detail,
+            fix: fix.map(str::to_owned),
+            warning: true,
         });
     }
 }
@@ -2033,6 +2051,73 @@ fn check_disk(installation: &Installation, report: &mut Report) {
     }
 }
 
+/// The memory limit the daemon's configuration file gives the node's
+/// budget, as the file writes it, when it gives one.
+fn budget_memory_in_file(config: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(config).ok()?;
+    let document: toml::Value = toml::from_str(&text).ok()?;
+    let memory = document.get("daemon")?.get("budget")?.get("memory")?;
+    Some(memory.as_str()?.to_owned())
+}
+
+/// Check the node's budget (issue 961): a daemon with no memory limit,
+/// from its file or from its own cgroup, admits every scale-out and
+/// starts every release, and nothing tells its operator so. That is a
+/// way to run a node and not a fault, so it is a warning.
+fn check_budget(installation: &Installation, report: &mut Report) {
+    const CHECK: &str = "budget";
+    let in_file = budget_memory_in_file(&installation.locations.config.path);
+
+    // With no daemon answering, the limit of the unit or container it
+    // would run in is not known, so only the file can be read.
+
+    let Some(status) = installation
+        .status
+        .as_ref()
+        .filter(|status| status.kind != "run")
+    else {
+        report.pass(
+            CHECK,
+            match in_file {
+                Some(memory) => format!(
+                    "the daemon's configuration file gives the node a memory budget of {memory}"
+                ),
+                None => "no daemon runs, and its configuration file sets no memory budget; \
+                         whether its unit or container limits its memory is known once it runs"
+                    .to_owned(),
+            },
+        );
+        return;
+    };
+
+    match (status.budget_memory, status.budget_memory_from.as_str()) {
+        (Some(memory), "cgroup") => report.pass(
+            CHECK,
+            format!(
+                "the node's memory budget is {}, from the memory limit of the daemon's cgroup",
+                human_size(memory)
+            ),
+        ),
+        (Some(memory), _) => report.pass(
+            CHECK,
+            format!(
+                "the node's memory budget is {}, from the daemon's configuration file",
+                human_size(memory)
+            ),
+        ),
+        (None, _) => report.warn(
+            CHECK,
+            "the node has no memory limit, so every scale-out is admitted and every release \
+             starts whatever memory the machine has, no worker is replaced for the node's \
+             memory, and what stops a node that takes too much is swap or the kernel's OOM \
+             killer: set memory in the [daemon.budget] table of the daemon's configuration \
+             file, or a memory limit on the unit or container the daemon runs in"
+                .to_owned(),
+            Some("muructl daemon config set daemon.budget.memory SIZE"),
+        ),
+    }
+}
+
 /// Print a table of items, the paths lined up.
 fn print_items(heading: &str, items: &[Item]) {
     println!("{heading}");
@@ -2060,7 +2145,11 @@ fn print_checks(checks: &[Check]) {
     println!("CHECKS");
 
     for check in checks {
-        let word = if check.ok { "ok" } else { "FAILED" };
+        let word = match (check.ok, check.warning) {
+            (false, _) => "FAILED",
+            (true, true) => "warning",
+            (true, false) => "ok",
+        };
 
         match &check.fix {
             Some(fix) => println!("{word:<7} {:<13} {}; see {fix}", check.check, check.detail),
@@ -2085,6 +2174,7 @@ pub(crate) async fn examine(locations: Locations) -> Report {
     let edge = check_edge(&installation, &mut report).await;
     check_versions(&installation, edge, &mut report);
     check_disk(&installation, &mut report);
+    check_budget(&installation, &mut report);
 
     report.ok = report.checks.iter().all(|check| check.ok)
         && report

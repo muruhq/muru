@@ -166,6 +166,25 @@ impl RunEvents {
 
     /// Record an event and tell the watchers.
     pub fn record(&self, kind: &str, subject: &str, level: &str, message: &str) {
+        self.record_at(kind, subject, level, message, None);
+    }
+
+    /// Record an event that happened at `time_unix_ms`, or now when none
+    /// is given, and tell the watchers: an event a host held while
+    /// nothing was connected carries the time it was raised. A time
+    /// ahead of the clock is taken as now.
+    pub fn record_at(
+        &self,
+        kind: &str,
+        subject: &str,
+        level: &str,
+        message: &str,
+        time_unix_ms: Option<u64>,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+
         let level = match level {
             "error" | "warning" | "notice" => level,
             _ => "info",
@@ -176,9 +195,7 @@ impl RunEvents {
             kept.0 += 1;
             let event = pb::Event {
                 sequence: kept.0,
-                time_unix_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| since.as_millis() as u64),
+                time_unix_ms: time_unix_ms.map_or(now, |happened| happened.min(now)),
                 r#type: kind.to_owned(),
                 subject: subject.to_owned(),
                 level: level.to_owned(),
@@ -754,6 +771,16 @@ pub fn debug_source(
     })
 }
 
+/// A worker a restart marked, or left, as the admin API names it.
+fn marked_worker(reply: WorkerReply) -> pb::Worker {
+    pb::Worker {
+        index: reply.index,
+        pid: reply.pid,
+        group: reply.group,
+        ..pb::Worker::default()
+    }
+}
+
 /// Workers replaced and workers gone, by metric, application, release,
 /// group and reason, counted from the host's events. A process runs one
 /// application, so one count serves it.
@@ -834,6 +861,33 @@ pub fn set_release_load(app: &str, release: &str, ms: u64) {
         .insert((app.to_owned(), release.to_owned()), ms);
 }
 
+/// The restart of every worker the host has under way, as it last said
+/// how far it had got; none when none is.
+static RESTART: Mutex<Option<pb::RestartStatus>> = Mutex::new(None);
+
+/// Note how far the host's restart of every worker has got, or that
+/// none is under way.
+pub fn set_restart(restart: Option<pb::RestartStatus>) {
+    *RESTART.lock().expect("restart poisoned") = restart;
+}
+
+fn restart_under_way() -> Option<pb::RestartStatus> {
+    RESTART.lock().expect("restart poisoned").clone()
+}
+
+/// The voluntary swaps waiting their turn in each group of the release
+/// that runs, as its host last said (section 7.8).
+static SWAPS_WAITING: Mutex<BTreeMap<(String, String, String), u32>> = Mutex::new(BTreeMap::new());
+
+/// Note the swaps a release's host says are waiting, by group, in place
+/// of what any release's host said before.
+pub fn set_swaps_waiting(app: &str, release: &str, waiting: BTreeMap<String, u32>) {
+    *SWAPS_WAITING.lock().expect("swaps waiting poisoned") = waiting
+        .into_iter()
+        .map(|(group, count)| ((app.to_owned(), release.to_owned(), group), count))
+        .collect();
+}
+
 /// Note what a release's workers last reported of the modules they have
 /// loaded, in place of what the release's workers reported before.
 pub fn set_worker_modules(
@@ -884,6 +938,22 @@ fn load_samples() -> Vec<muru_edge::metrics::Sample> {
             *loaded,
             *us,
             *load_us,
+        ));
+    }
+
+    // Section 7.8: the swaps waiting their turn in each group.
+
+    let waiting = SWAPS_WAITING.lock().expect("swaps waiting poisoned");
+
+    for ((app, release, group), count) in waiting.iter() {
+        samples.push(muru_edge::metrics::Sample::new(
+            "muru_worker_swaps_waiting",
+            &[
+                ("app", app.as_str()),
+                ("release", release.as_str()),
+                ("group", group.as_str()),
+            ],
+            f64::from(*count),
         ));
     }
 
@@ -1566,6 +1636,8 @@ impl Admin for Service {
     ) -> Result<Response<pb::Status>, Status> {
         let state = &self.state;
         Ok(Response::new(pb::Status {
+            budget_memory: None,
+            budget_memory_from: String::new(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             pid: std::process::id(),
             instance_id: state.instance_id.clone(),
@@ -1935,6 +2007,7 @@ impl Admin for Service {
         request: Request<pb::DebugRequest>,
     ) -> Result<Response<pb::DebugResponse>, Status> {
         let request = request.into_inner();
+        muru_controller::api::refuse_host_request(&request.op).map_err(Status::invalid_argument)?;
         let imports = request.op == "imports";
 
         // Section 6.18: an earlier load's import report is kept too, under
@@ -2191,6 +2264,67 @@ impl Admin for Service {
         Ok(Response::new(stream))
     }
 
+    /// Every worker of the run's release replaced in turn by its host,
+    /// as the daemon's call does.
+    async fn restart_release(
+        &self,
+        request: Request<pb::RestartReleaseRequest>,
+    ) -> Result<Response<pb::RestartReleaseResponse>, Status> {
+        let request = request.into_inner();
+        let release = self
+            .state
+            .target(&request.app, &request.release)
+            .map_err(Status::not_found)?;
+        let marked = self
+            .state
+            .ask(
+                "restart_all",
+                None,
+                serde_json::json!({ "group": request.group }),
+            )
+            .await
+            .map_err(Status::failed_precondition)?;
+
+        if request.wait && !marked.is_empty() {
+            let deadline = tokio::time::Instant::now()
+                + muru_controller::api::restart_wait(request.wait_timeout_ms);
+
+            while restart_under_way().is_some() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+
+        Ok(Response::new(pb::RestartReleaseResponse {
+            app: self.state.app.clone(),
+            release,
+            workers: marked.into_iter().map(marked_worker).collect(),
+            restart: restart_under_way(),
+        }))
+    }
+
+    async fn cancel_restart(
+        &self,
+        request: Request<pb::CancelRestartRequest>,
+    ) -> Result<Response<pb::RestartReleaseResponse>, Status> {
+        let request = request.into_inner();
+        let release = self
+            .state
+            .target(&request.app, &request.release)
+            .map_err(Status::not_found)?;
+        let left = self
+            .state
+            .ask("restart_cancel", None, serde_json::json!({}))
+            .await
+            .map_err(Status::failed_precondition)?;
+
+        Ok(Response::new(pb::RestartReleaseResponse {
+            app: self.state.app.clone(),
+            release,
+            workers: left.into_iter().map(marked_worker).collect(),
+            restart: restart_under_way(),
+        }))
+    }
+
     needs_the_daemon! {
         list_apps(pb::ListAppsRequest) -> pb::ListAppsResponse, "muructl app";
         get_app(pb::GetAppRequest) -> pb::App, "muructl app";
@@ -2268,5 +2402,33 @@ mod tests {
             [259, 260]
         );
         assert_eq!(events.after(0, 3).len(), 3);
+    }
+
+    #[test]
+    fn an_event_a_host_held_keeps_the_time_it_happened() {
+        let events = RunEvents::default();
+        events.record_at(
+            "worker.recycled",
+            "shop@r1",
+            "info",
+            "held",
+            Some(1_700_000_000_000),
+        );
+        events.record_at(
+            "worker.recycled",
+            "shop@r1",
+            "info",
+            "ahead",
+            Some(u64::MAX / 2),
+        );
+        events.record("worker.recycled", "shop@r1", "info", "now");
+
+        let kept = events.after(0, 10);
+        assert_eq!(kept[0].time_unix_ms, 1_700_000_000_000);
+        assert!(kept[1].time_unix_ms <= kept[2].time_unix_ms);
+        assert_eq!(
+            kept.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
     }
 }

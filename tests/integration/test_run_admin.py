@@ -226,6 +226,14 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
         assert "worker 1" in restarted and "is being replaced by pid" in restarted
         assert server.wait_for_log(": worker.restarted: worker 1")
 
+        # Section 10.14: every worker in turn is one call here too, which
+        # the run's host carries out.
+
+        rolling = muructl(runtime, "restart", "plain-wsgi", "--all", cwd=support.FIXTURES).stdout
+        assert "workers of plain-wsgi@r1 marked to be replaced" in rolling, rolling
+        assert "the restart of plain-wsgi@r1 has finished" in rolling, rolling
+        assert server.wait_for_log(": restart.finished: the ")
+
         # A change to what the access log writes goes into the run's edge
         # at once and is printed as the daemon records it.
 

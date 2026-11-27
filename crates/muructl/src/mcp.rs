@@ -1400,7 +1400,7 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "set_app_settings",
-            description: "Set release settings on an application, which every release deployed from now takes over the source's [tool.muru] and under a deploy's own flags: env (variables), secrets (NAME to STORE:KEY, or STORE:KEY:file), processes, threads, sync_threads, concurrency, max_requests, max_lifetime, timeouts (NAME to a duration: soft, hard, hard_drain_grace, shutdown, websocket_drain_grace, exit_grace, loop_stall, gil_stall) and memory (KEY to a value). replace removes the others first. No running release changes; the application is created when it does not exist.",
+            description: "Set release settings on an application, which every release deployed from now takes over the source's [tool.muru] and under a deploy's own flags: env (variables), secrets (NAME to STORE:KEY, or STORE:KEY:file), processes, threads, sync_threads, concurrency, max_requests, max_lifetime, max_surge, max_unavailable, timeouts (NAME to a duration: soft, hard, hard_drain_grace, shutdown, websocket_drain_grace, exit_grace, loop_stall, gil_stall) and memory (KEY to a value). replace removes the others first. No running release changes; the application is created when it does not exist.",
             changes: true,
             properties: json!({
                 "app": {"type": "string"},
@@ -1412,6 +1412,8 @@ fn specs() -> Vec<Spec> {
                 "concurrency": {"type": "integer"},
                 "max_requests": {"type": "integer"},
                 "max_lifetime": {"type": "string", "description": "A duration such as 1h"},
+                "max_surge": {"type": "integer", "description": "Workers a group may run over its count while workers are swapped"},
+                "max_unavailable": {"type": "integer", "description": "Workers a group may run under its count while workers are swapped"},
                 "timeouts": {"type": "object", "additionalProperties": {"type": "string"}},
                 "memory": {"type": "object", "additionalProperties": {"type": "string"}},
                 "replace": {"type": "boolean"},
@@ -1428,6 +1430,8 @@ fn specs() -> Vec<Spec> {
                     ("concurrency", "--concurrency"),
                     ("max_requests", "--max-requests"),
                     ("max_lifetime", "--max-lifetime"),
+                    ("max_surge", "--max-surge"),
+                    ("max_unavailable", "--max-unavailable"),
                 ] {
                     command.extend(option(arguments, key, name));
                 }
@@ -1453,7 +1457,7 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "unset_app_settings",
-            description: "Remove release settings from an application by key (processes, threads, sync_threads, concurrency, max_requests, max_lifetime, timeouts.KEY, memory.KEY, env.NAME, or env for every variable), or every one with all. No running release changes.",
+            description: "Remove release settings from an application by key (processes, threads, sync_threads, concurrency, max_requests, max_lifetime, max_surge, max_unavailable, timeouts.KEY, memory.KEY, env.NAME, or env for every variable), or every one with all. No running release changes.",
             changes: true,
             properties: json!({
                 "app": {"type": "string"},
@@ -1622,12 +1626,15 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "restart",
-            description: "Replace a release's worker (by its index within its group, as GROUP/N outside the default group) with a fresh one, gracefully or at once with force; or every worker in turn with all.",
+            description: "Replace a release's worker (by its index within its group, as GROUP/N outside the default group) with a fresh one, gracefully or at once with force; or every worker in turn with all, or every worker of one worker group with group, which the release's host carries out under the group's max_surge and max_unavailable and which waits until it has finished unless no_wait is given; cancel ends such a restart, leaving the workers not yet replaced.",
             changes: true,
             properties: json!({
                 "target": {"type": "string", "description": "app, or app@release"},
                 "worker": {"type": "string", "description": "Its index within its group, as GROUP/N outside the default group"},
                 "all": {"type": "boolean"},
+                "group": {"type": "string", "description": "Every worker of this worker group"},
+                "cancel": {"type": "boolean", "description": "End a restart of every worker that is under way"},
+                "no_wait": {"type": "boolean"},
                 "force": {"type": "boolean"},
             }),
             required: &["target"],
@@ -1635,8 +1642,14 @@ fn specs() -> Vec<Spec> {
                 let mut command =
                     [words(&["restart"]), vec![needed(arguments, "target")?]].concat();
                 command.extend(option(arguments, "worker", "--worker"));
+                command.extend(option(arguments, "group", "--group"));
 
-                for (key, name) in [("all", "--all"), ("force", "--force")] {
+                for (key, name) in [
+                    ("all", "--all"),
+                    ("cancel", "--cancel"),
+                    ("no_wait", "--no-wait"),
+                    ("force", "--force"),
+                ] {
                     if flag(arguments, key) {
                         command.push(name.to_owned());
                     }

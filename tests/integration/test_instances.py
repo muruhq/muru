@@ -160,6 +160,8 @@ def test_a_port_another_instance_holds_names_that_instance(tmp_path: Path) -> No
                 str(muructl_path),
                 "run",
                 "plain_wsgi:application",
+                "--python",
+                sys.executable,
                 "--port",
                 str(run.port),
                 "--dashboard",

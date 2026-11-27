@@ -12,6 +12,7 @@ drains, after sticky clients' grace.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -203,7 +204,14 @@ def test_a_preview_needs_the_releases_secret(daemon: Daemon, tmp_path: Path) -> 
     launcher.chmod(0o755)
     daemon.deploy("shop", SHOP)
     held = daemon.muructl(
-        "deploy", "shop", str(SHOP), "--hold", "--open-preview", env={"BROWSER": str(launcher)}
+        "deploy",
+        "shop",
+        str(SHOP),
+        "--python",
+        sys.executable,
+        "--hold",
+        "--open-preview",
+        env={"BROWSER": str(launcher)},
     )
     assert held.stdout.startswith("muru: release shop@r2 is ready and held: not serving\n")
     assert "in preview of shop@r2" in held.stdout + held.stderr, held.stderr
@@ -245,7 +253,15 @@ def test_a_preview_needs_the_releases_secret(daemon: Daemon, tmp_path: Path) -> 
     # release's secret, a release that does not exist with and without a
     # secret. Nothing says whether the release exists.
 
-    misses = ["r2", f"r2.{secret[:-1]}0", f"r2.{secret[:-1]}1", f"r2.{other}", "r9", f"r9.{secret}"]
+    # A wrong secret differs from the real one in its last digit, or its
+    # first, whatever those are (issue 966).
+
+    def other_digit(digit: str) -> str:
+        return "0" if digit != "0" else "1"
+
+    last = secret[:-1] + other_digit(secret[-1])
+    first = other_digit(secret[0]) + secret[1:]
+    misses = ["r2", f"r2.{last}", f"r2.{first}", f"r2.{other}", "r9", f"r9.{secret}"]
     by_header = {miss: answered(daemon, **{"Muru-Preview": miss}) for miss in misses}
     assert all(got == ("r1", ["ignored"], []) for got in by_header.values()), by_header
     by_cookie = {miss: answered(daemon, Cookie=f"muru_preview={miss}") for miss in misses}
@@ -292,7 +308,7 @@ def test_a_preview_needs_the_releases_secret(daemon: Daemon, tmp_path: Path) -> 
     # A second held release says how to preview it, and makes the
     # application alone ambiguous: the refusal names both.
 
-    third = daemon.muructl("deploy", "shop", str(SHOP), "--hold")
+    third = daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable, "--hold")
     assert third.stdout.strip() == "muru: release shop@r3 is ready and held: not serving"
     assert third.stderr.strip() == "muru: muructl preview shop@r3 opens a preview of it"
     refused = daemon.muructl("preview", "shop", "--header", check=False)
