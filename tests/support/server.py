@@ -114,7 +114,13 @@ def temporary_log(prefix: str) -> Path:
     """Return a new file for a server's output, kept after the server
     stops for the test to read and removed when the session ends."""
 
-    log = Path(tempfile.mkstemp(prefix=prefix, suffix=".log")[1])
+    # mkstemp opens the file it makes, and only its path is wanted here:
+    # left open, the descriptor is held to the end of the session, one
+    # for every server started (issue 979).
+
+    descriptor, path = tempfile.mkstemp(prefix=prefix, suffix=".log")
+    os.close(descriptor)
+    log = Path(path)
     _temporary_files.append(log)
     return log
 

@@ -11,6 +11,7 @@ of the test files that had a failure are kept."""
 from __future__ import annotations
 
 import os
+import resource
 import shutil
 import sys
 import tempfile
@@ -28,6 +29,11 @@ from support import instances, server
 # directory but keeps these, so the session's end removes those of the
 # files with no failure (issue 770), and pytest the links to them. It
 # keeps a skipped test's directory too, which the session's end removes.
+
+# The open files a session may need: a lock for each port handed out
+# and what its tests hold at once (issue 979).
+
+OPEN_FILES = 8192
 
 _wider_dirs: dict[str, set[Path]] = {}
 _failed_files: set[str] = set()
@@ -60,6 +66,18 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
     tempfile.gettempdir()
     os.environ.setdefault("MURU_RUN_DIR", str(server.short_dir("muru-rt-")))
+
+    # Issue 979: the session keeps the lock of every port it hands out
+    # open to its end, so that no other session on the machine is given
+    # one, which is a descriptor a port. A whole run passes the usual
+    # soft limit of 1024, so the session takes what the hard limit
+    # allows, as far as the suite could need.
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = OPEN_FILES if hard == resource.RLIM_INFINITY else min(OPEN_FILES, hard)
+
+    if soft != resource.RLIM_INFINITY and soft < wanted:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
 
     # Issue 849: a development run keeps its data directory under the user
     # state location, which a daemon started with --state-dir does not
