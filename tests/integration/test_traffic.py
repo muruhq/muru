@@ -12,6 +12,7 @@ drains, after sticky clients' grace.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -203,7 +204,14 @@ def test_a_preview_needs_the_releases_secret(daemon: Daemon, tmp_path: Path) -> 
     launcher.chmod(0o755)
     daemon.deploy("shop", SHOP)
     held = daemon.muructl(
-        "deploy", "shop", str(SHOP), "--hold", "--open-preview", env={"BROWSER": str(launcher)}
+        "deploy",
+        "shop",
+        str(SHOP),
+        "--python",
+        sys.executable,
+        "--hold",
+        "--open-preview",
+        env={"BROWSER": str(launcher)},
     )
     assert held.stdout.startswith("muru: release shop@r2 is ready and held: not serving\n")
     assert "in preview of shop@r2" in held.stdout + held.stderr, held.stderr
@@ -300,7 +308,7 @@ def test_a_preview_needs_the_releases_secret(daemon: Daemon, tmp_path: Path) -> 
     # A second held release says how to preview it, and makes the
     # application alone ambiguous: the refusal names both.
 
-    third = daemon.muructl("deploy", "shop", str(SHOP), "--hold")
+    third = daemon.muructl("deploy", "shop", str(SHOP), "--python", sys.executable, "--hold")
     assert third.stdout.strip() == "muru: release shop@r3 is ready and held: not serving"
     assert third.stderr.strip() == "muru: muructl preview shop@r3 opens a preview of it"
     refused = daemon.muructl("preview", "shop", "--header", check=False)
