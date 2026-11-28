@@ -5228,6 +5228,345 @@ pub fn check_maintenance(table: &Maintenance) -> Result<(), String> {
     Ok(())
 }
 
+/// A service (section 9.13), one of the `[service.NAME]` tables: a named
+/// command the daemon keeps running, which takes no requests from the
+/// edge.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Service {
+    /// One line shown by `muructl service list` and `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The program and its arguments, run without a shell. A bare name
+    /// is found on `PATH`, and a relative path with a directory in it is
+    /// taken from `cwd`. `{index}` is the instance's index and
+    /// `{run_dir}` its own directory under the runtime directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// The directory the command runs in. A relative path is taken from
+    /// the file's directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "a directory of the service's own under the state directory"))]
+    pub cwd: Option<String>,
+    /// Environment variables: a value, or a secret reference resolved
+    /// each time an instance starts. `{index}` and `{run_dir}` are
+    /// filled in a value as in `command`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
+    /// The user the instances run as, when the daemon runs as root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the service user"))]
+    pub user: Option<String>,
+    /// The group the instances run as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the user's primary group"))]
+    pub group: Option<String>,
+    /// The umask of the instances, in octal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "the daemon's"))]
+    pub umask: Option<String>,
+    /// Whether the service starts with the daemon. With `false` it is
+    /// defined and listed, and runs only between `muructl service start`
+    /// and a stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
+    pub autostart: Option<bool>,
+    /// How many copies of the command run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 1))]
+    pub instances: Option<u32>,
+    /// What happens when an instance exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<Restart>,
+    /// How an instance is known to be up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ServiceReadiness>,
+    /// The signal that asks an instance to stop: TERM, INT, QUIT, HUP,
+    /// USR1, USR2 or WINCH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "TERM"))]
+    pub stop_signal: Option<String>,
+    /// How long an instance asked to stop has before it is killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10s"))]
+    pub stop_timeout: Option<String>,
+    /// Send the stop signal to the instance's whole process group, not
+    /// its leader alone. The kill after `stop_timeout` always goes to
+    /// the group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub stop_group: Option<bool>,
+    /// The signal `muructl service signal NAME reload` sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload_signal: Option<String>,
+}
+
+/// The `readiness` table of a service: how an instance is known to be
+/// up. One of `after`, `tcp`, `unix`, `http` and `command` says how;
+/// `after = '1s'` when none does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceReadiness {
+    /// Ready once the process has stayed up this long.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Ready once a TCP connection to this `host:port` is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<String>,
+    /// Ready once a connection to this Unix socket is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix: Option<String>,
+    /// Ready once a GET of this `http://` URL answers 2xx or 3xx.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<String>,
+    /// Ready once this command, run as the service's user with its
+    /// environment, exits 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    /// How long an instance has to be ready before it is stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "60s"))]
+    pub timeout: Option<String>,
+    /// How often a form that probes tries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "500ms"))]
+    pub interval: Option<String>,
+}
+
+/// How long a service's instance asked to stop has, when its table does
+/// not say.
+pub const DEFAULT_SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a service's instance has to be ready, when its table does
+/// not say.
+pub const DEFAULT_SERVICE_READINESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often a service's readiness is probed, when its table does not
+/// say.
+pub const DEFAULT_SERVICE_READINESS_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long a service's process stays up to be ready, when its table
+/// names no readiness.
+pub const DEFAULT_SERVICE_READY_AFTER: Duration = Duration::from_secs(1);
+
+/// The placeholders a service's command, environment values and
+/// readiness addresses may use.
+pub const SERVICE_PLACEHOLDERS: [&str; 2] = ["index", "run_dir"];
+
+/// Fill the placeholders of a text: `{NAME}` becomes the value given for
+/// NAME, and `{{` and `}}` are literal braces. A placeholder no value is
+/// given for, and a brace that opens or closes nothing, is an error.
+pub fn fill_placeholders(text: &str, values: &[(&str, &str)]) -> Result<String, String> {
+    let mut filled = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(at) = rest.find(['{', '}']) {
+        filled.push_str(&rest[..at]);
+        let tail = &rest[at..];
+
+        if let Some(after) = tail.strip_prefix("{{") {
+            filled.push('{');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("}}") {
+            filled.push('}');
+            rest = after;
+        } else if tail.starts_with('}') {
+            return Err(format!(
+                "{text:?} has a }} that closes nothing; write }}}} for a brace"
+            ));
+        } else {
+            let Some(end) = tail.find('}') else {
+                return Err(format!(
+                    "{text:?} has a {{ that is not closed; write {{{{ for a brace"
+                ));
+            };
+
+            let name = &tail[1..end];
+
+            let Some((_, value)) = values.iter().find(|(known, _)| *known == name) else {
+                return Err(format!(
+                    "{text:?} uses {{{name}}}, which is not one of {}",
+                    values
+                        .iter()
+                        .map(|(known, _)| format!("{{{known}}}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            };
+
+            filled.push_str(value);
+            rest = &tail[end + 1..];
+        }
+    }
+
+    filled.push_str(rest);
+    Ok(filled)
+}
+
+/// Check a `[service.NAME]` table: a command, placeholders that are
+/// known, a user's keys that go together, a count of at least one, the
+/// restart table, one form of readiness, signals that can be sent and
+/// waits that are longer than nothing.
+pub fn check_service(table: &Service) -> Result<(), String> {
+    let known: Vec<(&str, &str)> = SERVICE_PLACEHOLDERS
+        .iter()
+        .map(|name| (*name, ""))
+        .collect();
+    let filled = |key: &str, text: &str| {
+        fill_placeholders(text, &known)
+            .map(|_| ())
+            .map_err(|error| format!("{key}: {error}"))
+    };
+
+    if table.command.is_empty() || table.command[0].is_empty() {
+        return Err("command: a service needs the command it runs".to_owned());
+    }
+
+    for argument in &table.command {
+        filled("command", argument)?;
+    }
+
+    for (name, value) in &table.env {
+        if !valid_env_name(name) {
+            return Err(format!("env: {name:?} is not a variable name"));
+        }
+
+        if let EnvValue::Plain(value) = value {
+            filled(&format!("env.{name}"), value)?;
+        }
+    }
+
+    if table.user.is_none() && table.group.is_some() {
+        return Err("group: a group needs the user it goes with".to_owned());
+    }
+
+    if let Some(umask) = &table.umask
+        && (umask.is_empty() || u32::from_str_radix(umask, 8).map_or(true, |mask| mask > 0o777))
+    {
+        return Err(format!("umask {umask:?} is not an octal mode such as 027"));
+    }
+
+    if table.instances == Some(0) {
+        return Err("instances must be at least 1".to_owned());
+    }
+
+    if let Some(restart) = &table.restart {
+        check_restart(restart)?;
+    }
+
+    for (key, signal) in [
+        ("stop_signal", &table.stop_signal),
+        ("reload_signal", &table.reload_signal),
+    ] {
+        if let Some(signal) = signal
+            && !STOP_SIGNALS.contains(&signal.as_str())
+        {
+            return Err(format!(
+                "{key} must be one of {}, not {signal:?}",
+                STOP_SIGNALS.join(", ")
+            ));
+        }
+    }
+
+    let wait = |key: &str, text: &Option<String>| match text {
+        Some(text) => {
+            let duration = parse_duration(text).map_err(|error| format!("{key}: {error}"))?;
+
+            if duration.is_zero() {
+                return Err(format!("{key} must be longer than nothing"));
+            }
+
+            Ok(())
+        }
+        None => Ok(()),
+    };
+
+    wait("stop_timeout", &table.stop_timeout)?;
+
+    let Some(readiness) = &table.readiness else {
+        return Ok(());
+    };
+
+    let forms: Vec<&str> = [
+        ("after", readiness.after.is_some()),
+        ("tcp", readiness.tcp.is_some()),
+        ("unix", readiness.unix.is_some()),
+        ("http", readiness.http.is_some()),
+        ("command", readiness.command.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, given)| *given)
+    .map(|(form, _)| form)
+    .collect();
+
+    if forms.len() > 1 {
+        return Err(format!(
+            "readiness: {} are given, and an instance is ready one way",
+            forms.join(" and ")
+        ));
+    }
+
+    wait("readiness.after", &readiness.after)?;
+    wait("readiness.timeout", &readiness.timeout)?;
+    wait("readiness.interval", &readiness.interval)?;
+
+    if readiness.interval.is_some() && (forms.is_empty() || forms == ["after"]) {
+        return Err(
+            "readiness.interval is for a form that probes: tcp, unix, http or command".to_owned(),
+        );
+    }
+
+    if let Some(address) = &readiness.tcp {
+        filled("readiness.tcp", address)?;
+        let address =
+            fill_placeholders(address, &[("index", "0"), ("run_dir", "/run")]).unwrap_or_default();
+
+        match parse_upstream_address(&address) {
+            Ok(UpstreamAddress::Tcp(..)) => {}
+            _ => return Err(format!("readiness.tcp {address:?} is not host:port")),
+        }
+    }
+
+    if let Some(path) = &readiness.unix {
+        filled("readiness.unix", path)?;
+
+        if !path.starts_with('/') && !path.starts_with("{run_dir}") {
+            return Err(format!(
+                "readiness.unix {path:?} must be an absolute path, or start with {{run_dir}}"
+            ));
+        }
+    }
+
+    if let Some(url) = &readiness.http {
+        filled("readiness.http", url)?;
+        let rest = url.strip_prefix("http://").unwrap_or_default();
+        let address = rest.split('/').next().unwrap_or_default();
+        let address =
+            fill_placeholders(address, &[("index", "0"), ("run_dir", "/run")]).unwrap_or_default();
+
+        if !matches!(
+            parse_upstream_address(&address),
+            Ok(UpstreamAddress::Tcp(..))
+        ) {
+            return Err(format!(
+                "readiness.http {url:?} is not a URL such as http://127.0.0.1:9187/metrics"
+            ));
+        }
+    }
+
+    if let Some(command) = &readiness.command {
+        if command.is_empty() || command[0].is_empty() {
+            return Err("readiness.command: the command is empty".to_owned());
+        }
+
+        for argument in command {
+            filled("readiness.command", argument)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// An HTTP upstream (section 4.13), one of the `[upstream.NAME]` tables:
 /// an unmanaged HTTP server that routes, fallbacks, traffic shares and
 /// authentication sub-requests can target.
@@ -6123,6 +6462,10 @@ pub struct Document {
     /// HTTP upstreams by name (section 4.13).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub upstream: BTreeMap<String, Upstream>,
+    /// Services by name (section 9.13): commands the daemon keeps
+    /// running.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub service: BTreeMap<String, Service>,
     /// Applications by name.
     #[serde(default)]
     pub app: BTreeMap<String, App>,
@@ -6172,6 +6515,7 @@ impl Document {
             condition: _,
             route: _,
             upstream: _,
+            service: _,
             app: _,
         } = self;
 
@@ -6220,6 +6564,7 @@ impl Document {
                 .keys()
                 .map(|name| format!("[upstream.{name}]")),
         );
+        tables.extend(self.service.keys().map(|name| format!("[service.{name}]")));
         tables.extend(self.overlay.keys().map(|name| format!("[overlay.{name}]")));
         tables
     }
@@ -6330,6 +6675,14 @@ impl Document {
             }
 
             self.upstream.insert(name, upstream);
+        }
+
+        for (name, service) in other.service {
+            if self.service.contains_key(&name) {
+                return Err(format!("service {name} is declared twice"));
+            }
+
+            self.service.insert(name, service);
         }
 
         for (name, app) in other.app {
@@ -9420,6 +9773,136 @@ mod restart_tests {
         assert_eq!(
             check_release_kind(&workers),
             Err("restart applies to a managed HTTP release (kind = 'http')".to_owned())
+        );
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::{Document, Service, check_service, fill_placeholders};
+
+    fn service(table: &str) -> Service {
+        toml::from_str(table).unwrap()
+    }
+
+    #[test]
+    fn placeholders_are_filled_and_braces_doubled_are_literal() {
+        let values = [("index", "2"), ("run_dir", "/run/s/1/2")];
+        assert_eq!(
+            fill_placeholders("127.0.0.1:91{index}0", &values).unwrap(),
+            "127.0.0.1:9120"
+        );
+        assert_eq!(
+            fill_placeholders("{run_dir}/x.sock {{index}}", &values).unwrap(),
+            "/run/s/1/2/x.sock {index}"
+        );
+        assert!(
+            fill_placeholders("{port}", &values)
+                .unwrap_err()
+                .ends_with("uses {port}, which is not one of {index}, {run_dir}")
+        );
+        assert!(
+            fill_placeholders("{index", &values)
+                .unwrap_err()
+                .contains("not closed")
+        );
+        assert!(
+            fill_placeholders("a}", &values)
+                .unwrap_err()
+                .contains("closes nothing")
+        );
+    }
+
+    #[test]
+    fn a_service_table_is_read_and_checked() {
+        let document: Document = toml::from_str(
+            "[service.redis]\ndescription = 'Cache'\n\
+             command = ['redis-server', '--port', '63{index}9']\nuser = 'redis'\n\
+             instances = 2\nstop_timeout = '30s'\nstop_group = true\nreload_signal = 'HUP'\n\
+             env = { SOCKET = '{run_dir}/redis.sock' }\n\
+             readiness = { tcp = '127.0.0.1:63{index}9', timeout = '15s' }\n\
+             restart = { policy = 'on-failure', give_up_after = 5 }\n",
+        )
+        .unwrap();
+        let redis = &document.service["redis"];
+        assert_eq!(redis.instances, Some(2));
+        assert_eq!(check_service(redis), Ok(()));
+        assert_eq!(document.deployment_tables(), ["[service.redis]"]);
+        assert!(document.daemon_tables().is_empty());
+
+        // A command is all a service needs.
+
+        assert_eq!(
+            check_service(&service("command = ['sleep', '600']")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_service_table_that_cannot_be_run_is_refused() {
+        let refused = |table: &str| check_service(&service(table)).unwrap_err();
+        let base = "command = ['x']\n";
+
+        assert_eq!(refused(""), "command: a service needs the command it runs");
+        assert!(refused("command = ['x', '{port}']").starts_with("command: "));
+        assert!(refused(&format!("{base}env = {{ A = '{{bind}}' }}")).starts_with("env.A: "));
+        assert_eq!(
+            refused(&format!("{base}group = 'staff'")),
+            "group: a group needs the user it goes with"
+        );
+        assert!(refused(&format!("{base}umask = '999'")).starts_with("umask "));
+        assert_eq!(
+            refused(&format!("{base}instances = 0")),
+            "instances must be at least 1"
+        );
+        assert!(
+            refused(&format!("{base}stop_signal = 'KILL'"))
+                .starts_with("stop_signal must be one of")
+        );
+        assert!(
+            refused(&format!("{base}reload_signal = 'STOP'")).starts_with("reload_signal must be")
+        );
+        assert_eq!(
+            refused(&format!("{base}stop_timeout = '0s'")),
+            "stop_timeout must be longer than nothing"
+        );
+        assert_eq!(
+            refused(&format!("{base}restart = {{ give_up_after = 0 }}")),
+            "restart.give_up_after must be at least 1"
+        );
+        assert_eq!(
+            refused(&format!(
+                "{base}readiness = {{ tcp = '127.0.0.1:1', after = '1s' }}"
+            )),
+            "readiness: after and tcp are given, and an instance is ready one way"
+        );
+        assert!(
+            refused(&format!("{base}readiness = {{ tcp = 'redis' }}")).contains("is not host:port")
+        );
+        assert!(
+            refused(&format!("{base}readiness = {{ unix = 'x.sock' }}")).contains("absolute path")
+        );
+        assert!(
+            refused(&format!("{base}readiness = {{ http = 'https://x/' }}"))
+                .contains("is not a URL")
+        );
+        assert!(refused(&format!("{base}readiness = {{ command = [] }}")).contains("is empty"));
+        assert!(
+            refused(&format!(
+                "{base}readiness = {{ after = '2s', interval = '1s' }}"
+            ))
+            .starts_with("readiness.interval is for a form that probes")
+        );
+        assert!(toml::from_str::<Service>("command = ['x']\nports = 1").is_err());
+    }
+
+    #[test]
+    fn a_service_declared_in_two_files_is_refused() {
+        let mut first: Document = toml::from_str("[service.redis]\ncommand = ['a']").unwrap();
+        let second: Document = toml::from_str("[service.redis]\ncommand = ['b']").unwrap();
+        assert_eq!(
+            first.merge(second).unwrap_err(),
+            "service redis is declared twice"
         );
     }
 }

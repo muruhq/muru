@@ -2,7 +2,7 @@
 
 # Applied files
 
-The keys of the files `muructl apply` reads, which say what the daemon serves: applications and their releases, hosts, routes, upstreams and overlays, with the client classes, rate limits and conditions that belong to them. A file of this kind kept beside a project's code is named `muru.deploy.toml`, since `muru.toml` there is the project's settings, which have other keys. A table of the daemon's own configuration here, such as `[[listener]]` or `[limits]`, is refused. A client class, rate limit or condition may not have the name of one the daemon's own file defines. A relative path is taken from the file's directory, except a release's own static directories and error pages, which are taken from its source directory; apply sends the daemon the absolute paths.
+The keys of the files `muructl apply` reads, which say what the daemon serves: applications and their releases, hosts, routes, upstreams, services and overlays, with the client classes, rate limits and conditions that belong to them. A file of this kind kept beside a project's code is named `muru.deploy.toml`, since `muru.toml` there is the project's settings, which have other keys. A table of the daemon's own configuration here, such as `[[listener]]` or `[limits]`, is refused. A client class, rate limit or condition may not have the name of one the daemon's own file defines. A relative path is taken from the file's directory, except a release's own static directories and error pages, which are taken from its source directory; apply sends the daemon the absolute paths.
 
 The JSON Schema of the same keys, for an editor that checks TOML against one, is `https://docs.muruhq.dev/en/latest/schema/deployment.schema.json`.
 
@@ -19,6 +19,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `overlay` | table of tables, {ref}`[overlay.NAME] <config-deployment-overlay-name>` |  | Overlays by name: partial configuration laid over the routes and applications while active. |
 | `rate_limit` | table of tables, {ref}`[rate_limit.NAME] <config-deployment-rate-limit-name>` |  | Rate limits by name, from the daemon's own file or an applied one. |
 | `route` | array of tables, {ref}`[[route]] <config-deployment-route>` |  | Routes, in the order written. |
+| `service` | table of tables, {ref}`[service.NAME] <config-deployment-service-name>` |  | Services by name: commands the daemon keeps running. |
 | `upstream` | table of tables, {ref}`[upstream.NAME] <config-deployment-upstream-name>` |  | HTTP upstreams by name. |
 
 (config-deployment-app-name)=
@@ -58,7 +59,7 @@ An application's table and its releases.
 
 A secret reference in an `[env]` table.
 
-The same keys apply at `[app.NAME.release.ID.env.NAME]`.
+The same keys apply at `[service.NAME.env.NAME]` and `[app.NAME.release.ID.env.NAME]`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -140,7 +141,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `python` | string | found at start | The interpreter: a path, or a request in uv's syntax. A relative path with a directory in it, such as `.venv/bin/python`, is taken from the file's directory. |
 | `readiness` | table, {ref}`[app.NAME.release.ID.readiness] <config-deployment-app-name-release-id-readiness>` |  | How an `http` release's instances are known to be ready. |
 | `reflection` | boolean | `false` | Serve gRPC server reflection for the services the release's gRPC mounts register (default false). |
-| `restart` | table, {ref}`[app.NAME.release.ID.restart] <config-deployment-app-name-release-id-restart>` |  | What happens when an `http` release's instance exits. |
+| `restart` | table, {ref}`[service.NAME.restart] <config-deployment-service-name-restart>` |  | What happens when an `http` release's instance exits. |
 | `scaling` | table, {ref}`[app.NAME.release.ID.scaling] <config-deployment-app-name-release-id-scaling>` |  | How the default group is scaled; static when absent. |
 | `sendfile_header` | string |  | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile` for the frameworks that send that one. |
 | `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. `source:SUBDIR`, or a relative path, is taken from the release's `source`, and `media:SUBDIR` from the media part. |
@@ -318,20 +319,6 @@ The `readiness` table of a managed HTTP release: how an instance is known to be 
 | --- | --- | --- | --- |
 | `path` | string |  | The path probed with a GET until it answers 2xx or 3xx; without it, any HTTP response makes the instance ready. |
 | `timeout` | string | `"60s"` | How long the instances get to become ready. |
-
-(config-deployment-app-name-release-id-restart)=
-## `[app.NAME.release.ID.restart]`
-
-The `restart` table of a managed HTTP release: what happens when an instance exits.
-
-| Key | Type | Default | Description |
-| --- | --- | --- | --- |
-| `delay` | string | `"1s"` | The wait before the next start after a run that lasted, and after the first quick exit. |
-| `give_up_after` | integer |  | Quick exits in a row after which the instance is left failed until it is restarted by hand. Without it the instance is started again every `max_delay`, without end. |
-| `max_delay` | string | `"1m"` | The longest wait: the wait doubles with each quick exit in a row up to this. |
-| `policy` | string | `"always"` | When an instance that exited is started again: `always`, after any exit; `on-failure`, after a failure, with a clean exit left alone; or `never`. `always`: After any exit. `on-failure`: After a failure; a clean exit is left alone. `never`: Never. |
-| `stable_after` | string | `"1m"` | A run this long was not a quick exit, and clears the count of them. |
-| `success_exit_codes` | array of integers | `[0]` | The exit statuses that count as a clean exit. Any other status, and death by a signal, is a failure. |
 
 (config-deployment-app-name-release-id-scaling)=
 ## `[app.NAME.release.ID.scaling]`
@@ -864,6 +851,60 @@ A route's traffic policy: the share of requests each release takes, the key requ
 | `split` | table of integers |  | Percent of requests to each release, by id; the application's serving release takes the rest. A release at 0 is reached only by preview or by a sticky cookie. |
 | `sticky` | boolean | `false` | Whether a client keeps the release it first got, through a cookie. |
 | `sticky_grace` | string | `"10m"` | How long sticky clients keep a release that is leaving the route alive, for example 10m. |
+
+(config-deployment-service-name)=
+## `[service.NAME]`
+
+A service, one of the `[service.NAME]` tables: a named command the daemon keeps running, which takes no requests from the edge.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `autostart` | boolean | `true` | Whether the service starts with the daemon. With `false` it is defined and listed, and runs only between `muructl service start` and a stop. |
+| `command` | array of strings |  | The program and its arguments, run without a shell. A bare name is found on `PATH`, and a relative path with a directory in it is taken from `cwd`. `{index}` is the instance's index and `{run_dir}` its own directory under the runtime directory. |
+| `cwd` | string | a directory of the service's own under the state directory | The directory the command runs in. A relative path is taken from the file's directory. |
+| `description` | string |  | One line shown by `muructl service list` and `status`. |
+| `env` | table of strings or tables, {ref}`[app.NAME.env.NAME] <config-deployment-app-name-env-name>` |  | Environment variables: a value, or a secret reference resolved each time an instance starts. `{index}` and `{run_dir}` are filled in a value as in `command`. |
+| `group` | string | the user's primary group | The group the instances run as. |
+| `instances` | integer | `1` | How many copies of the command run. |
+| `readiness` | table, {ref}`[service.NAME.readiness] <config-deployment-service-name-readiness>` |  | How an instance is known to be up. |
+| `reload_signal` | string |  | The signal `muructl service signal NAME reload` sends. |
+| `restart` | table, {ref}`[service.NAME.restart] <config-deployment-service-name-restart>` |  | What happens when an instance exits. |
+| `stop_group` | boolean | `false` | Send the stop signal to the instance's whole process group, not its leader alone. The kill after `stop_timeout` always goes to the group. |
+| `stop_signal` | string | `"TERM"` | The signal that asks an instance to stop: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. |
+| `stop_timeout` | string | `"10s"` | How long an instance asked to stop has before it is killed. |
+| `umask` | string | the daemon's | The umask of the instances, in octal. |
+| `user` | string | the service user | The user the instances run as, when the daemon runs as root. |
+
+(config-deployment-service-name-readiness)=
+## `[service.NAME.readiness]`
+
+The `readiness` table of a service: how an instance is known to be up. One of `after`, `tcp`, `unix`, `http` and `command` says how; `after = '1s'` when none does.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `after` | string |  | Ready once the process has stayed up this long. |
+| `command` | array of strings |  | Ready once this command, run as the service's user with its environment, exits 0. |
+| `http` | string |  | Ready once a GET of this `http://` URL answers 2xx or 3xx. |
+| `interval` | string | `"500ms"` | How often a form that probes tries. |
+| `tcp` | string |  | Ready once a TCP connection to this `host:port` is accepted. |
+| `timeout` | string | `"60s"` | How long an instance has to be ready before it is stopped. |
+| `unix` | string |  | Ready once a connection to this Unix socket is accepted. |
+
+(config-deployment-service-name-restart)=
+## `[service.NAME.restart]`
+
+The `restart` table of a managed HTTP release: what happens when an instance exits.
+
+The same keys apply at `[app.NAME.release.ID.restart]`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `delay` | string | `"1s"` | The wait before the next start after a run that lasted, and after the first quick exit. |
+| `give_up_after` | integer |  | Quick exits in a row after which the instance is left failed until it is restarted by hand. Without it the instance is started again every `max_delay`, without end. |
+| `max_delay` | string | `"1m"` | The longest wait: the wait doubles with each quick exit in a row up to this. |
+| `policy` | string | `"always"` | When an instance that exited is started again: `always`, after any exit; `on-failure`, after a failure, with a clean exit left alone; or `never`. `always`: After any exit. `on-failure`: After a failure; a clean exit is left alone. `never`: Never. |
+| `stable_after` | string | `"1m"` | A run this long was not a quick exit, and clears the count of them. |
+| `success_exit_codes` | array of integers | `[0]` | The exit statuses that count as a clean exit. Any other status, and death by a signal, is a failure. |
 
 (config-deployment-upstream-name)=
 ## `[upstream.NAME]`

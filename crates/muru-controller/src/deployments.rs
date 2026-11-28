@@ -30,6 +30,8 @@ pub enum Kind {
     Route,
     /// An upstream.
     Upstream,
+    /// A service.
+    Service,
     /// An overlay.
     Overlay,
     /// A client class.
@@ -42,11 +44,12 @@ pub enum Kind {
 
 impl Kind {
     /// Every kind.
-    pub const ALL: [Kind; 8] = [
+    pub const ALL: [Kind; 9] = [
         Kind::App,
         Kind::Host,
         Kind::Route,
         Kind::Upstream,
+        Kind::Service,
         Kind::Overlay,
         Kind::ClientClass,
         Kind::RateLimit,
@@ -60,6 +63,7 @@ impl Kind {
             Kind::Host => "host",
             Kind::Route => "route",
             Kind::Upstream => "upstream",
+            Kind::Service => "service",
             Kind::Overlay => "overlay",
             Kind::ClientClass => "client_class",
             Kind::RateLimit => "rate_limit",
@@ -148,6 +152,12 @@ pub fn objects(document: &Document) -> Vec<(Kind, String)> {
             .upstream
             .keys()
             .map(|name| (Kind::Upstream, name.clone())),
+    );
+    found.extend(
+        document
+            .service
+            .keys()
+            .map(|name| (Kind::Service, name.clone())),
     );
     found.extend(
         document
@@ -261,6 +271,7 @@ pub fn keep(document: &mut Document, owners: &Owners, name: &str) {
         .route
         .retain(|route| ours(Kind::Route, &route_key(&route.host, &route.key())));
     document.upstream.retain(|key, _| ours(Kind::Upstream, key));
+    document.service.retain(|key, _| ours(Kind::Service, key));
     document.overlay.retain(|key, _| ours(Kind::Overlay, key));
     document
         .client_class
@@ -304,6 +315,13 @@ pub fn stored_objects(store: &Store) -> BTreeSet<(Kind, String)> {
             .unwrap_or_default()
             .into_iter()
             .map(|(name, _)| (Kind::Upstream, name)),
+    );
+    found.extend(
+        store
+            .services()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|stored| (Kind::Service, stored.name)),
     );
     found.extend(
         store

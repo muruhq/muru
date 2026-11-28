@@ -2682,6 +2682,130 @@
         }
       ]
     },
+    "Service": {
+      "additionalProperties": false,
+      "description": "A service, one of the `[service.NAME]` tables: a named command the daemon keeps running, which takes no requests from the edge.",
+      "properties": {
+        "autostart": {
+          "default": true,
+          "description": "Whether the service starts with the daemon. With `false` it is defined and listed, and runs only between `muructl service start` and a stop.",
+          "type": "boolean"
+        },
+        "command": {
+          "description": "The program and its arguments, run without a shell. A bare name is found on `PATH`, and a relative path with a directory in it is taken from `cwd`. `{index}` is the instance's index and `{run_dir}` its own directory under the runtime directory.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "description": "The directory the command runs in. A relative path is taken from the file's directory.",
+          "type": "string",
+          "x-default": "a directory of the service's own under the state directory"
+        },
+        "description": {
+          "description": "One line shown by `muructl service list` and `status`.",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "$ref": "#/$defs/EnvValue"
+          },
+          "description": "Environment variables: a value, or a secret reference resolved each time an instance starts. `{index}` and `{run_dir}` are filled in a value as in `command`.",
+          "type": "object"
+        },
+        "group": {
+          "description": "The group the instances run as.",
+          "type": "string",
+          "x-default": "the user's primary group"
+        },
+        "instances": {
+          "default": 1,
+          "description": "How many copies of the command run.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "readiness": {
+          "$ref": "#/$defs/ServiceReadiness",
+          "description": "How an instance is known to be up."
+        },
+        "reload_signal": {
+          "description": "The signal `muructl service signal NAME reload` sends.",
+          "type": "string"
+        },
+        "restart": {
+          "$ref": "#/$defs/Restart",
+          "description": "What happens when an instance exits."
+        },
+        "stop_group": {
+          "default": false,
+          "description": "Send the stop signal to the instance's whole process group, not its leader alone. The kill after `stop_timeout` always goes to the group.",
+          "type": "boolean"
+        },
+        "stop_signal": {
+          "default": "TERM",
+          "description": "The signal that asks an instance to stop: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH.",
+          "type": "string"
+        },
+        "stop_timeout": {
+          "default": "10s",
+          "description": "How long an instance asked to stop has before it is killed.",
+          "type": "string"
+        },
+        "umask": {
+          "description": "The umask of the instances, in octal.",
+          "type": "string",
+          "x-default": "the daemon's"
+        },
+        "user": {
+          "description": "The user the instances run as, when the daemon runs as root.",
+          "type": "string",
+          "x-default": "the service user"
+        }
+      },
+      "type": "object"
+    },
+    "ServiceReadiness": {
+      "additionalProperties": false,
+      "description": "The `readiness` table of a service: how an instance is known to be up. One of `after`, `tcp`, `unix`, `http` and `command` says how; `after = '1s'` when none does.",
+      "properties": {
+        "after": {
+          "description": "Ready once the process has stayed up this long.",
+          "type": "string"
+        },
+        "command": {
+          "description": "Ready once this command, run as the service's user with its environment, exits 0.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "http": {
+          "description": "Ready once a GET of this `http://` URL answers 2xx or 3xx.",
+          "type": "string"
+        },
+        "interval": {
+          "default": "500ms",
+          "description": "How often a form that probes tries.",
+          "type": "string"
+        },
+        "tcp": {
+          "description": "Ready once a TCP connection to this `host:port` is accepted.",
+          "type": "string"
+        },
+        "timeout": {
+          "default": "60s",
+          "description": "How long an instance has to be ready before it is stopped.",
+          "type": "string"
+        },
+        "unix": {
+          "description": "Ready once a connection to this Unix socket is accepted.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "StaticDir": {
       "additionalProperties": false,
       "description": "A directory of an application's own files, an entry of the `[[tool.muru.static]]` or `[[app.NAME.release.ID.static]]` array: a path prefix the edge serves from a directory under the release's source, with the application taking what no file answers. Served by `muructl run` and the daemon alike, from the release the request was routed to.",
@@ -3054,6 +3178,13 @@
         "$ref": "#/$defs/Route"
       },
       "type": "array"
+    },
+    "service": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Service"
+      },
+      "description": "Services by name: commands the daemon keeps running.",
+      "type": "object"
     },
     "upstream": {
       "additionalProperties": {

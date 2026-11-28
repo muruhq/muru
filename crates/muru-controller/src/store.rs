@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use muru_config::{ClientClass, Host as VirtualHost, Overlay, RateLimit, Route, Upstream};
+use muru_config::{ClientClass, Host as VirtualHost, Overlay, RateLimit, Route, Service, Upstream};
 
 use crate::model::{
     App, CommandRun, Event, OverlayState, Release, ReleaseSpec, ReleaseState, Rollout, RunRecord,
@@ -111,6 +111,13 @@ CREATE TABLE IF NOT EXISTS upstreams (
     spec TEXT NOT NULL,
     resource_version INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS services (
+    name TEXT PRIMARY KEY,
+    number INTEGER NOT NULL,
+    spec TEXT NOT NULL,
+    held INTEGER NOT NULL DEFAULT 0,
+    resource_version INTEGER NOT NULL DEFAULT 1
+);
 CREATE TABLE IF NOT EXISTS overlays (
     name TEXT PRIMARY KEY,
     spec TEXT NOT NULL,
@@ -204,7 +211,7 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// Insert an event that happened at `happened_unix_ms`, or now when none
 /// is given, and drop those past retention. A time ahead of the clock is
@@ -304,7 +311,8 @@ impl Store {
         // store, and version 23 the preview secret of each release
         // (issue 928), given here to the releases that have none, and
         // version 24 the last event recorded from each release's host
-        // (issue 982).
+        // (issue 982), and version 25 the services of applied files
+        // (issue 486).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -1212,6 +1220,57 @@ impl Store {
     /// Remove an HTTP upstream.
     pub fn delete_upstream(&self, name: &str) -> Result<(), StoreError> {
         self.with(|connection| Writes { connection }.delete_upstream(name))
+    }
+
+    /// Every service, by name (section 9.13).
+    pub fn services(&self) -> Result<Vec<StoredService>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection
+                .prepare("SELECT name, number, spec, held FROM services ORDER BY name")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })?;
+            let mut services = Vec::new();
+
+            for row in rows {
+                let (name, number, encoded, held) = row?;
+                services.push(StoredService {
+                    name,
+                    number: number.max(0) as u64,
+                    held,
+                    service: decode(&encoded)?,
+                });
+            }
+
+            Ok(services)
+        })
+    }
+
+    /// Create or replace a service's definition.
+    pub fn put_service(&self, name: &str, service: &Service) -> Result<(), StoreError> {
+        self.with(|connection| Writes { connection }.put_service(name, service))
+    }
+
+    /// Remove a service.
+    pub fn delete_service(&self, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| Writes { connection }.delete_service(name))
+    }
+
+    /// Record whether a service was stopped by hand, and so stays
+    /// stopped until it is started by hand.
+    pub fn set_service_held(&self, name: &str, held: bool) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE services SET held = ?2 WHERE name = ?1",
+                params![name, held],
+            )?;
+            Ok(())
+        })
     }
 
     /// The client classes of applied files with their positions, in the
@@ -2166,6 +2225,20 @@ fn give_preview_secrets(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// A service as the store keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredService {
+    /// Its name.
+    pub name: String,
+    /// The number that names its directories.
+    pub number: u64,
+    /// Whether it was stopped by hand, and so stays stopped until it is
+    /// started by hand.
+    pub held: bool,
+    /// Its definition.
+    pub service: Service,
+}
+
 /// A new preview secret, or why the store cannot record a release
 /// without one.
 fn new_preview_secret() -> Result<String, StoreError> {
@@ -2423,6 +2496,30 @@ impl Writes<'_> {
     pub fn delete_upstream(&self, name: &str) -> Result<(), StoreError> {
         self.connection
             .execute("DELETE FROM upstreams WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    /// Create or replace a service's definition. A new service takes
+    /// the number after the highest in use, which names its directories
+    /// (section 13.8), and one replaced keeps its number and whether it
+    /// was stopped by hand.
+    pub fn put_service(&self, name: &str, service: &Service) -> Result<(), StoreError> {
+        let encoded =
+            toml::to_string(service).map_err(|error| StoreError::Decode(error.to_string()))?;
+        self.connection.execute(
+            "INSERT INTO services (name, number, spec) \
+                 VALUES (?1, (SELECT COALESCE(MAX(number), 0) + 1 FROM services), ?2) \
+                 ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
+                 resource_version = resource_version + 1",
+            params![name, encoded],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a service.
+    pub fn delete_service(&self, name: &str) -> Result<(), StoreError> {
+        self.connection
+            .execute("DELETE FROM services WHERE name = ?1", [name])?;
         Ok(())
     }
 

@@ -10234,6 +10234,10 @@ fn resolve_paths(document: &mut muru_config::Document, base: &Path) {
         }
     }
 
+    for service in document.service.values_mut() {
+        resolve(&mut service.cwd);
+    }
+
     for class in &mut document.client_class {
         resolve(&mut class.user_agent_list);
         resolve(&mut class.address_list);

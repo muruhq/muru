@@ -2,7 +2,7 @@
 
 # The daemon's configuration
 
-The keys of the daemon's own configuration file, `muru.toml` in its configuration directory, which say how the daemon runs: its listeners, limits, the proxy, compression, secret stores, logs, shutdown, metrics, events, the dashboard and the overlay webhook. It is read when the daemon starts and on `muructl daemon reload`. What the daemon serves is not in this file: an application, a host, a route, an upstream or an overlay here is refused, with a message that says to give it to `muructl apply`. Client classes, rate limits and conditions defined here are the node's: every applied file may use them, and none may define one of the same name. The client classes' list files are taken from this file's directory, and every other path is absolute.
+The keys of the daemon's own configuration file, `muru.toml` in its configuration directory, which say how the daemon runs: its listeners, limits, the proxy, compression, secret stores, logs, shutdown, metrics, events, the dashboard and the overlay webhook. It is read when the daemon starts and on `muructl daemon reload`. What the daemon serves is not in this file: an application, a host, a route, an upstream, a service or an overlay here is refused, with a message that says to give it to `muructl apply`. Client classes, rate limits and conditions defined here are the node's: every applied file may use them, and none may define one of the same name. The client classes' list files are taken from this file's directory, and every other path is absolute.
 
 The JSON Schema of the same keys, for an editor that checks TOML against one, is `https://docs.muruhq.dev/en/latest/schema/daemon.schema.json`.
 
