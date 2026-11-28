@@ -283,6 +283,22 @@ impl RestartPolicy {
         Verdict::Restart(self.backoff(in_a_row))
     }
 
+    /// The wait before a start that failed is tried again, for whoever
+    /// starts something whole under this policy, as the daemon does a
+    /// release it restores (section 9.9): the wait after `failed` starts
+    /// in a row, or none when it is not tried again, the policy being
+    /// `never` or `failed` having reached `give_up_after`.
+    pub fn retry_after(&self, failed: u32) -> Option<Duration> {
+        if self.mode == RestartMode::Never {
+            return None;
+        }
+
+        match self.again(failed) {
+            Verdict::Restart(wait) => Some(wait),
+            Verdict::Leave(_) | Verdict::GiveUp => None,
+        }
+    }
+
     /// The quick exits in a row after an exit that ended a run of `ran`,
     /// with `before` of them before it: a run that lasted clears the
     /// count, and any other adds to it.
@@ -2120,6 +2136,32 @@ mod tests {
         assert_eq!(supervisor.running(), 0);
         assert_eq!(supervisor.record().instances[0].left, Some(Left::Failed));
         supervisor.stop_until(Instant::now()).await;
+    }
+
+    #[test]
+    fn a_start_that_failed_is_tried_again_as_the_policy_says() {
+        let waits = |policy: &RestartPolicy| {
+            (1..=8)
+                .map(|failed| policy.retry_after(failed).map(|wait| wait.as_secs()))
+                .collect::<Vec<_>>()
+        };
+
+        // Without end by default, the wait doubling to a minute.
+
+        assert_eq!(
+            waits(&RestartPolicy::default()),
+            [1, 2, 4, 8, 16, 32, 60, 60].map(Some)
+        );
+
+        // To the count the policy gives up at, and never under `never`.
+
+        let gives_up = RestartPolicy {
+            give_up_after: Some(3),
+            ..RestartPolicy::default()
+        };
+        assert_eq!(waits(&gives_up)[..4], [Some(1), Some(2), None, None]);
+        assert_eq!(waits(&policy(RestartMode::Never, &[0])), [None; 8]);
+        assert_eq!(waits(&policy(RestartMode::OnFailure, &[0]))[0], Some(1));
     }
 
     #[tokio::test(start_paused = true)]

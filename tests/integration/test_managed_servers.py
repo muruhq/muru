@@ -713,6 +713,65 @@ def test_a_daemon_restart_readopts_the_instances(tmp_path: Path) -> None:
     wait_for(lambda: not alive(replacement))
 
 
+def test_a_release_that_cannot_start_when_the_daemon_does_is_tried_again(tmp_path: Path) -> None:
+    # The server starts unless the file is there.
+
+    broken = tmp_path / "broken"
+    script = f"test -e {shlex.quote(str(broken))} && exit 7; exec {shlex.join(SERVER)}"
+    first = start_daemon(tmp_path)
+    second = None
+
+    try:
+        deploy_server(first, "legacy", command=["/bin/sh", "-c", script])
+        pid = report(first)["pid"]
+        assert "detached" in first.muructl("daemon", "stop").stdout
+        first.process.wait(timeout=30)
+
+        # As after a reboot: nothing of the release runs, its runtime
+        # files are gone, and what the server needs is not there yet.
+
+        os.kill(pid, signal.SIGKILL)
+        wait_for(lambda: not alive(pid))
+        (first.files_dir / "h" / "1" / "servers.toml").unlink()
+        broken.touch()
+        second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
+        def events(kind: str) -> list[str]:
+            lines = second.muructl("events").stdout.splitlines()
+            return [line for line in lines if f" {kind} " in line]
+
+        # Each start that fails is an event, as any failed start is, and
+        # another says when the next attempt is, the waits doubling.
+
+        wait_for(lambda: len(events("release.restarting")) >= 2, 30)
+        again = events("release.restarting")
+        assert again[0].endswith(
+            "could not restart after the daemon restarted (attempt 1): instance 0 exited with "
+            "exit status: 7 before it was ready; trying again in 1s"
+        )
+        assert "(attempt 2)" in again[1] and again[1].endswith("trying again in 2s")
+        assert len(events("release.failed")) >= 2
+        shown = json.loads(second.muructl("release", "show", "legacy@r1", "--json").stdout)
+        assert shown["state"] == "failed"
+        assert "trying again in" in shown["message"]
+
+        # Once the server can start, the next attempt brings it back.
+
+        broken.unlink()
+        wait_for(lambda: second.request("/").status == 200, 30)
+        assert second.releases("legacy") == [
+            {"release": "legacy@r1", "state": "ready", "serving": "yes"}
+        ]
+        attempts = len(events("release.restarting"))
+        time.sleep(2.5)
+        assert len(events("release.restarting")) == attempts
+    finally:
+        if second is None:
+            second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
+        second.stop(shutdown=True)
+
+
 def test_a_daemon_restart_adopts_the_instances_still_there_and_starts_the_rest(
     tmp_path: Path,
 ) -> None:

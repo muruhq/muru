@@ -1371,6 +1371,29 @@ stop --shutdown` drains every release, stops the hosts and the edge, and
 then exits, for taking a node out of service. It leaves no records
 behind, and the next daemon starts the current releases afresh.
 
+A daemon that starts with nothing to take over, as after a reboot or a
+shutdown, starts each application's serving release. A release that
+does not start then is tried again: after one second, then two, the
+wait doubling to a minute, until it starts or another release is made
+the one to serve. An application whose database comes up a few seconds
+after it is back without anyone acting. Each failed attempt is a
+`release.failed` event with the reason, as for any start that fails,
+followed by a `release.restarting` warning that says when the next
+attempt is:
+
+```
+could not restart after the daemon restarted (attempt 2): the host exited with exit status: 1 before its workers were ready; trying again in 2s
+```
+
+The release is `failed` between attempts, and its message in `muructl
+release show` says when the next one is. A deploy or a rollback during the wait
+ends the attempts. A [managed
+server](managed-servers.md#the-restart-policy) release follows its own
+`restart` table here: its `delay` and `max_delay` are the waits, with
+`give_up_after` the attempts stop after that many, and with `policy =
+'never'` the first failure is the last. A start that fails in a deploy
+is not tried again, since the deploy reports it.
+
 A host whose daemon is gone keeps its workers; a host that dies takes
 its workers with it, and the next daemon starts its release again. A
 worker that is killed, by a hard timeout say, may leave a subprocess a

@@ -230,7 +230,10 @@ instance as it found it. While every instance of a release is
 `exited` or `failed`, a request waits for the queue timeout and is then
 answered 502 `upstream_failed`. The table applies to an instance that
 exits once the release is ready. An instance that exits while the
-release is still starting fails the release, whatever the policy.
+release is still starting fails the release, whatever the policy. A
+release that fails that way in a deploy stays failed. One that fails
+when the daemon starts it after a reboot is [tried
+again](daemon.md#stopping-and-restarting) with the table's waits.
 
 Draining stops new requests at the edge, waits for those in flight, then
 sends the process of each instance the profile's stop signal (`TERM` for

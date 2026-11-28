@@ -434,6 +434,15 @@ pub struct Upgrade {
     pub restart: bool,
 }
 
+/// Issue 393: a restored release whose start failed and is to be tried
+/// again.
+struct RestoreRetry {
+    /// Which attempt the next start is, counting the restore's own as 1.
+    attempt: u32,
+    /// When it is due.
+    due: tokio::time::Instant,
+}
+
 /// What to do with an active rollout (section 9.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RolloutAction {
@@ -1714,8 +1723,14 @@ enum AfterStop {
 /// with how the start went: what each operation that starts a release
 /// did after its start, before the start ran beside the loop.
 enum AfterStart {
-    /// The daemon's restore: the release serves again.
-    Restore { app: String, id: String },
+    /// The daemon's restore: the release serves again. `attempt` is 1
+    /// for the start the restore makes and one more for each retry of a
+    /// start that failed (issue 393).
+    Restore {
+        app: String,
+        id: String,
+        attempt: u32,
+    },
     /// A deploy: held, or serving with the release before it drained.
     Deploy {
         app: String,
@@ -2286,6 +2301,9 @@ struct Daemon {
     /// Issue 693: the starts waiting for another of their application's
     /// to end, in the order they were asked for.
     start_queue: HashMap<String, std::collections::VecDeque<(String, AfterStart)>>,
+    /// Issue 393: the releases restored at the daemon's start whose
+    /// start failed and is to be tried again, by application and release.
+    restores: HashMap<(String, String), RestoreRetry>,
     /// Issue 693: the applications whose rollout is being promoted.
     promoting: BTreeSet<String>,
     /// Issue 699: the releases being stopped beside the loop.
@@ -2824,6 +2842,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         condition_skips: BTreeSet::new(),
         starting: HashMap::new(),
         start_queue: HashMap::new(),
+        restores: HashMap::new(),
         promoting: BTreeSet::new(),
         stops: HashMap::new(),
         booted,
@@ -6493,6 +6512,124 @@ impl Daemon {
                 AfterStart::Restore {
                     app: app.name.clone(),
                     id: current.clone(),
+                    attempt: 1,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// Section 9.9 (issue 393): the release the daemon's restore started
+    /// did not start. A deploy that fails is final, since whoever made it
+    /// is there to hear, but a restore has nobody waiting: after a reboot
+    /// a database a few seconds late would leave the application down
+    /// until someone acted. So the start is tried again with the waits
+    /// of the restart policy, a managed server's own table or the
+    /// defaults for a release of workers, until it succeeds, the policy
+    /// gives up, or the release is no longer the one to serve. The start
+    /// has said why it failed, as release.failed; each attempt that is
+    /// to be followed by another is release.restarting, with the wait.
+    fn restore_failed(&mut self, app: &str, id: &str, attempt: u32, error: &str) {
+        let subject = format!("{app}@{id}");
+        let release = self.store.release(app, id).ok();
+
+        let policy = release
+            .as_ref()
+            .and_then(|release| release.spec.http.as_ref())
+            .map(|http| http.restart.policy())
+            .unwrap_or_default();
+
+        let stopping = self
+            .info
+            .stopping
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let wait = match stopping {
+            true => None,
+            false => policy.retry_after(attempt),
+        };
+
+        let Some(wait) = wait else {
+            let tried = match attempt {
+                1 => String::new(),
+                attempts => format!(", and is not tried again after {attempts} attempts"),
+            };
+
+            self.events.emit(
+                "release.failed",
+                &subject,
+                "error",
+                &format!("could not restart after the daemon restarted: {error}{tried}"),
+            );
+            return;
+        };
+
+        let message = format!(
+            "could not restart after the daemon restarted (attempt {attempt}): {error}; \
+             trying again in {}",
+            muru_config::format_duration(wait)
+        );
+
+        // The release's own message says a start is still to come, so
+        // that `release show` does not read as the end of it.
+
+        if let Some(release) = release.filter(|release| release.state == ReleaseState::Failed) {
+            self.set_state(&release, ReleaseState::Failed, &message);
+        }
+
+        self.events
+            .emit("release.restarting", &subject, "warning", &message);
+        self.restores.insert(
+            (app.to_owned(), id.to_owned()),
+            RestoreRetry {
+                attempt: attempt + 1,
+                due: tokio::time::Instant::now() + wait,
+            },
+        );
+    }
+
+    /// Issue 393: start again the restored releases whose wait has
+    /// passed. One that is no longer its application's serving release,
+    /// or no longer failed, has been dealt with by hand, with a deploy
+    /// or a rollback, and is left alone.
+    async fn retry_restores(&mut self) {
+        let now = tokio::time::Instant::now();
+        let due: Vec<(String, String)> = self
+            .restores
+            .iter()
+            .filter(|(_, retry)| retry.due <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for (app, id) in due {
+            let Some(retry) = self.restores.remove(&(app.clone(), id.clone())) else {
+                continue;
+            };
+
+            let serving = self
+                .store
+                .app(&app)
+                .ok()
+                .and_then(|record| record.current)
+                .as_deref()
+                == Some(id.as_str());
+
+            let failed = self
+                .store
+                .release(&app, &id)
+                .is_ok_and(|release| release.state == ReleaseState::Failed);
+
+            if !serving || !failed || self.running.contains_key(&(app.clone(), id.clone())) {
+                continue;
+            }
+
+            self.start_then(
+                &app,
+                &id,
+                AfterStart::Restore {
+                    app: app.clone(),
+                    id: id.clone(),
+                    attempt: retry.attempt,
                 },
             )
             .await;
@@ -8881,14 +9018,9 @@ impl Daemon {
     /// operation that started it, with how the start went.
     async fn after_start(&mut self, then: AfterStart, started: Result<(), String>) {
         match then {
-            AfterStart::Restore { app, id } => match started {
+            AfterStart::Restore { app, id, attempt } => match started {
                 Ok(()) => self.switch_to(&app, &id).await,
-                Err(error) => self.events.emit(
-                    "release.failed",
-                    &format!("{app}@{id}"),
-                    "error",
-                    &format!("could not restart after the daemon restarted: {error}"),
-                ),
+                Err(error) => self.restore_failed(&app, &id, attempt, &error),
             },
             AfterStart::Deploy {
                 app,
@@ -13889,6 +14021,7 @@ impl Daemon {
         }
 
         self.publish_servers();
+        self.retry_restores().await;
     }
 
     /// Issue 922: an instance's relay reports its end, which marks the
