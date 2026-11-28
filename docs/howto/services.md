@@ -42,6 +42,7 @@ is stopped with `TERM`.
 | `instances` | `1` | How many copies of the command run. |
 | `restart` | `always`, see below | What happens when an instance exits. |
 | `readiness` | `{ after = '1s' }` | How an instance is known to be up. |
+| `liveness` | none | A check that an instance still answers, which restarts one that does not. |
 | `stop_signal` | `TERM` | The signal that asks an instance to stop: `TERM`, `INT`, `QUIT`, `HUP`, `USR1`, `USR2` or `WINCH`. |
 | `stop_timeout` | `10s` | How long an instance asked to stop has before it is killed. |
 | `stop_group` | `false` | Send the stop signal to the instance's whole process group, not its leader alone. The kill after `stop_timeout` always goes to the group. |
@@ -194,6 +195,29 @@ within the timeout is stopped, as a stop stops it, with a
 `service.not_ready` warning. That counts as a quick exit and a failure,
 so the restart policy decides what follows.
 
+## Liveness
+
+A process can be running and no longer answering. `liveness` is a check
+made for as long as an instance is `running`, and an instance that
+fails it several times in a row is stopped and started again:
+
+```toml
+[service.broker]
+command = ['broker', '--port', '5555']
+liveness = { tcp = '127.0.0.1:5555', interval = '10s', timeout = '2s', failures = 3 }
+```
+
+The forms are those of `readiness` except `after`: `tcp`, `unix`,
+`http` and `command`. `interval` is how often the check is made (`10s`
+by default), `timeout` how long one check may take (`2s`), and
+`failures` how many in a row it takes (`3`). The checks begin once the
+instance is ready.
+
+An instance that fails is a `service.unresponsive` warning. It is
+stopped as a stop stops it, and that counts as a failure and a quick
+exit, so the restart policy decides what follows, as for an instance
+that was not ready in time.
+
 ## When an instance exits
 
 The `restart` table says what happens. It is the table a [managed HTTP
@@ -319,8 +343,8 @@ The `user` line is there when the table names one. The times an
 instance ran for are as the daemon saw them, which it does once a
 second.
 
-The exits listed are those the daemon has seen since it started. The
-[events](events.md) have every one.
+The last five exits of each instance are listed, and are kept when the
+daemon restarts. The [events](events.md) have every one.
 
 `status` exits 0 when the service is `running`, 3 when it is not, and 4
 when there is no such service. With several names it prints each and
@@ -491,6 +515,27 @@ whichever is shorter, so a service with a long `stop_timeout` wants a
 budget to match. The daemon says so in its log when a service's
 `stop_timeout` is longer than the budget.
 
+## Refusing services on a node
+
+A service is a command the node runs for as long as it is declared,
+and a project's services are named by its own settings. The daemon's
+own file says what a node accepts:
+
+```toml
+[daemon]
+services = 'node'
+```
+
+| Value | Meaning |
+| --- | --- |
+| `all` (the default) | The node's services and those its applications' projects declare are run. |
+| `node` | Only `[service.NAME]` tables in applied files are run. A release that declares services is refused when it is deployed or applied. |
+| `none` | No service is run. An applied file with a `[service.NAME]` table is refused, as is a release that declares services. |
+
+The refusal names the setting. Services that already run when the
+setting changes are left as they are until they are next applied or
+deployed.
+
 ## Events
 
 The subject of each event is the service's name.
@@ -502,6 +547,7 @@ The subject of each event is the service's name.
 | `service.exited` | info for a clean exit the policy leaves alone, warning otherwise | an instance exited by itself, with what happens next |
 | `service.failed` | error | the command could not be started |
 | `service.not_ready` | warning | an instance was not ready in time and was stopped |
+| `service.unresponsive` | warning | an instance failed its liveness check and is stopped |
 | `service.crash_looping` | error | the third quick exit in a row |
 | `service.gave_up` | error | `give_up_after` was reached, and the instance is `failed` |
 | `service.daemonised` | error | the program put itself in the background |

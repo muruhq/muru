@@ -227,8 +227,35 @@ instance 1 is left failed after exiting or failing to start 5 times in a row, ea
 
 A daemon that restarts or upgrades leaves an `exited` or `failed`
 instance as it found it. While every instance of a release is
-`exited` or `failed`, a request waits for the queue timeout and is then
-answered 502 `upstream_failed`. The table applies to an instance that
+`exited` or `failed`, nothing is going to answer, and a request is
+answered 503 `upstream_down` at once.
+
+### Liveness
+
+A server can be running and no longer answering. The `liveness` table
+of the release has the daemon ask each instance, for as long as it is
+`running`, and restart one that stops answering:
+
+```toml
+[app.api.release.r3.liveness]
+path = '/healthz'
+interval = '10s'
+timeout = '2s'
+failures = 3
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `path` | the readiness `path` | The path asked for with a GET. A 2xx or 3xx answer passes, or any HTTP answer when there is no path. |
+| `interval` | `10s` | How often an instance is asked. |
+| `timeout` | `2s` | How long one answer may take. |
+| `failures` | `3` | How many failures in a row restart the instance. |
+
+Without the table nothing is asked. With `muructl deploy` each key is
+a `--liveness KEY=VALUE` flag. An instance that fails is a
+`server.unresponsive` warning: it is taken out of service, stopped with
+`shutdown_timeout` to stop in, and started again by the restart policy,
+that failure counting as a quick exit. The table applies to an instance that
 exits once the release is ready. An instance that exits while the
 release is still starting fails the release, whatever the policy. A
 release that fails that way in a deploy stays failed. One that fails
