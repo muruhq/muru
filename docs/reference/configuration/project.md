@@ -312,6 +312,7 @@ The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a muru.toml and i
 | `reload_dirs` | array of strings |  | Directories watched, relative to the project; the project when empty. |
 | `reload_exclude` | array of strings |  | Patterns that never trigger a reload. |
 | `reload_include` | array of strings |  | Patterns watched besides `**/*.py`. |
+| `services` | boolean | `true` | Start the project's services that start automatically beside the application. |
 | `slow` | string | `"1s"` | How long a request may take before `errors` shows it. |
 | `timestamps` | boolean | `false` | Whether every line on the terminal carries the full UTC time. |
 | `tls_cert` | string |  | A certificate chain to serve, relative to the project. Not used by a detour. |
@@ -383,6 +384,7 @@ The `[tool.muru.serve]` table (`[serve]` in muru.toml, and in the file `muructl 
 | `python` | string | found at start | The interpreter: a path, or a request in uv's syntax. When absent, `/app/.venv` if there is no `VIRTUAL_ENV` and no project `.venv`, else the interpreter `muructl run` would find. |
 | `run_dir` | string | `"/run/muru"` | Where everything written at run time goes. |
 | `runtime_dir` | string | `"/opt/muru"` | Where the image holds the runtime library. |
+| `services` | array of strings | `all`: those that start automatically | Which of the project's services run in the container: `all`, `none`, or their names. |
 | `shutdown_budget` | string | `"8s"` | How long the whole stop may take, the delay included. |
 | `shutdown_delay` | string | `"0s"` | How long the listener keeps accepting after SIGTERM, readiness failing, with every connection closing after its response. |
 | `slow` | string | `"1s"` | How slow a request is to count as an error for `access_log = "errors"`. |

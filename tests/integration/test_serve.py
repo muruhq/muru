@@ -981,3 +981,95 @@ scale_out_window = '1s'
             serve.stop()
 
         subprocess.run(["sudo", "-n", "rmdir", str(cgroup)], check=False)
+
+
+def test_a_projects_services_run_in_the_container_and_a_required_one_gates_it(
+    tmp_path: Path,
+) -> None:
+    # Section 9.17: the project's services run beside the application,
+    # those the deployment chooses, with their output on the one stream.
+
+    muructl = support.muructl_path()
+    assert muructl is not None
+    project = tmp_path / "shop"
+    project.mkdir()
+    gone = tmp_path / "gone"
+    (project / "app.py").write_text((support.FIXTURES / "plain_wsgi.py").read_text())
+    (project / "worker.py").write_text(
+        "import os, time\n"
+        "print('worker ready', os.environ['MURU_SERVICE_INDEX'], flush=True)\n"
+        "time.sleep(600)\n"
+    )
+    (project / "pyproject.toml").write_text(
+        f"""[tool.muru]
+entrypoint = 'app:application'
+
+[tool.muru.services.worker]
+command = ['python', 'worker.py']
+readiness = {{ after = '200ms' }}
+
+[tool.muru.services.sidecar]
+command = ['/bin/sh', '-c', 'test -e {gone} && exit 3; echo sidecar up; exec sleep 600']
+required = true
+readiness = {{ after = '200ms' }}
+restart = {{ delay = '100ms', give_up_after = 2 }}
+
+[tool.muru.services.extra]
+command = ['/bin/sleep', '600']
+"""
+    )
+    serve = start(
+        tmp_path,
+        "--chdir",
+        str(project),
+        app=None,
+        env={"MURU_SERVE_SERVICES": "worker,sidecar"},
+    )
+
+    def run(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(muructl), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=tmp_path,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "MURU_RUN_DIR": str(serve.run_dir)},
+        )
+
+    try:
+        # The container was not ready until the required service ran.
+
+        serve.wait_for("muru.service.worker[0]: worker ready 0")
+        serve.wait_for("muru.service.sidecar[0]: sidecar up")
+        serve.wait_for("muru: service sidecar instance 0 started (pid ")
+        assert serve.admin("/readyz") == (200, "ok\n")
+        assert serve.admin("/startupz") == (200, "ok\n")
+
+        # The service commands work inside the container, on the
+        # services chosen, and the lines kept are the service's log.
+
+        listed = json.loads(run("service", "list", "--json").stdout)["services"]
+        assert [(service["name"], service["state"]) for service in listed] == [
+            ("sidecar", "running"),
+            ("worker", "running"),
+        ]
+        assert run("service", "logs", "worker").stdout == (
+            "muru.service.worker[0]: worker ready 0\n"
+        )
+        assert run("service", "status", "extra").returncode == 4
+        restarted = run("service", "restart", "worker")
+        assert restarted.returncode == 0, restarted.stderr
+        assert restarted.stdout.startswith("muru: worker restarted")
+
+        # A required service that fails for good ends the container:
+        # readiness fails while it is down, and muructl exits with 1.
+
+        gone.touch()
+        signalled = run("service", "signal", "sidecar", "TERM")
+        assert signalled.returncode == 0, signalled.stderr
+        assert serve.process.wait(timeout=30) == 1
+        serve.wait_for("the required service sidecar has failed")
+        assert "service sidecar instance 0 is left failed" in serve.output()
+    finally:
+        serve.stop()

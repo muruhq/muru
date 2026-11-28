@@ -300,6 +300,8 @@ pub struct RunState {
     pub recorder: Option<Arc<muru_edge::recorder::Recorder>>,
     /// The import reports of the last few loads (section 6.18).
     pub imports: Arc<ImportReports>,
+    /// The project's services, which the run supervises (section 9.17).
+    pub services: crate::run_services::Shared,
     /// The application's places (issues 849 and 850).
     pub places: muru_controller::places::Places,
     /// The upload spool, under `muructl serve`.
@@ -1752,6 +1754,22 @@ impl Admin for Service {
         // the two; the ring and the stream are both in memory, since a
         // run writes no log files (section 13.8).
 
+        // Section 9.17: a service's lines are the last this process kept,
+        // since they go to standard output and no file.
+
+        if !request.service.is_empty() {
+            let kept = state.services.lock().await.lines(&request.service, lines);
+
+            let Some(kept) = kept else {
+                return Err(Status::not_found(format!(
+                    "there is no service named {}",
+                    request.service
+                )));
+            };
+
+            return Ok(Response::new(self.lines("", "", kept, None)));
+        }
+
         if request.access {
             let live = request.follow.then(|| state.access_log.subscribe());
             let first = state.access_log.recent_lines(lines);
@@ -1767,6 +1785,76 @@ impl Admin for Service {
         let live = request.follow.then(|| state.logs.subscribe());
         let first = state.logs.recent(lines);
         Ok(Response::new(self.lines(&state.app, &release, first, live)))
+    }
+
+    /// Section 9.17: the project's services this run supervises.
+    async fn list_services(
+        &self,
+        request: Request<pb::ListServicesRequest>,
+    ) -> Result<Response<pb::ListServicesResponse>, Status> {
+        let request = request.into_inner();
+        let owners = muru_controller::deployments::Owners::new();
+        let services: Vec<pb::ServiceStatus> = self
+            .state
+            .services
+            .lock()
+            .await
+            .statuses()
+            .iter()
+            .filter(|status| request.names.is_empty() || request.names.contains(&status.name))
+            .map(|status| pb::ServiceStatus {
+                deployment: String::new(),
+                ..muru_controller::api::service_status(status, &owners)
+            })
+            .collect();
+        let missing = request
+            .names
+            .iter()
+            .filter(|name| !services.iter().any(|service| &service.name == *name))
+            .cloned()
+            .collect();
+
+        Ok(Response::new(pb::ListServicesResponse {
+            services,
+            missing,
+        }))
+    }
+
+    /// Section 9.17: start, stop, restart or signal one of them. Nothing
+    /// is kept: a service stopped here is started with the next run.
+    async fn act_on_service(
+        &self,
+        request: Request<pb::ActOnServiceRequest>,
+    ) -> Result<Response<pb::ActOnServiceResponse>, Status> {
+        let request = request.into_inner();
+        let action = muru_controller::services::Action::parse(
+            &request.action,
+            request.timeout_ms.map(Duration::from_millis),
+            request.kill,
+            request.rolling,
+            &request.signal,
+        )
+        .map_err(Status::invalid_argument)?;
+        let owners = muru_controller::deployments::Owners::new();
+        let mut services = self.state.services.lock().await;
+        let service = services.service(&request.name).map_err(Status::not_found)?;
+        let touched = service
+            .act(request.index, action)
+            .map_err(Status::failed_precondition)?;
+
+        let status = service.status();
+
+        Ok(Response::new(pb::ActOnServiceResponse {
+            name: request.name,
+            instances: touched
+                .into_iter()
+                .map(|(index, pid)| pb::ServiceTouched { index, pid })
+                .collect(),
+            service: Some(pb::ServiceStatus {
+                deployment: String::new(),
+                ..muru_controller::api::service_status(&status, &owners)
+            }),
+        }))
     }
 
     /// Section 9.12: a command of the project, declared or one-off, run
@@ -2381,8 +2469,6 @@ impl Admin for Service {
         list_hosts(pb::ListHostsRequest) -> pb::ListHostsResponse, "muructl host";
         list_routes(pb::ListRoutesRequest) -> pb::ListRoutesResponse, "muructl route";
         list_upstreams(pb::ListUpstreamsRequest) -> pb::ListUpstreamsResponse, "muructl upstream";
-        list_services(pb::ListServicesRequest) -> pb::ListServicesResponse, "muructl service";
-        act_on_service(pb::ActOnServiceRequest) -> pb::ActOnServiceResponse, "muructl service";
         apply_config(pb::ApplyConfigRequest) -> pb::ConfigReport, "muructl apply";
         diff_config(pb::DiffConfigRequest) -> pb::ConfigReport, "muructl deployment diff";
         list_deployments(pb::ListDeploymentsRequest) -> pb::ListDeploymentsResponse, "muructl deployment list";

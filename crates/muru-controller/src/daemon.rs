@@ -1278,27 +1278,7 @@ pub struct LiveRelease {
     pub restart: Option<RestartProgress>,
 }
 
-/// What is done to a service by hand (section 9.17).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServiceAction {
-    /// Start what does not run.
-    Start,
-    /// Stop it, each instance with `timeout` to stop in where one is
-    /// given, or killed at once with `kill`.
-    Stop {
-        /// The time to stop in, in place of the definition's.
-        timeout: Option<Duration>,
-        /// Skip the stop signal.
-        kill: bool,
-    },
-    /// Stop and start it, one instance at a time with `rolling`.
-    Restart {
-        /// Each instance ready before the next is stopped.
-        rolling: bool,
-    },
-    /// Send a signal: a name, or `reload` for the service's own.
-    Signal(String),
-}
+pub use crate::services::Action as ServiceAction;
 
 /// The restart by hand of a managed server release's instances.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -7411,45 +7391,7 @@ impl Daemon {
             return Err(format!("there is no service named {name}"));
         };
 
-        let plain = |indexes: Vec<u32>| indexes.into_iter().map(|index| (index, 0)).collect();
-
-        let done: Vec<(u32, u32)> = match action {
-            ServiceAction::Start => plain(service.start(index)?),
-            ServiceAction::Stop { timeout, kill } => {
-                let grace = match kill {
-                    true => Some(Duration::ZERO),
-                    false => timeout,
-                };
-
-                plain(service.stop(index, grace)?)
-            }
-            ServiceAction::Restart { rolling } => plain(service.restart(index, rolling)?),
-            ServiceAction::Signal(signal) => {
-                let number = match signal.as_str() {
-                    "reload" => match &service.table().reload_signal {
-                        Some(named) => crate::services::signal_number(named),
-                        None => return Err(format!("{name} names no reload_signal")),
-                    },
-                    "KILL" | "STOP" => {
-                        return Err(format!(
-                            "{signal} is not sent to a service: muructl service stop --kill \
-                             kills it, so that the daemon knows it was asked for"
-                        ));
-                    }
-                    named if muru_config::STOP_SIGNALS.contains(&named) => {
-                        crate::services::signal_number(named)
-                    }
-                    other => {
-                        return Err(format!(
-                            "{other:?} is not a signal a service is sent: reload, or one of {}",
-                            muru_config::STOP_SIGNALS.join(", ")
-                        ));
-                    }
-                };
-
-                service.signal(index, number)?
-            }
-        };
+        let done = service.act(index, action)?;
 
         let held = service.held();
         write_record(

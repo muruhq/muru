@@ -244,6 +244,12 @@ pub struct ServeArgs {
     #[arg(long = "trusted-proxy", value_name = "ADDRESS")]
     trusted_proxy: Vec<String>,
 
+    /// Which of the project's services run beside the application: all
+    /// (the default, those that start automatically), none, or their
+    /// names, separated by commas.
+    #[arg(long = "services", value_name = "NAMES", value_delimiter = ',')]
+    services: Vec<String>,
+
     /// How long the listener keeps accepting after SIGTERM, with
     /// readiness failing and every connection closing after its response
     /// (default 0s; 5s behind a Kubernetes Service).
@@ -315,6 +321,7 @@ const KEYS: &[(&str, Kind)] = &[
     ("static_dir", Kind::Text),
     ("spool_quota", Kind::Text),
     ("trusted_proxy", Kind::List),
+    ("services", Kind::List),
     ("shutdown_delay", Kind::Text),
     ("shutdown_budget", Kind::Text),
 ];
@@ -426,6 +433,7 @@ fn from_flags(args: &ServeArgs) -> BTreeMap<&'static str, Value> {
         ("static", &args.static_dirs),
         ("access_log_exclude", &args.access_log_exclude),
         ("trusted_proxy", &args.trusted_proxy),
+        ("services", &args.services),
     ] {
         if !items.is_empty() {
             layer.insert(key, Value::List(items.clone()));
@@ -960,6 +968,12 @@ fn prepare(
         && !app.as_deref().is_some_and(|app| Path::new(app).is_dir())
     {
         argv.extend(["--chdir".to_owned(), chdir.display().to_string()]);
+    }
+
+    // Which of the project's services run, for the run that serves.
+
+    if !layered.list("services").is_empty() {
+        argv.extend(["--services".to_owned(), layered.list("services").join(",")]);
     }
 
     argv.extend(

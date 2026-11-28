@@ -7074,6 +7074,11 @@ pub struct RunSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = true))]
     pub reload: Option<bool>,
+    /// Start the project's services that start automatically beside the
+    /// application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
+    pub services: Option<bool>,
     /// Directories watched, relative to the project; the project when
     /// empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -7161,6 +7166,7 @@ impl RunSettings {
             tls_key: over.tls_key.clone().or_else(|| self.tls_key.clone()),
             hosts: join(&self.hosts, &over.hosts),
             reload: over.reload.or(self.reload),
+            services: over.services.or(self.services),
             reload_dirs: join(&self.reload_dirs, &over.reload_dirs),
             reload_include: join(&self.reload_include, &over.reload_include),
             reload_exclude: join(&self.reload_exclude, &over.reload_exclude),
@@ -7400,6 +7406,11 @@ pub struct ServeSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "loopback peers, for their forwarding headers alone"))]
     pub trusted_proxy: Option<Vec<String>>,
+    /// Which of the project's services run in the container: `all`,
+    /// `none`, or their names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`all`: those that start automatically"))]
+    pub services: Option<Vec<String>>,
 }
 
 /// A count given as a number or as a word such as `auto`.

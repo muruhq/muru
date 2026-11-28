@@ -584,3 +584,88 @@ def test_a_projects_services_run_with_its_serving_release(daemon: Daemon, tmp_pa
     assert (
         "service x: switch is for a service a project declares" in refused.stdout + refused.stderr
     )
+
+
+def test_a_projects_services_run_beside_a_development_run(tmp_path: Path) -> None:
+    from support import server as support
+
+    runtime = support.short_dir("muru-rt-")
+    project = tmp_path / "shop"
+    project.mkdir()
+    (project / "web.py").write_text(
+        "def application(environ, start_response):\n"
+        "    start_response('200 OK', [('Content-Type', 'text/plain')])\n"
+        "    return [b'one']\n"
+    )
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'shop'\nversion = '0.0.0'\n\n"
+        "[tool.muru]\nentrypoint = 'web:application'\n\n"
+        "[tool.muru.services.worker]\n"
+        "command = ['python', '-c', 'import os, time; "
+        'print("worker of", os.environ["MURU_RELEASE"], flush=True); time.sleep(600)\']\n'
+        "readiness = { after = '200ms' }\n\n"
+        "[tool.muru.services.reindex]\ncommand = ['/bin/sleep', '600']\nautostart = false\n"
+    )
+
+    def command(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(support.muructl_path()), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "MURU_RUN_DIR": str(runtime)},
+        )
+
+    server = support.start(
+        None,
+        workers=1,
+        chdir=project,
+        args=["--reload"],
+        env={"MURU_RUN_DIR": str(runtime)},
+    )
+
+    try:
+        # The services that start automatically run beside the
+        # application, their lines with the run's own.
+
+        assert server.wait_for_log("muru.service.worker[0]: worker of r1", timeout=20), server.log()
+        assert server.wait_for_log("admin socket"), server.log()
+        wait_for(
+            lambda: (
+                [
+                    (service["name"], service["state"])
+                    for service in json.loads(command("service", "list", "--json").stdout)[
+                        "services"
+                    ]
+                ]
+                == [("reindex", "stopped"), ("worker", "running")]
+            )
+        )
+        first = json.loads(command("service", "list", "--json").stdout)["services"][1]
+        pid = first["instance_list"][0]["pid"]
+
+        # A reload starts a new release, and the worker with it, so that
+        # it runs the edited code.
+
+        (project / "web.py").write_text((project / "web.py").read_text().replace("one", "two"))
+        assert server.wait_for_log("switched to release r2", timeout=30), server.log()
+        assert server.wait_for_log("muru.service.worker[0]: worker of r2", timeout=20), server.log()
+        wait_for(lambda: not alive(pid))
+    finally:
+        server.stop()
+
+    # The services stop with the run.
+
+    listed = subprocess.run(["ps", "-ax", "-o", "command="], capture_output=True, text=True).stdout
+    assert 'print("worker of"' not in listed
+
+    # They can be left out.
+
+    quiet = support.start(None, workers=1, chdir=project, args=["--no-services"])
+
+    try:
+        assert quiet.get("/").status == 200
+        time.sleep(1.5)
+        assert "muru.service." not in quiet.log()
+    finally:
+        quiet.stop()

@@ -3335,22 +3335,14 @@ impl Admin for Service {
     ) -> Result<Response<pb::ActOnServiceResponse>, Status> {
         let request = request.into_inner();
 
-        let action = match request.action.as_str() {
-            "start" => crate::daemon::ServiceAction::Start,
-            "stop" => crate::daemon::ServiceAction::Stop {
-                timeout: request.timeout_ms.map(Duration::from_millis),
-                kill: request.kill,
-            },
-            "restart" => crate::daemon::ServiceAction::Restart {
-                rolling: request.rolling,
-            },
-            "signal" => crate::daemon::ServiceAction::Signal(request.signal.clone()),
-            other => {
-                return Err(Status::invalid_argument(format!(
-                    "{other:?} is not something done to a service: start, stop, restart or signal"
-                )));
-            }
-        };
+        let action = crate::services::Action::parse(
+            &request.action,
+            request.timeout_ms.map(Duration::from_millis),
+            request.kill,
+            request.rolling,
+            &request.signal,
+        )
+        .map_err(Status::invalid_argument)?;
 
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
@@ -5371,7 +5363,7 @@ pub fn refuse_host_request(op: &str) -> Result<(), String> {
 }
 
 /// A service as the admin API gives it.
-fn service_status(
+pub fn service_status(
     status: &crate::services::Status,
     owners: &crate::deployments::Owners,
 ) -> pb::ServiceStatus {

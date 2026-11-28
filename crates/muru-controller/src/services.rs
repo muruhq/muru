@@ -555,6 +555,49 @@ impl Setting {
     }
 }
 
+/// What is done to a service by hand (section 9.17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Start what does not run.
+    Start,
+    /// Stop it, each instance with `timeout` to stop in where one is
+    /// given, or killed at once with `kill`.
+    Stop {
+        /// The time to stop in, in place of the definition's.
+        timeout: Option<Duration>,
+        /// Skip the stop signal.
+        kill: bool,
+    },
+    /// Stop and start it, one instance at a time with `rolling`.
+    Restart {
+        /// Each instance ready before the next is stopped.
+        rolling: bool,
+    },
+    /// Send a signal: a name, or `reload` for the service's own.
+    Signal(String),
+}
+
+impl Action {
+    /// The action a request names, with what it carries.
+    pub fn parse(
+        action: &str,
+        timeout: Option<Duration>,
+        kill: bool,
+        rolling: bool,
+        signal: &str,
+    ) -> Result<Self, String> {
+        match action {
+            "start" => Ok(Self::Start),
+            "stop" => Ok(Self::Stop { timeout, kill }),
+            "restart" => Ok(Self::Restart { rolling }),
+            "signal" => Ok(Self::Signal(signal.to_owned())),
+            other => Err(format!(
+                "{other:?} is not something done to a service: start, stop, restart or signal"
+            )),
+        }
+    }
+}
+
 /// How a service comes to be under this daemon.
 pub enum Begin<'a> {
     /// Every instance is started.
@@ -957,6 +1000,51 @@ impl Service {
                 Some((index, pid))
             })
             .collect())
+    }
+
+    /// Do to the service, or one instance of it, what a command asks:
+    /// gives the index of each instance it was done to, and for a signal
+    /// the pid it went to.
+    pub fn act(&mut self, index: Option<u32>, action: Action) -> Result<Vec<(u32, u32)>, String> {
+        let plain = |indexes: Vec<u32>| indexes.into_iter().map(|index| (index, 0)).collect();
+
+        match action {
+            Action::Start => Ok(plain(self.start(index)?)),
+            Action::Stop { timeout, kill } => {
+                let grace = match kill {
+                    true => Some(Duration::ZERO),
+                    false => timeout,
+                };
+
+                Ok(plain(self.stop(index, grace)?))
+            }
+            Action::Restart { rolling } => Ok(plain(self.restart(index, rolling)?)),
+            Action::Signal(signal) => {
+                let name = &self.setting.name;
+
+                let number = match signal.as_str() {
+                    "reload" => match &self.setting.table.reload_signal {
+                        Some(named) => signal_number(named),
+                        None => return Err(format!("{name} names no reload_signal")),
+                    },
+                    "KILL" | "STOP" => {
+                        return Err(format!(
+                            "{signal} is not sent to a service: muructl service stop --kill \
+                             kills it, so that what supervises it knows it was asked for"
+                        ));
+                    }
+                    named if muru_config::STOP_SIGNALS.contains(&named) => signal_number(named),
+                    other => {
+                        return Err(format!(
+                            "{other:?} is not a signal a service is sent: reload, or one of {}",
+                            muru_config::STOP_SIGNALS.join(", ")
+                        ));
+                    }
+                };
+
+                self.signal(index, number)
+            }
+        }
     }
 
     /// Take up a changed definition (section 9.17). What a process is

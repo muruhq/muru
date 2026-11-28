@@ -62,6 +62,7 @@ The `[tool.muru.run]` table of a pyproject.toml, or `[run]` in a muru.toml and i
 | `reload_dirs` | array of strings |  | Directories watched, relative to the project; the project when empty. |
 | `reload_exclude` | array of strings |  | Patterns that never trigger a reload. |
 | `reload_include` | array of strings |  | Patterns watched besides `**/*.py`. |
+| `services` | boolean | `true` | Start the project's services that start automatically beside the application. |
 | `slow` | string | `"1s"` | How long a request may take before `errors` shows it. |
 | `timestamps` | boolean | `false` | Whether every line on the terminal carries the full UTC time. |
 | `tls_cert` | string |  | A certificate chain to serve, relative to the project. Not used by a detour. |
