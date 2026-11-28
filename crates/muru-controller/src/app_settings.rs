@@ -73,6 +73,10 @@ pub struct AppSettings {
     /// How often memory is measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_check_interval_ms: Option<u64>,
+    /// What the node changes of the services the releases declare
+    /// (section 9.17, issue 1011), by the service's name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, muru_config::ServiceOverride>,
 }
 
 /// The host timeouts an application sets, by their key in a `timeouts`
@@ -196,6 +200,15 @@ impl AppSettings {
             memory_reclaim_first: message.memory_reclaim_first,
             memory_hard_limit: message.memory_hard_limit,
             memory_check_interval_ms: message.memory_check_interval_ms,
+            services: message
+                .services
+                .iter()
+                .map(|(name, text)| {
+                    serde_json::from_str::<muru_config::ServiceOverride>(text)
+                        .map(|settings| (name.clone(), settings))
+                        .map_err(|error| format!("service.{name}: {error}"))
+                })
+                .collect::<Result<_, _>>()?,
         };
 
         settings.check()?;
@@ -243,6 +256,16 @@ impl AppSettings {
             memory_reclaim_first: self.memory_reclaim_first,
             memory_hard_limit: self.memory_hard_limit,
             memory_check_interval_ms: self.memory_check_interval_ms,
+            services: self
+                .services
+                .iter()
+                .map(|(name, settings)| {
+                    (
+                        name.clone(),
+                        serde_json::to_string(settings).unwrap_or_default(),
+                    )
+                })
+                .collect(),
             notice: String::new(),
         }
     }
@@ -311,6 +334,7 @@ impl AppSettings {
             memory_reclaim_first: memory.reclaim_first,
             memory_hard_limit: optional_bytes(&memory.hard_limit, "memory.hard_limit")?,
             memory_check_interval_ms: optional_ms(&memory.check_interval, "memory.check_interval")?,
+            services: table.service.clone(),
         };
 
         settings.check()?;
@@ -350,6 +374,7 @@ impl AppSettings {
             check_interval: self.memory_check_interval_ms.map(duration),
         };
         table.memory = (memory != muru_config::Memory::default()).then_some(memory);
+        table.service = self.services.clone();
     }
 
     /// What can be refused before a release is deployed with them.
@@ -379,6 +404,16 @@ impl AppSettings {
             && hard < soft
         {
             return Err("memory.hard_limit must not be below memory.soft_limit".to_owned());
+        }
+
+        for (name, settings) in &self.services {
+            if !muru_config::valid_name(name) {
+                return Err(format!("service.{name}: {name:?} is not a service's name"));
+            }
+
+            settings
+                .check()
+                .map_err(|error| format!("service.{name}: {error}"))?;
         }
 
         Ok(())
@@ -419,6 +454,18 @@ impl AppSettings {
             memory_check_interval_ms: over
                 .memory_check_interval_ms
                 .or(self.memory_check_interval_ms),
+            services: {
+                let mut services = self.services.clone();
+
+                for (name, settings) in &over.services {
+                    let merged = services
+                        .get(name)
+                        .map_or_else(|| settings.clone(), |under| under.with(settings));
+                    services.insert(name.clone(), merged);
+                }
+
+                services
+            },
         }
     }
 
@@ -435,6 +482,47 @@ impl AppSettings {
         if let Some(name) = key.strip_prefix("env.") {
             muru_config::check_env_name(name)?;
             self.env.retain(|entry| entry.name != name);
+            return Ok(());
+        }
+
+        // Issue 1011: `service.SVC` removes all a service has set, and
+        // `service.SVC.KEY` one key of it, a variable as `env.NAME`.
+
+        if let Some(rest) = key.strip_prefix("service.") {
+            let (name, inner) = rest.split_once('.').unwrap_or((rest, ""));
+
+            let Some(settings) = self.services.get_mut(name) else {
+                return Ok(());
+            };
+
+            match inner {
+                "" => {
+                    self.services.remove(name);
+                    return Ok(());
+                }
+                "autostart" => settings.autostart = None,
+                "instances" => settings.instances = None,
+                "restart" => settings.restart = None,
+                "stop_timeout" => settings.stop_timeout = None,
+                "on_idle" => settings.on_idle = None,
+                "env" => settings.env.clear(),
+                other => match other.strip_prefix("env.") {
+                    Some(variable) => {
+                        settings.env.remove(variable);
+                    }
+                    None => {
+                        return Err(format!(
+                            "{key} is not an application setting: a service's are {}",
+                            muru_config::SERVICE_OVERRIDE_KEYS.join(", ")
+                        ));
+                    }
+                },
+            }
+
+            if settings.is_empty() {
+                self.services.remove(name);
+            }
+
             return Ok(());
         }
 
@@ -467,7 +555,8 @@ impl AppSettings {
             "memory.check_interval" => self.memory_check_interval_ms = None,
             other => {
                 return Err(format!(
-                    "{other} is not an application setting: {}, timeouts.KEY, env.NAME or env",
+                    "{other} is not an application setting: {}, timeouts.KEY, env.NAME, env, \
+                     service.NAME or service.NAME.KEY",
                     SCALARS.join(", ")
                 ));
             }
@@ -551,6 +640,47 @@ impl AppSettings {
             };
 
             lines.push((crate::config::env_layer(&entry.name), value));
+        }
+
+        // Issue 1011: what is changed of each service, by its key.
+
+        for (name, settings) in &self.services {
+            let key = |inner: &str| format!("service.{name}.{inner}");
+
+            if let Some(autostart) = settings.autostart {
+                lines.push((key("autostart"), autostart.to_string()));
+            }
+
+            if let Some(instances) = settings.instances {
+                lines.push((key("instances"), instances.to_string()));
+            }
+
+            if let Some(restart) = &settings.restart {
+                lines.push((
+                    key("restart"),
+                    serde_json::to_string(restart).unwrap_or_default(),
+                ));
+            }
+
+            if let Some(stop_timeout) = &settings.stop_timeout {
+                lines.push((key("stop_timeout"), stop_timeout.clone()));
+            }
+
+            if let Some(on_idle) = settings.on_idle {
+                lines.push((key("on_idle"), on_idle.as_str().to_owned()));
+            }
+
+            for (variable, value) in &settings.env {
+                lines.push((
+                    key(&format!("env.{variable}")),
+                    match value {
+                        muru_config::EnvValue::Plain(value) => value.clone(),
+                        muru_config::EnvValue::Secret(secret) => {
+                            format!("secret {}:{}", secret.secret.store, secret.secret.key)
+                        }
+                    },
+                ));
+            }
         }
 
         lines
@@ -726,12 +856,114 @@ pub fn resolve(
         spec.layers.0.insert(key, LAYER.to_owned());
     }
 
+    // Issue 1011: what the node changes of the release's services is laid
+    // over the tables the release declares; a service the release does
+    // not declare has nothing to change. The result is checked as the
+    // project's own table was.
+
+    for (name, settings) in &settings.services {
+        let Some(table) = spec.services.get_mut(name) else {
+            continue;
+        };
+
+        for key in settings.apply(table) {
+            spec.layers
+                .0
+                .insert(format!("services.{name}.{key}"), LAYER.to_owned());
+        }
+
+        muru_config::check_project_service(table)
+            .map_err(|error| format!("service.{name}: {error}"))?;
+    }
+
     Ok(spec)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AppSettings, pb};
+
+    #[test]
+    fn a_services_settings_are_set_shown_merged_and_removed_by_key() {
+        let message = |services: &[(&str, &str)]| pb::AppSettings {
+            services: services
+                .iter()
+                .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
+                .collect(),
+            ..pb::AppSettings::default()
+        };
+        let first = AppSettings::from_message(&message(&[
+            ("worker", r#"{"instances": 8, "env": {"QUEUE": "bulk"}}"#),
+            ("beat", r#"{"autostart": false}"#),
+        ]))
+        .unwrap();
+        assert_eq!(
+            first.lines(),
+            [
+                ("service.beat.autostart".to_owned(), "false".to_owned()),
+                ("service.worker.instances".to_owned(), "8".to_owned()),
+                ("service.worker.env.QUEUE".to_owned(), "bulk".to_owned()),
+            ]
+        );
+
+        // They go to a message and back, and to a table and back.
+
+        assert_eq!(
+            AppSettings::from_message(&first.to_message()).unwrap(),
+            first
+        );
+        let mut table = muru_config::App::default();
+        first.write_table(&mut table);
+        assert_eq!(table.service["worker"].instances, Some(8));
+        assert_eq!(AppSettings::from_table(&table).unwrap(), first);
+
+        // A later setting replaces one key of a service and keeps the rest.
+
+        let over = AppSettings::from_message(&message(&[("worker", r#"{"stop_timeout": "2m"}"#)]))
+            .unwrap();
+        let mut merged = first.with(&over);
+        assert_eq!(merged.services["worker"].instances, Some(8));
+        assert_eq!(
+            merged.services["worker"].stop_timeout.as_deref(),
+            Some("2m")
+        );
+
+        // One key is removed, then a variable, then a whole service.
+
+        merged.unset("service.worker.instances").unwrap();
+        merged.unset("service.worker.env.QUEUE").unwrap();
+        assert_eq!(
+            merged.lines(),
+            [
+                ("service.beat.autostart".to_owned(), "false".to_owned()),
+                ("service.worker.stop_timeout".to_owned(), "2m".to_owned()),
+            ]
+        );
+        merged.unset("service.beat").unwrap();
+        merged.unset("service.worker.stop_timeout").unwrap();
+        assert!(merged.is_empty());
+        assert!(merged.clone().unset("service.worker.command").is_ok());
+        let mut again = first.clone();
+        assert!(
+            again
+                .unset("service.worker.command")
+                .unwrap_err()
+                .starts_with("service.worker.command is not an application setting")
+        );
+
+        // What cannot be taken is refused when it is set.
+
+        assert!(
+            AppSettings::from_message(&message(&[("worker", r#"{"instances": 0}"#)]))
+                .unwrap_err()
+                .starts_with("service.worker: instances must be at least 1")
+        );
+        assert!(
+            AppSettings::from_message(&message(&[("worker", r#"{"command": ["x"]}"#)]))
+                .unwrap_err()
+                .starts_with("service.worker: ")
+        );
+    }
 
     fn settings() -> AppSettings {
         AppSettings::from_message(&pb::AppSettings {

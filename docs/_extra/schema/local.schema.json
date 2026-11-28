@@ -163,6 +163,11 @@
           },
           "type": "array"
         },
+        "services": {
+          "default": true,
+          "description": "Start the project's services that start automatically beside the application.",
+          "type": "boolean"
+        },
         "slow": {
           "default": "1s",
           "description": "How long a request may take before `errors` shows it.",

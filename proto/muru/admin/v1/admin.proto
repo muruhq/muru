@@ -834,6 +834,7 @@ message AppSettings {
   string notice = 22;                        // on a change's answer: what its caller should be told, as that applied files last wrote these settings (issue 936)
   optional uint32 max_surge = 23;            // workers a group may run over its count while workers are swapped
   optional uint32 max_unavailable = 24;      // workers a group may run under its count while workers are swapped
+  map<string, string> services = 25;         // what the node changes of a service the releases declare, by the service's name: a JSON object with the keys autostart, instances, restart, stop_timeout, on_idle and env
 }
 
 // Set some of an application's settings and remove others. The settings
@@ -918,6 +919,7 @@ message DeployRequest {
   optional uint32 initial_processes = 63;   // the workers each group starts with and keeps while the release takes no traffic, where that is fewer than its processes (issue 964); its processes when absent
   map<string, uint32> group_initial_processes = 64; // the same for one named worker group, over initial_processes
   RestartSettings restart = 65;             // what happens when an http release's instance exits; the defaults when absent
+  bool wait_services = 66;                  // with wait: answer once the release's services that start automatically are running, or with an error when one is not within its readiness timeout
 }
 
 // The restart table of an http release: when an instance that exited is
@@ -1709,6 +1711,7 @@ message Route {
 
 message ListServicesRequest {
   repeated string names = 1;        // only these; every service when empty
+  string app = 2;                   // only this application's services; every service when empty
 }
 
 message ListServicesResponse {
@@ -1737,6 +1740,8 @@ message ServiceStatus {
   string log = 17;                  // the file its instances' output is written to
   string deployment = 18;           // the deployment that owns it
   repeated ServiceInstance instance_list = 19;
+  string app = 20;                  // for a project's service, its application; the name is then APP/NAME
+  string release = 21;              // for a project's service, the release whose service runs
 }
 
 // One instance of a service.

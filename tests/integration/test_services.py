@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import tomllib
 from collections.abc import Callable
@@ -414,3 +415,280 @@ def test_services_outlive_the_daemon_and_are_stopped_by_a_shutdown(tmp_path: Pat
         assert (listed["stopped"]["state"], listed["stopped"]["held"]) == ("stopped", True)
     finally:
         third.stop(shutdown=True)
+
+
+WORKER_SCRIPT = (
+    "import os, sys, time\n"
+    "print('worker of', os.environ['MURU_RELEASE'], os.environ['TASKS'], "
+    "os.path.realpath(sys.executable), flush=True)\n"
+    "time.sleep(600)\n"
+)
+
+
+def project_with_services(directory: Path, beat: bool = True) -> Path:
+    """A project that serves a page and declares services."""
+
+    directory.mkdir(exist_ok=True)
+    (directory / "worker.py").write_text(WORKER_SCRIPT)
+    (directory / "web.py").write_text(
+        "def application(environ, start_response):\n"
+        "    start_response('200 OK', [('Content-Type', 'text/plain')])\n"
+        "    return [b'site']\n"
+    )
+    services = (
+        "[tool.muru.services.worker]\n"
+        "command = ['python', 'worker.py']\n"
+        "env = { TASKS = 'queue-{index}' }\n"
+        "readiness = { after = '200ms' }\n"
+        "switch = 'start-first'\n\n"
+        "[tool.muru.services.reindex]\n"
+        "command = ['/bin/sleep', '600']\n"
+        "autostart = false\n"
+    )
+
+    if beat:
+        services += (
+            "\n[tool.muru.services.beat]\n"
+            "command = ['/bin/sh', '-c', 'echo beat of $MURU_RELEASE in $PWD; exec sleep 600']\n"
+            "readiness = { after = '200ms' }\n"
+        )
+
+    (directory / "pyproject.toml").write_text(
+        "[project]\nname = 'shop'\nversion = '0.0.0'\n\n"
+        "[tool.muru]\nentrypoint = 'web:application'\nprocesses = 1\n\n" + services
+    )
+    return directory
+
+
+def test_a_projects_services_run_with_its_serving_release(daemon: Daemon, tmp_path: Path) -> None:
+    project = project_with_services(tmp_path / "shop")
+
+    def of_app() -> dict[str, dict]:
+        listed = json.loads(daemon.muructl("service", "list", "--app", "shop", "--json").stdout)
+        return {service["name"]: service for service in listed["services"]}
+
+    def running_for(release: str) -> bool:
+        return all(
+            (service["release"], service["state"]) == (release, "running")
+            for name, service in of_app().items()
+            if name != "shop/reindex" and not service["held"]
+        )
+
+    # The first deploy brings the release's services with it: those that
+    # start automatically run, named with the application.
+
+    daemon.deploy("shop", project, "--wait-services")
+    listed = of_app()
+    assert list(listed) == ["shop/beat", "shop/reindex", "shop/worker"]
+    assert all(
+        service["app"] == "shop" and service["release"] == "r1" for service in listed.values()
+    )
+    assert [listed[name]["state"] for name in listed] == ["running", "stopped", "running"]
+
+    # A service runs with what a command of the release runs with: its
+    # interpreter for `python`, its source as the directory, the
+    # release's name, and its own variables over them.
+
+    worker_log = daemon.muructl("service", "logs", "shop/worker").stdout
+    assert f"worker of r1 queue-0 {os.path.realpath(sys.executable)}" in worker_log
+    assert f"beat of r1 in {project}" in daemon.muructl("service", "logs", "shop/beat").stdout
+    assert (daemon.base / "logs" / "apps" / "shop" / "services" / "worker.log").exists()
+    logs = json.loads(daemon.muructl("logs", "list", "--json").stdout)["logs"]
+    kinds = {log["name"]: (log["kind"], log["app"]) for log in logs}
+    assert kinds["apps/shop/services/worker.log"] == ("service", "shop")
+
+    # A held release runs no services: those of the serving one run on.
+
+    first = {name: service["instance_list"][0]["pid"] for name, service in listed.items()}
+    daemon.deploy("shop", project, "--hold")
+    time.sleep(1.5)
+    assert running_for("r1")
+    assert of_app()["shop/worker"]["instance_list"][0]["pid"] == first["shop/worker"]
+
+    # A deploy that takes over changes each service over as it asks: the
+    # worker's new instance is ready before the old one stops, and the
+    # scheduler's old one stops before the new one starts.
+
+    daemon.deploy("shop", project, "--wait-services")
+    assert running_for("r3")
+    wait_for(lambda: not alive(first["shop/worker"]) and not alive(first["shop/beat"]))
+    assert "worker of r3 queue-0" in daemon.muructl("service", "logs", "shop/worker").stdout
+    changed = dict(
+        (line.split(None, 5)[4], line.split(None, 5)[5])
+        for line in daemon.muructl("events").stdout.splitlines()
+        if " service.changed " in line and "shop@r3 takes over" in line
+    )
+    assert changed["shop/worker"].endswith("the old ones stopped once they are ready")
+    assert changed["shop/beat"].endswith("the old instances are stopped, and its own started then")
+
+    def after_takeover() -> list[str]:
+        lines = daemon.muructl("events").stdout.splitlines()
+        worker = [line for line in lines if " shop/worker " in line]
+        took_over = next(n for n, line in enumerate(worker) if "shop@r3 takes over" in line)
+        return [line.split(None, 5)[5] for line in worker[took_over + 1 :]]
+
+    wait_for(lambda: any("stopped (" in line for line in after_takeover()))
+    after = after_takeover()
+    ready = next(n for n, line in enumerate(after) if "is ready" in line)
+    stopped = next(n for n, line in enumerate(after) if "stopped (" in line)
+    assert ready < stopped, after
+
+    # A service stopped by hand stays stopped when another release takes
+    # over, and a rollback takes the services back with the traffic.
+
+    daemon.muructl("service", "stop", "shop/beat")
+    daemon.deploy("shop", project, "--wait-services")
+    listed = of_app()
+    assert (listed["shop/beat"]["state"], listed["shop/beat"]["held"]) == ("stopped", True)
+    assert (listed["shop/worker"]["release"], listed["shop/worker"]["state"]) == ("r4", "running")
+    daemon.muructl("rollback", "shop")
+    wait_for(lambda: of_app()["shop/worker"]["release"] == "r3")
+    wait_for(lambda: of_app()["shop/worker"]["state"] == "running")
+    daemon.muructl("service", "start", "shop/beat", "--wait")
+    assert of_app()["shop/beat"]["release"] == "r3"
+
+    # The node's own settings for a service are taken by the releases
+    # deployed from then on, over what the project declares.
+
+    daemon.muructl(
+        "app", "set", "shop", "--service", "worker.instances=2", "--service", "beat.autostart=false"
+    )
+    shown = daemon.muructl("app", "show", "shop").stdout
+    assert "service.worker.instances" in shown and "service.beat.autostart" in shown
+    exported = tomllib.loads(daemon.muructl("deployment", "export").stdout)
+    assert exported["app"]["shop"]["service"] == {
+        "beat": {"autostart": False},
+        "worker": {"instances": 2},
+    }
+    daemon.deploy("shop", project, "--wait-services")
+    listed = of_app()
+    assert [instance["state"] for instance in listed["shop/worker"]["instance_list"]] == [
+        "running",
+        "running",
+    ]
+    wait_for(lambda: of_app()["shop/beat"]["state"] == "stopped")
+    assert of_app()["shop/beat"]["held"] is False
+    daemon.muructl("app", "unset", "shop", "service.worker", "service.beat")
+
+    # A release that no longer declares a service leaves nothing in its
+    # place, and a drained application runs none.
+
+    project_with_services(project, beat=False)
+    daemon.deploy("shop", project, "--wait-services")
+    wait_for(lambda: list(of_app()) == ["shop/reindex", "shop/worker"])
+    serving = of_app()["shop/worker"]
+    pid = serving["instance_list"][0]["pid"]
+    daemon.muructl("drain", f"shop@{serving['release']}")
+    wait_for(lambda: of_app() == {})
+    assert not alive(pid)
+
+    # A service that does not come up fails --wait-services, and the
+    # release is serving all the same.
+
+    (project / "worker.py").write_text("raise SystemExit(3)\n")
+    settings = project / "pyproject.toml"
+    settings.write_text(
+        settings.read_text().replace(
+            "switch = 'start-first'", "switch = 'start-first'\nrestart = { give_up_after = 2 }"
+        )
+    )
+    failed = daemon.muructl(
+        "deploy", "shop", str(project), "--python", sys.executable, "--wait-services", check=False
+    )
+    assert failed.returncode != 0
+    assert "its service shop/worker is not running" in failed.stderr
+    assert daemon.get().body == b"site"
+
+    # A node's service takes none of the keys that follow a release.
+
+    refused = apply(
+        daemon, tmp_path / "node.toml", table("x", "sleep 1", "switch = 'start-first'\n")
+    )
+    assert (
+        "service x: switch is for a service a project declares" in refused.stdout + refused.stderr
+    )
+
+
+def test_a_projects_services_run_beside_a_development_run(tmp_path: Path) -> None:
+    from support import server as support
+
+    runtime = support.short_dir("muru-rt-")
+    project = tmp_path / "shop"
+    project.mkdir()
+    (project / "web.py").write_text(
+        "def application(environ, start_response):\n"
+        "    start_response('200 OK', [('Content-Type', 'text/plain')])\n"
+        "    return [b'one']\n"
+    )
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'shop'\nversion = '0.0.0'\n\n"
+        "[tool.muru]\nentrypoint = 'web:application'\n\n"
+        "[tool.muru.services.worker]\n"
+        "command = ['python', '-c', 'import os, time; "
+        'print("worker of", os.environ["MURU_RELEASE"], flush=True); time.sleep(600)\']\n'
+        "readiness = { after = '200ms' }\n\n"
+        "[tool.muru.services.reindex]\ncommand = ['/bin/sleep', '600']\nautostart = false\n"
+    )
+
+    def command(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(support.muructl_path()), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "MURU_RUN_DIR": str(runtime)},
+        )
+
+    server = support.start(
+        None,
+        workers=1,
+        chdir=project,
+        args=["--reload"],
+        env={"MURU_RUN_DIR": str(runtime)},
+    )
+
+    try:
+        # The services that start automatically run beside the
+        # application, their lines with the run's own.
+
+        assert server.wait_for_log("muru.service.worker[0]: worker of r1", timeout=20), server.log()
+        assert server.wait_for_log("admin socket"), server.log()
+        wait_for(
+            lambda: (
+                [
+                    (service["name"], service["state"])
+                    for service in json.loads(command("service", "list", "--json").stdout)[
+                        "services"
+                    ]
+                ]
+                == [("reindex", "stopped"), ("worker", "running")]
+            )
+        )
+        first = json.loads(command("service", "list", "--json").stdout)["services"][1]
+        pid = first["instance_list"][0]["pid"]
+
+        # A reload starts a new release, and the worker with it, so that
+        # it runs the edited code.
+
+        (project / "web.py").write_text((project / "web.py").read_text().replace("one", "two"))
+        assert server.wait_for_log("switched to release r2", timeout=30), server.log()
+        assert server.wait_for_log("muru.service.worker[0]: worker of r2", timeout=20), server.log()
+        wait_for(lambda: not alive(pid))
+    finally:
+        server.stop()
+
+    # The services stop with the run.
+
+    listed = subprocess.run(["ps", "-ax", "-o", "command="], capture_output=True, text=True).stdout
+    assert 'print("worker of"' not in listed
+
+    # They can be left out.
+
+    quiet = support.start(None, workers=1, chdir=project, args=["--no-services"])
+
+    try:
+        assert quiet.get("/").status == 200
+        time.sleep(1.5)
+        assert "muru.service." not in quiet.log()
+    finally:
+        quiet.stop()

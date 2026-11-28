@@ -40,6 +40,11 @@ pub struct Health {
     host_heard: AtomicU64,
     /// What is served, once it is.
     serving: OnceLock<Serving>,
+    /// The required services, each with whether it is running.
+    services: std::sync::Mutex<Vec<(String, bool)>>,
+    /// Set once every required service has been running: the startup
+    /// probe waits for it.
+    services_started: AtomicBool,
 }
 
 /// The running application, as the probes and metrics see it.
@@ -70,6 +75,8 @@ impl Health {
             stopping: AtomicBool::new(false),
             host_heard: AtomicU64::new(now_ms()),
             serving: OnceLock::new(),
+            services: std::sync::Mutex::new(Vec::new()),
+            services_started: AtomicBool::new(false),
         })
     }
 
@@ -77,6 +84,26 @@ impl Health {
     pub fn started(&self, serving: Serving) {
         let _ = self.serving.set(serving);
         self.started.store(true, Ordering::Relaxed);
+    }
+
+    /// The required services, each with whether it is running, as last
+    /// looked at.
+    pub fn services(&self, services: Vec<(String, bool)>) {
+        if services.iter().all(|(_, running)| *running) {
+            self.services_started.store(true, Ordering::Relaxed);
+        }
+
+        *self.services.lock().expect("services poisoned") = services;
+    }
+
+    /// The first required service that is not running, if one is not.
+    fn service_down(&self) -> Option<String> {
+        self.services
+            .lock()
+            .expect("services poisoned")
+            .iter()
+            .find(|(_, running)| !running)
+            .map(|(name, _)| name.clone())
     }
 
     /// The host has reported: it is alive.
@@ -112,6 +139,10 @@ impl Health {
             return Err("starting".to_owned());
         };
 
+        if let Some(name) = self.service_down() {
+            return Err(format!("the required service {name} is not running"));
+        }
+
         let routing = serving.pools.current();
 
         for (group, pool) in routing.default_pools() {
@@ -144,7 +175,11 @@ impl Health {
                     format!("not live: {reason}\n"),
                 ),
             },
-            "/startupz" if self.started.load(Ordering::Relaxed) => {
+            "/startupz"
+                if self.started.load(Ordering::Relaxed)
+                    && (self.services_started.load(Ordering::Relaxed)
+                        || self.service_down().is_none()) =>
+            {
                 (StatusCode::OK, text, "ok\n".to_owned())
             }
             "/startupz" => (
@@ -224,6 +259,13 @@ impl Health {
         serde_json::json!({
             "state": if self.stopping.load(Ordering::Relaxed) { "stopping" } else { "serving" },
             "groups": groups,
+            "services": self
+                .services
+                .lock()
+                .expect("services poisoned")
+                .iter()
+                .map(|(name, running)| serde_json::json!({"name": name, "required": true, "running": running}))
+                .collect::<Vec<_>>(),
             "settings": serving.settings,
             "limits": limits,
         })

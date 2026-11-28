@@ -4923,6 +4923,12 @@ pub struct DeployArgs {
     #[arg(long)]
     hold: bool,
 
+    /// Wait as well for the release's services that start automatically
+    /// to be running, and fail when one is not within its readiness
+    /// timeout; the release is serving all the same.
+    #[arg(long, conflicts_with_all = ["no_wait", "hold"])]
+    wait_services: bool,
+
     /// With --hold, open an entry link to the release's preview in the
     /// browser once it is ready.
     #[arg(long, requires = "hold", conflicts_with_all = ["no_wait", "dry_run"])]
@@ -5311,6 +5317,7 @@ impl ReleaseArgs {
                 .map(|timeout| timeout.as_millis() as u64),
             stop_signal: self.stop_signal.unwrap_or_default(),
             restart: restart_settings(&self.restart),
+            wait_services: false,
             entrypoint: self.entrypoint.unwrap_or_default(),
             interface: self
                 .interface
@@ -5454,6 +5461,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
         hold: args.hold,
+        wait_services: args.wait_services,
         override_freeze: args.override_freeze,
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         retain_workers: args.retain_workers,
@@ -7021,6 +7029,13 @@ pub struct AppSetArgs {
     #[arg(long = "secret", value_name = "NAME=STORE:KEY[:file]", value_parser = parse_secret_setting)]
     secrets: Vec<(String, String, String, bool)>,
 
+    /// What this node changes of a service the releases declare, as
+    /// SERVICE.KEY=VALUE: autostart (true or false), instances,
+    /// stop_timeout, on_idle (run or stop), restart.KEY as a restart
+    /// table's keys, or env.NAME for a variable. Repeatable.
+    #[arg(long = "service", value_name = "SERVICE.KEY=VALUE", value_parser = parse_service_setting)]
+    service: Vec<(String, String, String)>,
+
     /// Remove every setting the application has first, so it holds only
     /// those given here.
     #[arg(long)]
@@ -7111,9 +7126,130 @@ impl AppSetArgs {
             memory_check_interval_ms: memory_setting(&self.memory, "check_interval")
                 .and_then(|text| muru_config::parse_duration(&text).ok())
                 .map(|duration| duration.as_millis() as u64),
+            services: service_settings(&self.service),
             notice: String::new(),
         }
     }
+}
+
+/// A --service setting as SERVICE.KEY=VALUE, checked as the key of that
+/// name in an application's service table is: the service, the key and
+/// the value.
+fn parse_service_setting(text: &str) -> Result<(String, String, String), String> {
+    let (target, value) = text.split_once('=').ok_or_else(|| {
+        format!("{text:?} is not SERVICE.KEY=VALUE, for example worker.instances=8")
+    })?;
+    let (service, key) = target
+        .split_once('.')
+        .ok_or_else(|| format!("{target:?} is not SERVICE.KEY, for example worker.instances"))?;
+    let (service, key, value) = (service.trim(), key.trim(), value.trim());
+
+    if !muru_config::valid_name(service) {
+        return Err(format!("{service:?} is not a service's name"));
+    }
+
+    match key {
+        "autostart" => {
+            if !["true", "false"].contains(&value) {
+                return Err(format!("autostart must be true or false, not {value:?}"));
+            }
+        }
+        "instances" => {
+            value
+                .parse::<u32>()
+                .ok()
+                .filter(|count| *count > 0)
+                .ok_or_else(|| format!("instances: {value:?} is not a count of at least 1"))?;
+        }
+        "stop_timeout" => {
+            muru_config::parse_duration(value)?;
+        }
+        "on_idle" => {
+            value
+                .parse::<muru_config::ServiceIdle>()
+                .map_err(|error| error.to_string())?;
+        }
+        other => match (other.strip_prefix("restart."), other.strip_prefix("env.")) {
+            (Some(inner), _) => {
+                crate::parse_restart_setting(&format!("{inner}={value}"))?;
+            }
+            (_, Some(variable)) => {
+                if !muru_config::valid_env_name(variable) {
+                    return Err(format!("{variable:?} is not a variable name"));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "{other:?} is not a service's setting: autostart, instances, stop_timeout, \
+                     on_idle, restart.KEY or env.NAME"
+                ));
+            }
+        },
+    }
+
+    Ok((service.to_owned(), key.to_owned(), value.to_owned()))
+}
+
+/// The --service settings as a request carries them: for each service a
+/// JSON object with the keys of an application's service table.
+fn service_settings(
+    given: &[(String, String, String)],
+) -> std::collections::BTreeMap<String, String> {
+    let mut services: std::collections::BTreeMap<
+        String,
+        serde_json::Map<String, serde_json::Value>,
+    > = std::collections::BTreeMap::new();
+
+    for (service, key, value) in given {
+        let table = services.entry(service.clone()).or_default();
+
+        match key.as_str() {
+            "autostart" => {
+                table.insert(key.clone(), serde_json::json!(value == "true"));
+            }
+            "instances" => {
+                table.insert(
+                    key.clone(),
+                    serde_json::json!(value.parse::<u32>().unwrap_or(1)),
+                );
+            }
+            "stop_timeout" | "on_idle" => {
+                table.insert(key.clone(), serde_json::json!(value));
+            }
+            other => {
+                let (inner, name) = match other.split_once('.') {
+                    Some((inner, name)) => (inner, name),
+                    None => continue,
+                };
+
+                let entry = table
+                    .entry(inner.to_owned())
+                    .or_insert_with(|| serde_json::json!({}));
+
+                let value = match (inner, name) {
+                    ("restart", "success_exit_codes") => serde_json::json!(
+                        value
+                            .split(',')
+                            .filter_map(|code| code.trim().parse::<u8>().ok())
+                            .collect::<Vec<_>>()
+                    ),
+                    ("restart", "give_up_after") => {
+                        serde_json::json!(value.parse::<u32>().unwrap_or(1))
+                    }
+                    _ => serde_json::json!(value),
+                };
+
+                if let Some(entry) = entry.as_object_mut() {
+                    entry.insert(name.to_owned(), value);
+                }
+            }
+        }
+    }
+
+    services
+        .into_iter()
+        .map(|(service, table)| (service, serde_json::Value::Object(table).to_string()))
+        .collect()
 }
 
 /// Set an application's release settings.

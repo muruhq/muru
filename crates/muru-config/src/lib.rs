@@ -179,6 +179,8 @@ words!(ServerProfile {
     Generic => "generic",
 });
 words!(ServerBind { Unix => "unix", Port => "port" });
+words!(ServiceSwitch { StopFirst => "stop-first", StartFirst => "start-first" });
+words!(ServiceIdle { Run => "run", Stop => "stop" });
 words!(RestartMode {
     Always => "always",
     OnFailure => "on-failure",
@@ -1280,6 +1282,11 @@ pub struct Release {
     /// with the release on request, with inputs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub commands: BTreeMap<String, CommandTable>,
+    /// Services the application declares (section 9.17), by name:
+    /// commands kept running beside the release while it serves, in
+    /// place of the source's own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, Service>,
     /// What the deploy recorded about where the release's code came from
     /// (section 9.14): string keys to string values, `commit`, `ref`,
     /// `url`, `description` and `dirty` among them, which the release
@@ -5299,6 +5306,96 @@ pub struct Service {
     /// The signal `muructl service signal NAME reload` sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reload_signal: Option<String>,
+    /// For a project's service, what happens when another release takes
+    /// over: `stop-first` stops the old release's instances before the
+    /// new release's are started, and `start-first` starts the new and
+    /// stops the old once the new are ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "stop-first"))]
+    pub switch: Option<ServiceSwitch>,
+    /// For a project's service, whether it runs on while the
+    /// application's host is stopped for idleness (`run`) or stops with
+    /// it and starts when a request wakes it (`stop`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "run"))]
+    pub on_idle: Option<ServiceIdle>,
+    /// For a project's service under `muructl serve`: the container is
+    /// not ready while the service is not running, and muructl exits
+    /// when it has failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub required: Option<bool>,
+}
+
+/// How a project's service changes over when another release takes over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceSwitch {
+    /// The old release's instances stop before the new release's start.
+    #[default]
+    StopFirst,
+    /// The new release's instances are ready before the old ones stop.
+    StartFirst,
+}
+
+/// What a project's service does while its application's host is stopped
+/// for idleness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceIdle {
+    /// It runs on.
+    #[default]
+    Run,
+    /// It stops with the host and starts when a request wakes it.
+    Stop,
+}
+
+/// Check a node's `[service.NAME]` table: as [`check_service`], and none
+/// of the keys that are for a project's service.
+pub fn check_node_service(table: &Service) -> Result<(), String> {
+    for (key, set) in [
+        ("switch", table.switch.is_some()),
+        ("on_idle", table.on_idle.is_some()),
+        ("required", table.required.is_some()),
+    ] {
+        if set {
+            return Err(format!(
+                "{key} is for a service a project declares, which follows its releases"
+            ));
+        }
+    }
+
+    check_service(table)
+}
+
+/// Check a project's service, `[tool.muru.services.NAME]` or a declared
+/// release's: as [`check_service`], with no user of its own, since it
+/// runs as its application does, and a `cwd` inside the release's source.
+pub fn check_project_service(table: &Service) -> Result<(), String> {
+    for (key, set) in [
+        ("user", table.user.is_some()),
+        ("group", table.group.is_some()),
+        ("umask", table.umask.is_some()),
+    ] {
+        if set {
+            return Err(format!(
+                "{key} is not set on a project's service, which runs as its application does"
+            ));
+        }
+    }
+
+    if let Some(cwd) = &table.cwd
+        && (Path::new(cwd).is_absolute()
+            || Path::new(cwd)
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir)))
+    {
+        return Err(format!(
+            "cwd {cwd:?} must be a path inside the release's source directory"
+        ));
+    }
+
+    check_service(table)
 }
 
 /// The `readiness` table of a service: how an instance is known to be
@@ -6204,6 +6301,141 @@ pub struct App {
     /// The memory policy for every release, each key over the source's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,
+    /// What this node changes of the services the application's
+    /// releases declare (section 9.17), by the service's name: every
+    /// release deployed after this is applied takes them over its own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub service: BTreeMap<String, ServiceOverride>,
+}
+
+/// What a node's operator changes of a service a project declares, the
+/// `[app.NAME.service.SERVICE]` table: the keys that are the node's to
+/// decide. The command is the release's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceOverride {
+    /// Whether the service starts with its release on this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autostart: Option<bool>,
+    /// How many copies of the command run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<u32>,
+    /// What happens when an instance exits, in place of the project's
+    /// table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<Restart>,
+    /// How long an instance asked to stop has before it is killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout: Option<String>,
+    /// Whether the service runs on while the application's host is
+    /// stopped for idleness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_idle: Option<ServiceIdle>,
+    /// Variables over the service's own, by name: a value, or a secret
+    /// reference.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
+}
+
+/// The keys of a `[app.NAME.service.SERVICE]` table.
+pub const SERVICE_OVERRIDE_KEYS: [&str; 6] = [
+    "autostart",
+    "instances",
+    "restart",
+    "stop_timeout",
+    "on_idle",
+    "env",
+];
+
+impl ServiceOverride {
+    /// Whether nothing is set.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Check what can be refused before a release takes it.
+    pub fn check(&self) -> Result<(), String> {
+        if self.instances == Some(0) {
+            return Err("instances must be at least 1".to_owned());
+        }
+
+        if let Some(restart) = &self.restart {
+            check_restart(restart)?;
+        }
+
+        if let Some(text) = &self.stop_timeout {
+            let duration =
+                parse_duration(text).map_err(|error| format!("stop_timeout: {error}"))?;
+
+            if duration.is_zero() {
+                return Err("stop_timeout must be longer than nothing".to_owned());
+            }
+        }
+
+        for name in self.env.keys() {
+            if !valid_env_name(name) {
+                return Err(format!("env: {name:?} is not a variable name"));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// These settings with `over`'s laid on them, a variable by its name.
+    pub fn with(&self, over: &Self) -> Self {
+        let mut env = self.env.clone();
+        env.extend(over.env.clone());
+
+        Self {
+            autostart: over.autostart.or(self.autostart),
+            instances: over.instances.or(self.instances),
+            restart: over.restart.clone().or_else(|| self.restart.clone()),
+            stop_timeout: over
+                .stop_timeout
+                .clone()
+                .or_else(|| self.stop_timeout.clone()),
+            on_idle: over.on_idle.or(self.on_idle),
+            env,
+        }
+    }
+
+    /// Lay the settings over a service's table, and give the keys that
+    /// were set.
+    pub fn apply(&self, table: &mut Service) -> Vec<String> {
+        let mut given = Vec::new();
+
+        if let Some(autostart) = self.autostart {
+            table.autostart = Some(autostart);
+            given.push("autostart".to_owned());
+        }
+
+        if let Some(instances) = self.instances {
+            table.instances = Some(instances);
+            given.push("instances".to_owned());
+        }
+
+        if let Some(restart) = &self.restart {
+            table.restart = Some(restart.clone());
+            given.push("restart".to_owned());
+        }
+
+        if let Some(stop_timeout) = &self.stop_timeout {
+            table.stop_timeout = Some(stop_timeout.clone());
+            given.push("stop_timeout".to_owned());
+        }
+
+        if let Some(on_idle) = self.on_idle {
+            table.on_idle = Some(on_idle);
+            given.push("on_idle".to_owned());
+        }
+
+        for (name, value) in &self.env {
+            table.env.insert(name.clone(), value.clone());
+            given.push(format!("env.{name}"));
+        }
+
+        given
+    }
 }
 
 impl App {
@@ -6239,6 +6471,7 @@ impl App {
             max_unavailable,
             timeouts,
             memory,
+            service,
         } = self;
 
         serving.is_some()
@@ -6263,6 +6496,7 @@ impl App {
             || max_unavailable.is_some()
             || timeouts.is_some()
             || memory.is_some()
+            || !service.is_empty()
     }
 
     /// Take another table's own settings in place of this one's, and give
@@ -6293,6 +6527,7 @@ impl App {
             max_unavailable,
             timeouts,
             memory,
+            service,
         } = other;
 
         self.serving = serving;
@@ -6317,6 +6552,7 @@ impl App {
         self.max_unavailable = max_unavailable;
         self.timeouts = timeouts;
         self.memory = memory;
+        self.service = service;
 
         (release, schedule)
     }
@@ -6977,6 +7213,11 @@ pub struct RunSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = true))]
     pub reload: Option<bool>,
+    /// Start the project's services that start automatically beside the
+    /// application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
+    pub services: Option<bool>,
     /// Directories watched, relative to the project; the project when
     /// empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -7064,6 +7305,7 @@ impl RunSettings {
             tls_key: over.tls_key.clone().or_else(|| self.tls_key.clone()),
             hosts: join(&self.hosts, &over.hosts),
             reload: over.reload.or(self.reload),
+            services: over.services.or(self.services),
             reload_dirs: join(&self.reload_dirs, &over.reload_dirs),
             reload_include: join(&self.reload_include, &over.reload_include),
             reload_exclude: join(&self.reload_exclude, &over.reload_exclude),
@@ -7303,6 +7545,11 @@ pub struct ServeSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("x-default" = "loopback peers, for their forwarding headers alone"))]
     pub trusted_proxy: Option<Vec<String>>,
+    /// Which of the project's services run in the container: `all`,
+    /// `none`, or their names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-default" = "`all`: those that start automatically"))]
+    pub services: Option<Vec<String>>,
 }
 
 /// A count given as a number or as a word such as `auto`.
@@ -7529,6 +7776,10 @@ pub struct ToolMuru {
     /// with the release on request, with inputs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub commands: BTreeMap<String, CommandTable>,
+    /// Services the application declares (section 9.17), by name:
+    /// commands kept running beside the release while it serves.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, Service>,
 }
 
 /// A command an application declares, the `[tool.muru.commands.NAME]` or
@@ -9894,6 +10145,116 @@ mod service_tests {
             .starts_with("readiness.interval is for a form that probes")
         );
         assert!(toml::from_str::<Service>("command = ['x']\nports = 1").is_err());
+    }
+
+    #[test]
+    fn a_projects_service_and_a_nodes_take_the_keys_that_are_theirs() {
+        use super::{
+            ServiceIdle, ServiceSwitch, ToolMuru, check_node_service, check_project_service,
+        };
+
+        let project: ToolMuru = toml::from_str(
+            "entrypoint = 'shop.wsgi:application'\n\
+             [services.worker]\ncommand = ['celery', '-A', 'shop', 'worker']\n\
+             instances = 4\nswitch = 'start-first'\non_idle = 'stop'\ncwd = 'tasks'\n\
+             [services.litestream]\ncommand = ['litestream', 'replicate']\nrequired = true\n",
+        )
+        .unwrap();
+        let worker = &project.services["worker"];
+        assert_eq!(worker.switch, Some(ServiceSwitch::StartFirst));
+        assert_eq!(worker.on_idle, Some(ServiceIdle::Stop));
+        assert_eq!(check_project_service(worker), Ok(()));
+        assert_eq!(
+            check_project_service(&project.services["litestream"]),
+            Ok(())
+        );
+
+        // A node's service follows no release.
+
+        assert_eq!(
+            check_node_service(worker).unwrap_err(),
+            "switch is for a service a project declares, which follows its releases"
+        );
+        assert!(
+            check_node_service(&project.services["litestream"])
+                .unwrap_err()
+                .starts_with("required is for a service a project declares")
+        );
+
+        // A project's service runs as its application, inside its source.
+
+        assert_eq!(
+            check_project_service(&service("command = ['x']\nuser = 'redis'")).unwrap_err(),
+            "user is not set on a project's service, which runs as its application does"
+        );
+
+        for cwd in ["/srv/other", "../other"] {
+            let table = service(&format!("command = ['x']\ncwd = '{cwd}'"));
+            assert!(
+                check_project_service(&table)
+                    .unwrap_err()
+                    .ends_with("must be a path inside the release's source directory")
+            );
+        }
+
+        assert!(toml::from_str::<Service>("command = ['x']\nswitch = 'both'").is_err());
+    }
+
+    #[test]
+    fn a_nodes_settings_for_a_projects_service_are_laid_over_its_table() {
+        use super::{App, ServiceIdle, ServiceOverride};
+
+        let app: App = toml::from_str(
+            "[service.worker]\ninstances = 8\nstop_timeout = '2m'\nenv = { QUEUE = 'bulk' }\n\
+             [service.beat]\nautostart = false\non_idle = 'stop'\n\
+             restart = { give_up_after = 3 }\n",
+        )
+        .unwrap();
+        assert!(app.sets_own());
+        let worker = &app.service["worker"];
+        assert_eq!(worker.check(), Ok(()));
+
+        // Only what is set is laid over, and the keys set are named.
+
+        let mut table = service("command = ['celery', 'worker']\ninstances = 4\nenv = { A = 'b' }");
+        assert_eq!(
+            worker.apply(&mut table),
+            ["instances", "stop_timeout", "env.QUEUE"]
+        );
+        assert_eq!(table.instances, Some(8));
+        assert_eq!(table.command, ["celery", "worker"]);
+        assert_eq!(table.env.len(), 2);
+        let mut beat = service("command = ['celery', 'beat']");
+        app.service["beat"].apply(&mut beat);
+        assert_eq!(
+            (beat.autostart, beat.on_idle),
+            (Some(false), Some(ServiceIdle::Stop))
+        );
+
+        // A later setting replaces the same key and keeps the others.
+
+        let over: ServiceOverride =
+            toml::from_str("instances = 2\nenv = { QUEUE = 'fast' }").unwrap();
+        let merged = worker.with(&over);
+        assert_eq!(merged.instances, Some(2));
+        assert_eq!(merged.stop_timeout.as_deref(), Some("2m"));
+        assert_eq!(merged.env.len(), 1);
+
+        // The command is the release's, and what cannot be run is refused.
+
+        assert!(toml::from_str::<ServiceOverride>("command = ['x']").is_err());
+        let refused = |text: &str| {
+            toml::from_str::<ServiceOverride>(text)
+                .unwrap()
+                .check()
+                .unwrap_err()
+        };
+        assert_eq!(refused("instances = 0"), "instances must be at least 1");
+        assert!(refused("stop_timeout = 'soon'").starts_with("stop_timeout: "));
+        assert_eq!(
+            refused("restart = { give_up_after = 0 }"),
+            "restart.give_up_after must be at least 1"
+        );
     }
 
     #[test]

@@ -523,6 +523,206 @@ The subject of each event is the service's name.
 | `muru_service_exits_total` | counter | service, outcome | exits the program made: `clean` or `failed` |
 | `muru_service_start_time_seconds` | gauge | service, instance | when the instance's process started |
 
+## A project's services
+
+A project declares the long-running processes that belong with its
+code, such as a queue's workers or a scheduler, in its own settings.
+They run the same release as its web workers, with the same settings
+and secrets, and are replaced when the release is.
+
+```toml
+# pyproject.toml
+[tool.muru]
+entrypoint = 'shop.wsgi:application'
+
+[tool.muru.services.worker]
+description = 'Task queue workers'
+command = ['celery', '-A', 'shop', 'worker', '--hostname', 'worker{index}@%h']
+instances = 4
+stop_timeout = '2m'
+switch = 'start-first'
+
+[tool.muru.services.beat]
+description = 'Periodic task scheduler'
+command = ['celery', '-A', 'shop', 'beat', '--schedule', '{run_dir}/beat-schedule']
+restart = { give_up_after = 5 }
+
+[tool.muru.services.reindex]
+description = 'Rebuild the search index; started by hand'
+command = ['python', 'manage.py', 'reindex', '--watch']
+autostart = false
+```
+
+The keys are those of a node's service, with three differences. There
+is no `user`, `group` or `umask`: the instances run as the application
+does. `cwd` is the release's source directory, or a path relative to
+it. And there are two more keys:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `switch` | `stop-first` | What happens when another release takes over. `stop-first` stops the old release's instances before the new release's are started, so there are never two. `start-first` starts the new release's and stops the old ones once the new are ready, so there is no gap. |
+| `on_idle` | `run` | With `stop`, the service stops when the application's host is stopped for idleness and starts when a request wakes it. |
+
+The services are fixed with each release, as its commands are. A
+release declared in an applied file may carry tables of its own, which
+replace the project's:
+
+```toml
+[app.shop.release.r7]
+source = '/srv/shop'
+
+[app.shop.release.r7.services.worker]
+command = ['celery', '-A', 'shop', 'worker', '--concurrency', '8']
+instances = 2
+```
+
+A [managed HTTP server](managed-servers.md) release carries its
+services the same way, so the worker beside a gunicorn that is being
+cut over comes along unchanged.
+
+### The node's own settings for a service
+
+The node's operator can change some of what a project declared without
+a new release of its code. These are settings of the application, as
+its worker counts and variables are: every release deployed from then
+on takes them over the project's own.
+
+```toml
+[app.shop.service.worker]
+instances = 8
+
+[app.shop.service.beat]
+autostart = false           # this node does not run the scheduler
+```
+
+`autostart`, `instances`, `restart`, `stop_timeout`, `on_idle` and `env`
+can be set there. The command is the release's. The same by command:
+
+```console
+$ muructl app set shop --service worker.instances=8 --service beat.autostart=false
+$ muructl app unset shop service.worker.instances
+$ muructl app unset shop service.beat
+```
+
+`--service` takes `restart.KEY` for a key of the restart table and
+`env.NAME` for a variable. `muructl app show` lists what is set, and an
+export writes it back. A service the serving release does not declare
+has nothing to change. The settings reach the next release deployed,
+not the one that serves.
+
+### What an instance runs with
+
+What a [command](commands.md) of the release runs with: the release's
+environment with its secrets, the directory of its interpreter first on
+`PATH`, `MURU_APP`, `MURU_RELEASE` and `MURU_RELEASE_DIR`, and the
+application's user. `python` as the first word of `command` is the
+release's interpreter. The service's own `env` and `MURU_SERVICE`,
+`MURU_SERVICE_INDEX` and `MURU_SERVICE_RUN_DIR` come over all of it.
+
+### Which release's services run
+
+An application's services are those of its serving release, the one a
+plain deploy or a promotion made serving. They are named with the
+application, as `shop/worker`:
+
+```console
+$ muructl service list --app shop
+SERVICE       STATE     UP    PID    SINCE  RESTARTS  COMMAND
+shop/beat     running   1/1   71002  12s    0         celery -A shop beat --schedule {run_dir}/beat-schedule
+shop/reindex  stopped   0/1   -      -      0         python manage.py reindex --watch
+shop/worker   running   4/4   -      14s    0         celery -A shop worker --hostname worker{index}@%h
+```
+
+| Moment | What happens to the services |
+| --- | --- |
+| A first deploy | started once the release is serving |
+| A later deploy, a promotion | when the new release takes over, each service changes over as its `switch` says |
+| `deploy --hold`, a preview | the held release runs no services |
+| A canary or blue/green rollout under way | the release being replaced keeps its services, and the candidate runs none until it is promoted |
+| A rollback | the services go back with the traffic |
+| A release kept warm | its services are stopped |
+| `muructl drain` of the serving release | its services stop with it |
+| A new release that no longer declares a service | the old release's service stops and nothing takes its place |
+| Maintenance mode, a group scaled to zero | no change |
+| The host stopped for idleness | no change, unless the service has `on_idle = 'stop'` |
+| A release whose host fails and is started again | its services run on |
+
+A service stopped with `muructl service stop shop/worker` stays stopped
+when another release takes over, until `muructl service start`.
+
+A deploy does not fail because a service does: the release is serving
+once its workers are, and a service that will not start is in `backoff`
+on a serving release. `muructl deploy --wait-services` waits for every
+service that starts automatically to be `running`, and exits with an
+error when one is not within its readiness timeout. The release is
+serving all the same.
+
+During a canary two releases take requests and one runs the workers, so
+a task the candidate enqueues is run by the old release's code, and the
+other way round after the promotion for tasks still queued. Tasks have
+to be compatible across adjacent releases.
+
+The log of a project's service is `apps/APP/services/NAME.log` in the
+log directory, and continues across releases.
+
+## In a container
+
+Under `muructl serve` the project's services run beside the application
+in the container, with their output on standard output with every other
+line:
+
+```console
+$ docker run registry.example.com/shop
+muru: serving shop.wsgi:application on http://0.0.0.0:8080
+muru: service worker instance 0 started (pid 15)
+muru.service.worker[0]: worker ready, polling the queue
+```
+
+Which of them run is a setting, so that one image serves several roles:
+`--services`, `MURU_SERVE_SERVICES` or `services` in the serve table
+takes `all` (the default), `none`, or the names.
+
+```console
+$ docker run -e MURU_SERVE_SERVICES=none registry.example.com/shop
+$ docker run -e MURU_SERVE_SERVICES=worker registry.example.com/shop
+```
+
+A service can be tied to the container's health:
+
+```toml
+[tool.muru.services.litestream]
+command = ['litestream', 'replicate', '-config', '/app/litestream.yml']
+required = true
+```
+
+With `required = true` the startup probe waits for the service to be
+ready, the readiness probe fails while it is not `running`, and when it
+is `failed` muructl shuts down and exits with status 1, so that
+whatever runs the container replaces it. A required service gives up
+after five quick exits in a row unless its `restart.give_up_after` says
+otherwise. A service that is not required never affects the probes.
+
+On `SIGTERM` the services are stopped after the application, within the
+shutdown budget, each with its `stop_timeout` or what is left. Nothing
+is kept: a service stopped by hand is started again with the next
+container.
+
+The `muructl service` commands work inside the container. `muructl
+service logs` prints the last lines muructl has kept, a thousand for
+each service.
+
+A worker that should scale apart from the web side belongs in a
+container of its own, whose command is `muructl command run`, and
+needs no service.
+
+## In development
+
+`muructl run` starts the project's services that start automatically
+beside the application, prints their lines, restarts them when a
+reload starts a new release, so that a worker picks up the edited code,
+and stops them on Ctrl-C. `--no-services`, or `services = false` in the
+run table, turns that off, and `--services worker` picks some.
+
 ## Limits
 
 - A program that puts itself in the background and also starts a

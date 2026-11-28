@@ -34,6 +34,7 @@ mod pstats;
 mod release_metadata;
 mod render;
 mod run_admin;
+mod run_services;
 mod serve;
 mod serve_admin;
 mod serve_limits;
@@ -892,6 +893,22 @@ struct RunArgs {
     #[arg(long)]
     no_reload: bool,
 
+    /// Which of the project's services run beside the application: all
+    /// (the default, those that start automatically), none, or their
+    /// names, separated by commas.
+    #[arg(
+        long = "services",
+        value_name = "NAMES",
+        value_delimiter = ',',
+        conflicts_with = "no_services"
+    )]
+    services: Vec<String>,
+
+    /// Run none of the project's services; services = false in the
+    /// project's run table or muru.local.toml turns them off for good.
+    #[arg(long)]
+    no_services: bool,
+
     /// When the environment is built from uv.lock: auto (the default)
     /// builds a missing .venv and leaves an existing one alone, always
     /// also builds before the start, never builds nothing; a bare --build
@@ -1159,7 +1176,6 @@ fn running(command: &Command) -> admin::Running {
             ..admin::Running::default()
         },
         Command::Service { command } => admin::Running {
-            daemon_only: true,
             change: command.change(),
             ..admin::Running::default()
         },
@@ -1490,10 +1506,18 @@ fn main() -> anyhow::Result<()> {
             service::ServiceCommand::List {
                 state,
                 quiet,
+                app,
                 deployment,
                 socket,
                 output,
-            } => runtime.block_on(service::list(socket, output.json, state, quiet, deployment)),
+            } => runtime.block_on(service::list(
+                socket,
+                output.json,
+                state,
+                quiet,
+                app,
+                deployment,
+            )),
             service::ServiceCommand::Status {
                 named,
                 socket,
@@ -2234,6 +2258,8 @@ struct Serving {
     env_file: Option<PathBuf>,
     /// Whether the run reloads on changes.
     reload: bool,
+    /// Which of the project's services run beside the application.
+    services: run_services::Choice,
     reload_dirs: Vec<PathBuf>,
     reload_include: Vec<String>,
     reload_exclude: Vec<String>,
@@ -2295,6 +2321,16 @@ impl Serving {
             under.iter().chain(over).cloned().collect()
         };
 
+        let services = if args.no_services {
+            run_services::Choice::None
+        } else if !args.services.is_empty() {
+            run_services::Choice::parse(&args.services)
+        } else if settings.services == Some(false) {
+            run_services::Choice::None
+        } else {
+            run_services::Choice::All
+        };
+
         let reload = if args.no_reload {
             false
         } else if args.reload {
@@ -2341,6 +2377,7 @@ impl Serving {
                 .clone()
                 .or_else(|| settings.env_file.as_deref().map(PathBuf::from)),
             reload,
+            services,
             reload_dirs: settings
                 .reload_dirs
                 .iter()
@@ -3330,6 +3367,52 @@ fn project_name(project: &Path) -> Option<String> {
     let normalised = name.to_ascii_lowercase().replace(['_', '.'], "-");
 
     muru_config::valid_name(&normalised).then_some(normalised)
+}
+
+/// Section 9.17: make the run's services those the project declares now,
+/// for the release that serves: at the start, and again when a reload
+/// starts a new release. What cannot be read or started is said, and the
+/// application is served all the same.
+async fn take_services(
+    services: &run_services::Shared,
+    choice: &run_services::Choice,
+    project: &Path,
+    served: &run_admin::Served,
+    label: &str,
+    release: u32,
+    places: &muru_controller::places::Places,
+) {
+    let tables = run_services::declared(project, served.file.as_deref())
+        .and_then(|declared| run_services::chosen(&declared, choice));
+
+    let tables = match tables {
+        Ok(tables) => tables,
+        Err(error) => {
+            muru_common::muru_println!("warning: the project's services are not run: {error}");
+            return;
+        }
+    };
+
+    let (python, pythonpath) = served
+        .interpreter
+        .lock()
+        .expect("interpreter poisoned")
+        .clone();
+
+    let context = project_commands::Context {
+        app: label.to_owned(),
+        release: format!("r{release}"),
+        project: project.to_path_buf(),
+        python,
+        pythonpath,
+        env: served.env.clone(),
+        file: served.file.clone(),
+        places: places.clone(),
+    };
+
+    for (name, error) in services.lock().await.take(&tables, &context) {
+        muru_common::muru_println!("error: service {name} could not be started: {error}");
+    }
 }
 
 /// The line that marks SIGTERM under `muructl serve`: what readiness does
@@ -4750,6 +4833,13 @@ async fn run_with(
         file: args.settings_file.clone(),
     });
 
+    // Section 9.17: the project's services, which this process
+    // supervises since there is no daemon to.
+
+    let services: run_services::Shared = Arc::new(tokio::sync::Mutex::new(
+        run_services::RunServices::new(&run_dir, &resolved.serving.services),
+    ));
+
     let logs = Logs::default();
     let mut group_tables = resolved.groups.clone();
     let mut mounts = mount_paths(&resolved);
@@ -5461,6 +5551,7 @@ async fn run_with(
             processes: Arc::clone(&run_processes),
             recorder: recorder.clone(),
             imports: Arc::clone(&import_reports),
+            services: Arc::clone(&services),
             places: resolved.places.clone(),
             spool: serve.as_ref().map(|mode| mode.run_dir.join("spool")),
         });
@@ -5580,7 +5671,32 @@ async fn run_with(
         drop(changed_tx);
     }
 
+    // Section 9.17: the services start once the application's workers
+    // are ready, and before the probes say so: a required service is
+    // part of the container's health from the first answer.
+
+    take_services(
+        &services,
+        &resolved.serving.services,
+        &project,
+        &served,
+        &label,
+        1,
+        &resolved.places,
+    )
+    .await;
+
     if let Some(health) = &health {
+        health.services(
+            services
+                .lock()
+                .await
+                .required()
+                .into_iter()
+                .map(|(name, running, _)| (name, running))
+                .collect(),
+        );
+
         let required = std::iter::once(muru_edge::routing::DEFAULT_GROUP.to_owned())
             .chain(
                 resolved
@@ -5631,6 +5747,11 @@ async fn run_with(
     let in_flight = edge.access_log();
     let mut serving = tokio::spawn(edge.run());
     let mut release = 1;
+
+    // Section 9.17: the services are looked at once a second.
+
+    let mut services_tick = tokio::time::interval(Duration::from_secs(1));
+    services_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Ctrl-C and SIGTERM both stop the run in order: the host is told to
     // stop and its workers finish what they are serving.
@@ -5826,6 +5947,43 @@ async fn run_with(
                     }
                 }
             }
+            _ = services_tick.tick() => {
+                let (reports, required) = {
+                    let mut services = services.lock().await;
+                    (services.check().await, services.required())
+                };
+
+                for (name, report) in reports {
+                    match report.level {
+                        "error" => muru_common::muru_println!(
+                            "error: service {name} {}", report.message
+                        ),
+                        "warning" => muru_common::muru_println!(
+                            "warning: service {name} {}", report.message
+                        ),
+                        _ => muru_common::muru_println!("service {name} {}", report.message),
+                    }
+                }
+
+                // Under serve a required service is part of the
+                // container's health, and one that has failed for good
+                // ends the container, for whatever runs it to replace.
+
+                if let Some(health) = &health {
+                    health.services(
+                        required
+                            .iter()
+                            .map(|(name, running, _)| (name.clone(), *running))
+                            .collect(),
+                    );
+
+                    if let Some((name, _, _)) = required.iter().find(|(_, _, failed)| *failed) {
+                        break Err(anyhow::anyhow!(
+                            "the required service {name} has failed, and is not started again"
+                        ));
+                    }
+                }
+            }
             _ = limits_tick.tick(), if limits_watch.is_some() => {
                 let Some(watch) = &mut limits_watch else {
                     continue;
@@ -6012,6 +6170,21 @@ async fn run_with(
                                 next.flush_output().await;
                                 muru_common::muru_println!("switched to release r{release}");
                                 release_number.store(release, Ordering::Relaxed);
+
+                                // The services go over to the new
+                                // release, so that a worker picks up the
+                                // edited code as the application does.
+
+                                take_services(
+                                    &services,
+                                    &resolved.serving.services,
+                                    &project,
+                                    &served,
+                                    &label,
+                                    release,
+                                    &resolved.places,
+                                )
+                                .await;
                                 let previous = std::mem::replace(&mut current, next);
                                 run_processes.host(current.pid(), current.relay_pid());
                                 tokio::spawn(previous.stop(stop_budget));
@@ -6144,6 +6317,11 @@ async fn run_with(
                 Some(muru_controller::shutdown::workers_deadline(deadline)),
             )
             .await;
+
+        // The services stop after the application, which uses them
+        // until its last request, within what is left of the budget.
+
+        services.lock().await.stop_all(deadline).await;
     } else if muru_controller::shutdown::is_main_process() {
         let deadline = Instant::now() + muru_controller::shutdown::DEFAULT_BUDGET;
         let for_drain = deadline
@@ -6158,9 +6336,15 @@ async fn run_with(
                 Some(muru_controller::shutdown::workers_deadline(deadline)),
             )
             .await;
+        services.lock().await.stop_all(deadline).await;
     } else {
         drainer.drain(requests_budget).await;
         current.stop(stop_budget).await;
+        services
+            .lock()
+            .await
+            .stop_all(Instant::now() + run_services::STOP_WITHIN)
+            .await;
     }
 
     // The lines of the last requests are written before the run exits, unless

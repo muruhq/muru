@@ -87,6 +87,10 @@ pub struct Spec {
     /// How each instance's log relay is started; none starts the
     /// instances directly.
     pub relay: Option<RelaySpec>,
+    /// Where the lines of an instance started directly go, in place of
+    /// the log: whoever supervises takes them, as `muructl serve` does
+    /// to put them on its own standard output.
+    pub sink: Option<Sink>,
     /// The signal that asks an instance to stop.
     pub stop_signal: i32,
     /// Whether the stop signal goes to the instance's whole process
@@ -95,6 +99,17 @@ pub struct Spec {
     pub stop_group: bool,
     /// The event types to report under.
     pub events: EventNames,
+}
+
+/// Takes a line an instance wrote: the instance's index, whether the
+/// line is from its standard error, and the line.
+#[derive(Clone)]
+pub struct Sink(pub Arc<dyn Fn(u32, bool, String) + Send + Sync>);
+
+impl fmt::Debug for Sink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Sink")
+    }
 }
 
 /// How the log relay of each instance is started, and what hears it.
@@ -602,6 +617,34 @@ fn watch_relay(
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
+}
+
+/// Hand each line of an instance's stream to the sink, until the stream
+/// ends. A line that is not text is given with what is not replaced.
+async fn read_lines(
+    stream: impl tokio::io::AsyncRead + Unpin,
+    index: u32,
+    stderr: bool,
+    sink: Sink,
+) {
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+
+        match tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&line);
+                (sink.0)(
+                    index,
+                    stderr,
+                    text.trim_end_matches(['\n', '\r']).to_owned(),
+                );
+            }
+        }
+    }
 }
 
 /// A process this daemon started, or one it adopted from a previous
@@ -1352,31 +1395,53 @@ impl Supervisor {
         }
 
         // Without a relay, output goes to the log file itself, not
-        // through this process.
+        // through this process, unless whoever supervises takes the
+        // lines, when each stream is a pipe read here.
 
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.spec.log)
-            .with_context(|| format!("opening {}", self.spec.log.display()))?;
         let mut command = Command::new(&program);
+
+        if self.spec.sink.is_some() {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        } else {
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.spec.log)
+                .with_context(|| format!("opening {}", self.spec.log.display()))?;
+            command.stdout(log.try_clone()?).stderr(log);
+        }
+
         command
             .args(&arguments[1..])
             .current_dir(&self.spec.cwd)
             .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
             .env_clear()
             .envs(self.spec.env.iter().cloned())
             .envs(instance.spec.env.iter().cloned())
             .envs(crate::instance::variables());
         crate::host::own_session(&mut command, self.spec.identity);
-        let child = command
+        let mut child = command
             .spawn()
             .with_context(|| format!("starting {}", program.display()))?;
         let pid = child
             .id()
             .with_context(|| format!("{} started with no pid", program.display()))?;
+
+        // Each stream is read to its end on a task of its own, which
+        // ends when the last process holding the pipe has gone.
+
+        if let Some(sink) = &self.spec.sink {
+            let index = instance.index;
+
+            if let Some(out) = child.stdout.take() {
+                tokio::spawn(read_lines(out, index, false, sink.clone()));
+            }
+
+            if let Some(error) = child.stderr.take() {
+                tokio::spawn(read_lines(error, index, true, sink.clone()));
+            }
+        }
+
         let instance = &mut self.instances[position];
         instance.process = Some(Process::Child {
             child,
@@ -2206,6 +2271,16 @@ impl Supervisor {
         futures::future::join_all(stops).await;
     }
 
+    /// Kill every instance's process and group, without waiting for
+    /// them to go, for instances no record will name.
+    pub fn kill_all(&self) {
+        for instance in &self.instances {
+            if let Some(process) = &instance.process {
+                process.force();
+            }
+        }
+    }
+
     /// Leave the instances running and forget them, for a daemon that
     /// detaches. What an instance that exited left running is killed
     /// here: the record has no place for it, so the next daemon would
@@ -2265,6 +2340,7 @@ mod tests {
             identity: None,
             log: dir.join("output.log"),
             relay: None,
+            sink: None,
             stop_signal: libc::SIGTERM,
             stop_group: false,
             events: EVENTS,
@@ -2895,6 +2971,50 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         let _ = supervisor.check().await;
         wait_for("the group to go", || (!group_exists(pid)).then_some(()));
+        supervisor.stop_until(Instant::now()).await;
+    }
+
+    #[tokio::test]
+    async fn the_lines_of_an_instance_go_to_whoever_takes_them_in_place_of_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let into = Arc::clone(&taken);
+        let mut supervisor = Supervisor::start(
+            Spec {
+                sink: Some(Sink(Arc::new(move |index, stderr, line| {
+                    into.lock().unwrap().push((index, stderr, line));
+                }))),
+                ..spec(dir.path())
+            },
+            RestartPolicy::default(),
+            vec![instance(&[
+                "/bin/sh",
+                "-c",
+                "echo to out; echo to error >&2; exec sleep 600",
+            ])],
+            STOP_WITHIN,
+        )
+        .await
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+
+        while taken.lock().unwrap().len() < 2 {
+            assert!(std::time::Instant::now() < deadline, "the lines never came");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut lines = taken.lock().unwrap().clone();
+        lines.sort();
+        assert_eq!(
+            lines,
+            [
+                (0, false, "to out".to_owned()),
+                (0, true, "to error".to_owned())
+            ]
+        );
+        assert!(!dir.path().join("output.log").exists());
+        let _ = supervisor.check().await;
         supervisor.stop_until(Instant::now()).await;
     }
 

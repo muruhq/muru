@@ -929,6 +929,13 @@ impl Admin for Service {
             .map_err(|_| Status::unavailable("the daemon is stopping"))?
             .map_err(Status::failed_precondition)?;
         await_host_report(&self.handle, &release).await;
+
+        if request.wait_services {
+            await_services(&self.handle, &release)
+                .await
+                .map_err(Status::failed_precondition)?;
+        }
+
         Ok(Response::new(noticed(release)))
     }
 
@@ -1565,26 +1572,39 @@ impl Admin for Service {
         let (app, release, path) = if !request.service.is_empty() {
             // Section 9.17: a service's output is one file, every instance's.
 
-            let known = self
-                .handle
-                .store
-                .services()
-                .map_err(internal)?
-                .iter()
-                .any(|stored| stored.name == request.service);
+            // A node's is named by itself, and a project's as APP/NAME.
 
-            if !known {
+            let path = match request.service.split_once('/') {
+                Some((app, name)) => {
+                    let known = self
+                        .handle
+                        .info
+                        .services
+                        .lock()
+                        .expect("services poisoned")
+                        .iter()
+                        .any(|status| status.name == request.service);
+
+                    known.then(|| locations.app_service_log(app, name))
+                }
+                None => self
+                    .handle
+                    .store
+                    .services()
+                    .map_err(internal)?
+                    .iter()
+                    .any(|stored| stored.name == request.service)
+                    .then(|| locations.service_log(&request.service)),
+            };
+
+            let Some(path) = path else {
                 return Err(Status::not_found(format!(
                     "there is no service named {}",
                     request.service
                 )));
-            }
+            };
 
-            (
-                String::new(),
-                String::new(),
-                locations.service_log(&request.service),
-            )
+            (String::new(), String::new(), path)
         } else if request.edge {
             (String::new(), String::new(), locations.edge_log())
         } else if request.daemon {
@@ -3287,6 +3307,13 @@ impl Admin for Service {
             .expect("services poisoned")
             .iter()
             .filter(|status| request.names.is_empty() || request.names.contains(&status.name))
+            .filter(|status| {
+                request.app.is_empty()
+                    || status
+                        .owner
+                        .as_ref()
+                        .is_some_and(|(app, _)| app == &request.app)
+            })
             .map(|status| service_status(status, &owners))
             .collect();
         let missing = request
@@ -3308,22 +3335,14 @@ impl Admin for Service {
     ) -> Result<Response<pb::ActOnServiceResponse>, Status> {
         let request = request.into_inner();
 
-        let action = match request.action.as_str() {
-            "start" => crate::daemon::ServiceAction::Start,
-            "stop" => crate::daemon::ServiceAction::Stop {
-                timeout: request.timeout_ms.map(Duration::from_millis),
-                kill: request.kill,
-            },
-            "restart" => crate::daemon::ServiceAction::Restart {
-                rolling: request.rolling,
-            },
-            "signal" => crate::daemon::ServiceAction::Signal(request.signal.clone()),
-            other => {
-                return Err(Status::invalid_argument(format!(
-                    "{other:?} is not something done to a service: start, stop, restart or signal"
-                )));
-            }
-        };
+        let action = crate::services::Action::parse(
+            &request.action,
+            request.timeout_ms.map(Duration::from_millis),
+            request.kill,
+            request.rolling,
+            &request.signal,
+        )
+        .map_err(Status::invalid_argument)?;
 
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
@@ -5199,6 +5218,77 @@ fn planned_identity(app: &str, handle: &Handle) -> Option<crate::host::Identity>
     }
 }
 
+/// Section 9.17: wait until the services of a release that start
+/// automatically are running, each within its readiness timeout from
+/// now and a little more for the changeover, and say which is not when
+/// one is not. A service stopped by hand is not waited for.
+async fn await_services(handle: &Handle, release: &Release) -> Result<(), String> {
+    let wanted: Vec<(String, Duration)> = release
+        .spec
+        .services
+        .iter()
+        .filter(|(_, table)| crate::services::autostart_of(table))
+        .map(|(name, table)| {
+            let readiness = table
+                .readiness
+                .as_ref()
+                .and_then(|readiness| readiness.timeout.as_deref())
+                .and_then(|text| muru_config::parse_duration(text).ok())
+                .unwrap_or(muru_config::DEFAULT_SERVICE_READINESS_TIMEOUT);
+            (
+                format!("{}/{name}", release.app),
+                readiness + crate::services::stop_timeout_of(table) + Duration::from_secs(5),
+            )
+        })
+        .collect();
+    let began = tokio::time::Instant::now();
+
+    loop {
+        let waiting: Vec<(String, String, bool)> = {
+            let services = handle.info.services.lock().expect("services poisoned");
+
+            wanted
+                .iter()
+                .filter_map(|(address, within)| {
+                    let status = services.iter().find(|status| &status.name == address);
+                    let of_release = status
+                        .and_then(|status| status.owner.as_ref())
+                        .is_some_and(|(_, id)| id == &release.id);
+
+                    match status {
+                        Some(status) if status.held => None,
+                        Some(status) if of_release && status.state == "running" => None,
+                        Some(status) if of_release => Some((
+                            address.clone(),
+                            status.state.to_owned(),
+                            began.elapsed() >= *within || status.state == "failed",
+                        )),
+                        _ => Some((
+                            address.clone(),
+                            "not started".to_owned(),
+                            began.elapsed() >= *within,
+                        )),
+                    }
+                })
+                .collect()
+        };
+
+        if waiting.is_empty() {
+            return Ok(());
+        }
+
+        if let Some((address, state, _)) = waiting.iter().find(|(_, _, late)| *late) {
+            return Err(format!(
+                "release {}@{} is serving, and its service {address} is not running ({state}); \
+                 muructl service status {address} says where it stands",
+                release.app, release.id
+            ));
+        }
+
+        tokio::time::sleep(RESTART_POLL).await;
+    }
+}
+
 /// How long a deploy's answer waits for what the host has to say.
 const HOST_REPORT_WAIT: Duration = Duration::from_secs(2);
 
@@ -5273,7 +5363,7 @@ pub fn refuse_host_request(op: &str) -> Result<(), String> {
 }
 
 /// A service as the admin API gives it.
-fn service_status(
+pub fn service_status(
     status: &crate::services::Status,
     owners: &crate::deployments::Owners,
 ) -> pb::ServiceStatus {
@@ -5304,7 +5394,20 @@ fn service_status(
             .unwrap_or_else(|| "TERM".to_owned()),
         stop_timeout_ms: crate::services::stop_timeout_of(table).as_millis() as u64,
         log: status.log.display().to_string(),
-        deployment: owner_of(owners, Kind::Service, &status.name),
+        deployment: match &status.owner {
+            Some((app, _)) => owner_of(owners, Kind::App, app),
+            None => owner_of(owners, Kind::Service, &status.name),
+        },
+        app: status
+            .owner
+            .as_ref()
+            .map(|(app, _)| app.clone())
+            .unwrap_or_default(),
+        release: status
+            .owner
+            .as_ref()
+            .map(|(_, release)| release.clone())
+            .unwrap_or_default(),
         instance_list: status
             .instances
             .iter()
