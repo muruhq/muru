@@ -32,6 +32,9 @@ const EVENTS: EventNames = EventNames {
     daemonised: "service.daemonised",
 };
 
+/// The event of an instance that failed its liveness check.
+const UNRESPONSIVE_EVENT: &str = "service.unresponsive";
+
 /// The event of an instance that passed its readiness check.
 const READY_EVENT: &str = "service.ready";
 
@@ -189,6 +192,7 @@ impl Difference {
             ("stop_timeout", old.stop_timeout != new.stop_timeout),
             ("reload_signal", old.reload_signal != new.reload_signal),
             ("description", old.description != new.description),
+            ("liveness", old.liveness != new.liveness),
         ] {
             if changed {
                 difference.in_place.push(key);
@@ -402,32 +406,7 @@ async fn probe_until_ready(readiness: Readiness, fill: Fill, context: ProbeConte
         let left = deadline.saturating_duration_since(Instant::now());
         let within = PROBE_TIMEOUT.min(left);
 
-        let passed = match &readiness.form {
-            Form::After(_) => true,
-            Form::Tcp(address) => {
-                let address = fill.text(address);
-                tokio::time::timeout(within, tokio::net::TcpStream::connect(address))
-                    .await
-                    .is_ok_and(|connected| connected.is_ok())
-            }
-            Form::Unix(path) => {
-                let path = fill.text(path);
-                tokio::time::timeout(within, tokio::net::UnixStream::connect(path))
-                    .await
-                    .is_ok_and(|connected| connected.is_ok())
-            }
-            Form::Http(url) => tokio::time::timeout(within, http_answers(fill.text(url)))
-                .await
-                .unwrap_or(false),
-            Form::Command(command) => {
-                let command: Vec<String> = command.iter().map(|word| fill.text(word)).collect();
-                tokio::time::timeout(within, command_passes(command, &fill, context.clone()))
-                    .await
-                    .unwrap_or(false)
-            }
-        };
-
-        if passed {
+        if passes(&readiness.form, within, &fill, &context).await {
             return true;
         }
 
@@ -441,6 +420,91 @@ async fn probe_until_ready(readiness: Readiness, fill: Fill, context: ProbeConte
                 .min(deadline.saturating_duration_since(Instant::now())),
         )
         .await;
+    }
+}
+
+/// Whether one try of a form passes within its time.
+async fn passes(form: &Form, within: Duration, fill: &Fill, context: &ProbeContext) -> bool {
+    match form {
+        Form::After(_) => true,
+        Form::Tcp(address) => {
+            let address = fill.text(address);
+            tokio::time::timeout(within, tokio::net::TcpStream::connect(address))
+                .await
+                .is_ok_and(|connected| connected.is_ok())
+        }
+        Form::Unix(path) => {
+            let path = fill.text(path);
+            tokio::time::timeout(within, tokio::net::UnixStream::connect(path))
+                .await
+                .is_ok_and(|connected| connected.is_ok())
+        }
+        Form::Http(url) => tokio::time::timeout(within, http_answers(fill.text(url)))
+            .await
+            .unwrap_or(false),
+        Form::Command(command) => {
+            let command: Vec<String> = command.iter().map(|word| fill.text(word)).collect();
+            tokio::time::timeout(within, command_passes(command, fill, context.clone()))
+                .await
+                .unwrap_or(false)
+        }
+    }
+}
+
+/// A table's liveness: the check made of an instance that is running,
+/// how often, how long one may take, and how many in a row fail before
+/// the instance is stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Liveness {
+    form: Form,
+    interval: Duration,
+    timeout: Duration,
+    failures: u32,
+}
+
+impl Liveness {
+    fn of(table: &Table) -> Option<Self> {
+        let given = table.liveness.clone()?;
+
+        let form = if let Some(address) = given.tcp {
+            Form::Tcp(address)
+        } else if let Some(path) = given.unix {
+            Form::Unix(path)
+        } else if let Some(url) = given.http {
+            Form::Http(url)
+        } else {
+            Form::Command(given.command?)
+        };
+
+        Some(Self {
+            form,
+            interval: wait_of(&given.interval, muru_config::DEFAULT_LIVENESS_INTERVAL),
+            timeout: wait_of(&given.timeout, muru_config::DEFAULT_LIVENESS_TIMEOUT),
+            failures: given
+                .failures
+                .unwrap_or(muru_config::DEFAULT_LIVENESS_FAILURES)
+                .max(1),
+        })
+    }
+
+    /// The liveness as `service status` words it.
+    fn describe(&self) -> String {
+        let how = match &self.form {
+            Form::After(wait) => format!("after {}", muru_config::format_duration(*wait)),
+            Form::Tcp(address) => format!("tcp {address}"),
+            Form::Unix(path) => format!("unix {path}"),
+            Form::Http(url) => format!("http {url}"),
+            Form::Command(command) => format!("command {}", command.join(" ")),
+        };
+
+        format!(
+            "{how} every {}, restarted after {} in a row",
+            muru_config::format_duration(self.interval),
+            match self.failures {
+                1 => "1 failure".to_owned(),
+                failures => format!("{failures} failures"),
+            }
+        )
     }
 }
 
@@ -702,11 +766,21 @@ struct Probe {
     /// The check under way, which gives how long the instance took to
     /// be ready when it was in time.
     task: Option<tokio::task::JoinHandle<Option<Duration>>>,
+    /// The liveness check under way.
+    alive: Option<tokio::task::JoinHandle<bool>>,
+    /// When the next liveness check is due, once the instance is ready.
+    alive_at: Option<Instant>,
+    /// The liveness checks failed in a row.
+    unanswered: u32,
 }
 
 impl Drop for Probe {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
+            task.abort();
+        }
+
+        if let Some(task) = self.alive.take() {
             task.abort();
         }
     }
@@ -759,6 +833,8 @@ pub struct Status {
     pub restart: String,
     /// Its readiness as a phrase.
     pub readiness: String,
+    /// Its liveness check as a phrase; empty when it has none.
+    pub liveness: String,
     /// Each instance.
     pub instances: Vec<InstanceStatus>,
 }
@@ -775,6 +851,8 @@ const STATES: [&str; 7] = [
 pub struct Service {
     setting: Setting,
     readiness: Readiness,
+    /// The check that a running instance still answers, when it has one.
+    liveness: Option<Liveness>,
     supervisor: Box<Supervisor>,
     /// A supervisor whose instances are being stopped because the
     /// definition changed what they were started with; the one above
@@ -855,6 +933,9 @@ impl Service {
                                 pid: Some(pid),
                                 ready: true,
                                 task: None,
+                                alive: None,
+                                alive_at: Some(Instant::now()),
+                                unanswered: 0,
                             },
                         );
                     }
@@ -878,6 +959,7 @@ impl Service {
 
         let mut service = Self {
             readiness: Readiness::of(&setting.table),
+            liveness: Liveness::of(&setting.table),
             setting,
             supervisor: Box::new(supervisor),
             retiring: None,
@@ -1163,6 +1245,7 @@ impl Service {
             .collect();
         self.setting = setting;
         self.readiness = Readiness::of(&self.setting.table);
+        self.liveness = Liveness::of(&self.setting.table);
 
         // One declared again while it was being removed is kept.
 
@@ -1254,6 +1337,7 @@ impl Service {
         let start = autostart_of(&setting.table) && !self.held;
         self.setting = setting;
         self.readiness = Readiness::of(&self.setting.table);
+        self.liveness = Liveness::of(&self.setting.table);
         self.removing = false;
 
         let fresh = Supervisor::idle(
@@ -1479,7 +1563,66 @@ impl Service {
                             self.setting.probe_context(),
                         ))
                     }),
+                    alive: None,
+                    alive_at: None,
+                    unanswered: 0,
                 };
+            }
+
+            // An instance that is up is asked whether it still answers,
+            // one check at a time: enough failures in a row and it is
+            // stopped as one that failed.
+
+            if let Some(liveness) = self.liveness.as_ref().filter(|_| probe.ready && !stopping) {
+                let now = Instant::now();
+
+                if probe
+                    .alive
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                {
+                    let answered = probe
+                        .alive
+                        .take()
+                        .and_then(futures::FutureExt::now_or_never)
+                        .and_then(Result::ok)
+                        .unwrap_or(false);
+
+                    probe.unanswered = match answered {
+                        true => 0,
+                        false => probe.unanswered + 1,
+                    };
+
+                    if probe.unanswered >= liveness.failures {
+                        let failed = match liveness.failures {
+                            1 => "its liveness check".to_owned(),
+                            failures => format!("its liveness check {failures} times in a row"),
+                        };
+
+                        reports.push(Report::new(
+                            UNRESPONSIVE_EVENT,
+                            "warning",
+                            format!("instance {index} failed {failed} and is stopped"),
+                        ));
+                        probe.unanswered = 0;
+                        probe.alive_at = None;
+                        self.supervisor.fail(
+                            position,
+                            now + stop_timeout_of(&self.setting.table),
+                            format!("failed {failed}"),
+                        );
+                        continue;
+                    }
+                }
+
+                if probe.alive.is_none() && probe.alive_at.is_none_or(|due| due <= now) {
+                    let (form, within) = (liveness.form.clone(), liveness.timeout);
+                    let (fill, context) = (self.setting.fill(index), self.setting.probe_context());
+                    probe.alive_at = Some(now + liveness.interval);
+                    probe.alive = Some(tokio::spawn(async move {
+                        passes(&form, within, &fill, &context).await
+                    }));
+                }
             }
 
             if stopping
@@ -1503,6 +1646,10 @@ impl Service {
 
             if let Some(took) = passed {
                 probe.ready = true;
+                probe.alive_at = self
+                    .liveness
+                    .as_ref()
+                    .map(|liveness| Instant::now() + liveness.interval);
                 reports.push(Report::new(
                     READY_EVENT,
                     "info",
@@ -1674,6 +1821,11 @@ impl Service {
             restart: crate::config::restart_spec_from(self.setting.table.restart.as_ref())
                 .describe(),
             readiness: self.readiness.describe(),
+            liveness: self
+                .liveness
+                .as_ref()
+                .map(Liveness::describe)
+                .unwrap_or_default(),
             instances,
         }
     }
@@ -2041,6 +2193,77 @@ mod tests {
             said.iter()
                 .any(|line| line.starts_with("service.ready info: "))
         );
+        service.stop_until(std::time::Instant::now()).await;
+    }
+
+    #[tokio::test]
+    async fn an_instance_that_stops_answering_its_liveness_check_is_started_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = "command = ['/bin/sh', '-c', 'touch \"$MURU_SERVICE_RUN_DIR/ok\"; exec sleep 600']\n\
+                     readiness = { after = '50ms' }\n\
+                     liveness = { command = ['/bin/sh', '-c', 'test -e {run_dir}/ok'], \
+                     interval = '50ms', failures = 2 }\n\
+                     restart = { delay = '50ms' }\n";
+        let mut service =
+            Service::begin(setting(dir.path(), "deaf", table), false, Begin::Start).unwrap();
+        settle(&mut service, |status| status.state == "running").await;
+        assert_eq!(
+            service.status().liveness,
+            "command /bin/sh -c test -e {run_dir}/ok every 50ms, restarted after 2 failures in \
+             a row"
+        );
+
+        // While the check passes the instance is left alone.
+
+        let pid = service.status().instances[0].pid;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let said = settle(&mut service, |status| status.state == "running").await;
+        assert_eq!(said, Vec::<String>::new());
+        assert_eq!(service.status().instances[0].pid, pid);
+
+        // Once it fails twice in a row the instance is stopped, which is
+        // a failure, and the policy starts it again.
+
+        std::fs::remove_file(dir.path().join("run/0/ok")).unwrap();
+        let said = settle(&mut service, |status| {
+            status.state == "running" && status.instances[0].pid != pid
+        })
+        .await;
+        assert!(
+            said.contains(
+                &"service.unresponsive warning: instance 0 failed its liveness check 2 times in \
+                  a row and is stopped"
+                    .to_owned()
+            ),
+            "{said:?}"
+        );
+        assert!(
+            said.iter().any(|line| line.starts_with(
+                "service.exited warning: instance 0 failed its liveness check 2 times in a row \
+                 and was stopped"
+            )),
+            "{said:?}"
+        );
+        assert_eq!(service.status().restarts, 1);
+        assert_eq!(service.exits().collect::<Vec<_>>(), [("failed", 1)]);
+
+        // A change to the check is in force at once: the process is the
+        // same one, and with no check nothing is asked.
+
+        let pid = service.status().instances[0].pid;
+        let without: String = table
+            .lines()
+            .filter(|line| !line.contains("liveness") && !line.contains("interval"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let difference = service.update(setting(dir.path(), "deaf", &without));
+        assert_eq!(difference.in_place, ["liveness"]);
+        std::fs::remove_file(dir.path().join("run/0/ok")).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let said = settle(&mut service, |status| status.state == "running").await;
+        assert_eq!(said, Vec::<String>::new());
+        assert_eq!(service.status().instances[0].pid, pid);
+        assert_eq!(service.status().liveness, "");
         service.stop_until(std::time::Instant::now()).await;
     }
 

@@ -432,6 +432,13 @@ fn status_lines(service: &pb::ServiceStatus) -> Vec<String> {
         ),
         ("restart".to_owned(), service.restart.clone()),
         ("readiness".to_owned(), service.readiness.clone()),
+    ]);
+
+    if !service.liveness.is_empty() {
+        rows.push(("liveness".to_owned(), service.liveness.clone()));
+    }
+
+    rows.extend([
         (
             "stop".to_owned(),
             format!(

@@ -1742,6 +1742,7 @@ message ServiceStatus {
   repeated ServiceInstance instance_list = 19;
   string app = 20;                  // for a project's service, its application; the name is then APP/NAME
   string release = 21;              // for a project's service, the release whose service runs
+  string liveness = 22;             // the check that a running instance still answers, as a phrase; empty when it has none
 }
 
 // One instance of a service.

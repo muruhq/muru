@@ -412,6 +412,7 @@ A service, one of the `[service.NAME]` tables: a named command the daemon keeps 
 | `env` | table of strings or tables, {ref}`[tool.muru.env.NAME] <config-project-tool-muru-env-name>` |  | Environment variables: a value, or a secret reference resolved each time an instance starts. `{index}` and `{run_dir}` are filled in a value as in `command`. |
 | `group` | string | the user's primary group | The group the instances run as. |
 | `instances` | integer | `1` | How many copies of the command run. |
+| `liveness` | table, {ref}`[tool.muru.services.NAME.liveness] <config-project-tool-muru-services-name-liveness>` |  | A check that an instance still answers, made for as long as it runs; one that fails it is stopped and started again. |
 | `on_idle` | string | `"run"` | For a project's service, whether it runs on while the application's host is stopped for idleness (`run`) or stops with it and starts when a request wakes it (`stop`). `run`: It runs on. `stop`: It stops with the host and starts when a request wakes it. |
 | `readiness` | table, {ref}`[tool.muru.services.NAME.readiness] <config-project-tool-muru-services-name-readiness>` |  | How an instance is known to be up. |
 | `reload_signal` | string |  | The signal `muructl service signal NAME reload` sends. |
@@ -423,6 +424,21 @@ A service, one of the `[service.NAME]` tables: a named command the daemon keeps 
 | `switch` | string | `"stop-first"` | For a project's service, what happens when another release takes over: `stop-first` stops the old release's instances before the new release's are started, and `start-first` starts the new and stops the old once the new are ready. `stop-first`: The old release's instances stop before the new release's start. `start-first`: The new release's instances are ready before the old ones stop. |
 | `umask` | string | the daemon's | The umask of the instances, in octal. |
 | `user` | string | the service user | The user the instances run as, when the daemon runs as root. |
+
+(config-project-tool-muru-services-name-liveness)=
+## `[tool.muru.services.NAME.liveness]`
+
+The `liveness` table of a service: a check that a running instance still answers. One of `tcp`, `unix`, `http` and `command` says how.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `command` | array of strings |  | Alive while this command, run as the service's user with its environment, exits 0. |
+| `failures` | integer | `3` | How many checks in a row fail before the instance is stopped; at least 1. |
+| `http` | string |  | Alive while a GET of this `http://` URL answers 2xx or 3xx. |
+| `interval` | string | `"10s"` | How often the check is made. |
+| `tcp` | string |  | Alive while a TCP connection to this `host:port` is accepted. |
+| `timeout` | string | `"2s"` | How long one check may take. |
+| `unix` | string |  | Alive while a connection to this Unix socket is accepted. |
 
 (config-project-tool-muru-services-name-readiness)=
 ## `[tool.muru.services.NAME.readiness]`

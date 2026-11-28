@@ -1483,6 +1483,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "liveness": {
+          "$ref": "#/$defs/ServiceLiveness",
+          "description": "A check that an instance still answers, made for as long as it runs; one that fails it is stopped and started again."
+        },
         "on_idle": {
           "$ref": "#/$defs/ServiceIdle",
           "default": "run",
@@ -1552,6 +1556,49 @@
           "type": "string"
         }
       ]
+    },
+    "ServiceLiveness": {
+      "additionalProperties": false,
+      "description": "The `liveness` table of a service: a check that a running instance still answers. One of `tcp`, `unix`, `http` and `command` says how.",
+      "properties": {
+        "command": {
+          "description": "Alive while this command, run as the service's user with its environment, exits 0.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "failures": {
+          "default": 3,
+          "description": "How many checks in a row fail before the instance is stopped; at least 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "http": {
+          "description": "Alive while a GET of this `http://` URL answers 2xx or 3xx.",
+          "type": "string"
+        },
+        "interval": {
+          "default": "10s",
+          "description": "How often the check is made.",
+          "type": "string"
+        },
+        "tcp": {
+          "description": "Alive while a TCP connection to this `host:port` is accepted.",
+          "type": "string"
+        },
+        "timeout": {
+          "default": "2s",
+          "description": "How long one check may take.",
+          "type": "string"
+        },
+        "unix": {
+          "description": "Alive while a connection to this Unix socket is accepted.",
+          "type": "string"
+        }
+      },
+      "type": "object"
     },
     "ServiceReadiness": {
       "additionalProperties": false,

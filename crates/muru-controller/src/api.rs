@@ -5401,6 +5401,7 @@ pub fn service_status(
         user: table.user.clone().unwrap_or_default(),
         restart: status.restart.clone(),
         readiness: status.readiness.clone(),
+        liveness: status.liveness.clone(),
         stop_signal: table
             .stop_signal
             .clone()

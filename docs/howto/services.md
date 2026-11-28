@@ -475,7 +475,7 @@ node match them.
 | A removed table, with `--prune` | stopped and removed; its log is left |
 | `command`, `cwd`, `env`, `user`, `group`, `umask`, `readiness`, `stop_signal` or `stop_group` changed | every instance stopped and started again |
 | `instances` raised or lowered | instances started, or the highest numbered stopped; the others are not touched |
-| `restart`, `stop_timeout`, `reload_signal` or `description` changed | in force at once, nothing restarted |
+| `restart`, `liveness`, `stop_timeout`, `reload_signal` or `description` changed | in force at once, nothing restarted |
 | `autostart` turned on | started, unless it was stopped by hand |
 | `autostart` turned off | nothing: a running service keeps running until it is stopped |
 
