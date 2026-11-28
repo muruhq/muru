@@ -55,6 +55,7 @@ pub mod scaling;
 pub mod secrets;
 pub mod selector;
 pub mod servers;
+pub mod services;
 pub mod settings;
 pub mod shared;
 pub mod shutdown;

@@ -29,7 +29,7 @@ Python web applications are usually deployed in one of two ways. A general web s
 ## 1.3 Non-goals for the first versions
 
 - Multi-node scheduling and orchestration. Interfaces are designed so nodes can be added later.
-- General management of non-Python servers. Unmanaged HTTP upstreams are supported, and managed HTTP server releases exist in a limited form for migration cutovers (section 9.9).
+- General management of a node's processes. Muru supervises the processes that belong beside the applications it serves, with the smallest policy that makes them dependable, and a node's general system services stay with the system's own manager (ADR 0091). Inside that line are unmanaged HTTP upstreams, managed HTTP server releases in a limited form for migration cutovers (section 9.9) and services (section 9.17). Outside it are dependencies and ordering between services, socket activation, resource limits, templated instances and running services from images.
 - Windows. Production support is Linux. macOS is supported for development.
 - Acting as a CDN, WAF or API gateway product.
 

@@ -661,7 +661,7 @@ fn finish(name: &str, arguments: &JsonObject, result: CallToolResult) -> CallToo
     };
 
     let value = match name {
-        "logs" => lines(),
+        "logs" | "service_logs" => lines(),
         "command_run" if arguments.contains_key("output") => lines(),
         "metrics" => {
             let Ok(mut answer) = serde_json::from_str::<Value>(&printed) else {
@@ -1077,6 +1077,48 @@ fn specs() -> Vec<Spec> {
                 }
 
                 Ok(command)
+            },
+        },
+        Spec {
+            name: "services",
+            description: "The services the daemon keeps running (commands beside the applications, such as a cache or a queue worker): each one's state, instances, restarts and command, or with name one service in full, with each instance's state and last exits.",
+            changes: false,
+            properties: json!({
+                "name": {"type": "string", "description": "One service; every service when left out"},
+            }),
+            required: &[],
+            command: |arguments| {
+                Ok(match text(arguments, "name") {
+                    Some(name) => [words(&["service", "status"]), vec![name]].concat(),
+                    None => words(&["service", "list"]),
+                })
+            },
+        },
+        Spec {
+            name: "service_logs",
+            description: "Recent lines of a service's log, the output of its instances, as an array.",
+            changes: false,
+            properties: json!({
+                "name": {"type": "string"},
+                "lines": {"type": "integer", "description": "How many recent lines (default 100, at most 1000)"},
+            }),
+            required: &["name"],
+            command: |arguments| {
+                let lines = arguments
+                    .get("lines")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(100)
+                    .min(1000);
+
+                Ok([
+                    words(&["service", "logs"]),
+                    vec![
+                        needed(arguments, "name")?,
+                        "--lines".to_owned(),
+                        lines.to_string(),
+                    ],
+                ]
+                .concat())
             },
         },
         Spec {
@@ -1626,7 +1668,7 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "restart",
-            description: "Replace a release's worker (by its index within its group, as GROUP/N outside the default group) with a fresh one, gracefully or at once with force; or every worker in turn with all, or every worker of one worker group with group, which the release's host carries out under the group's max_surge and max_unavailable and which waits until it has finished unless no_wait is given; cancel ends such a restart, leaving the workers not yet replaced.",
+            description: "Replace a release's worker (by its index within its group, as GROUP/N outside the default group) with a fresh one, gracefully or at once with force; or every worker in turn with all, or every worker of one worker group with group, which the release's host carries out under the group's max_surge and max_unavailable and which waits until it has finished unless no_wait is given; cancel ends such a restart, leaving the workers not yet replaced. For a managed HTTP server release, all restarts its instances one at a time and index restarts one of them.",
             changes: true,
             properties: json!({
                 "target": {"type": "string", "description": "app, or app@release"},
@@ -1634,6 +1676,7 @@ fn specs() -> Vec<Spec> {
                 "all": {"type": "boolean"},
                 "group": {"type": "string", "description": "Every worker of this worker group"},
                 "cancel": {"type": "boolean", "description": "End a restart of every worker that is under way"},
+                "index": {"type": "integer", "description": "One instance of a managed HTTP server release"},
                 "no_wait": {"type": "boolean"},
                 "force": {"type": "boolean"},
             }),
@@ -1644,6 +1687,10 @@ fn specs() -> Vec<Spec> {
                 command.extend(option(arguments, "worker", "--worker"));
                 command.extend(option(arguments, "group", "--group"));
 
+                if let Some(index) = arguments.get("index").and_then(Value::as_u64) {
+                    command.extend(["--index".to_owned(), index.to_string()]);
+                }
+
                 for (key, name) in [
                     ("all", "--all"),
                     ("cancel", "--cancel"),
@@ -1653,6 +1700,38 @@ fn specs() -> Vec<Spec> {
                     if flag(arguments, key) {
                         command.push(name.to_owned());
                     }
+                }
+
+                Ok(command)
+            },
+        },
+        Spec {
+            name: "service",
+            description: "Start, stop or restart a service that is already defined, whole or one instance by index. A service stopped whole stays stopped until it is started; a restart with rolling takes the instances one at a time. A service is defined in an applied file, not here.",
+            changes: true,
+            properties: json!({
+                "action": {"type": "string", "enum": ["start", "stop", "restart"]},
+                "name": {"type": "string"},
+                "index": {"type": "integer", "description": "One instance; every instance when left out"},
+                "rolling": {"type": "boolean", "description": "For restart: one instance at a time, each ready before the next"},
+            }),
+            required: &["action", "name"],
+            command: |arguments| {
+                let action = needed(arguments, "action")?;
+
+                if !["start", "stop", "restart"].contains(&action.as_str()) {
+                    return Err(format!("{action:?} is not start, stop or restart"));
+                }
+
+                let mut command = vec!["service".to_owned(), action.clone()];
+                command.push(needed(arguments, "name")?);
+
+                if let Some(index) = arguments.get("index").and_then(Value::as_u64) {
+                    command.extend(["--index".to_owned(), index.to_string()]);
+                }
+
+                if action == "restart" && flag(arguments, "rolling") {
+                    command.push("--rolling".to_owned());
                 }
 
                 Ok(command)

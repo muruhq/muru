@@ -750,6 +750,10 @@ mod tests {
                 "[upstream.legacy]\naddresses = ['127.0.0.1:9000']\n",
                 "[upstream.legacy]",
             ),
+            (
+                "[service.redis]\ncommand = ['redis-server']\n",
+                "[service.redis]",
+            ),
         ] {
             let Err(error) = read(text) else {
                 panic!("{table} is refused");

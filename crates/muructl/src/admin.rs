@@ -4595,6 +4595,11 @@ pub async fn show_status(
         "apps     {} ({} releases)",
         status.app_count, status.release_count
     );
+
+    if !status.services.is_empty() {
+        println!("services {}", services_line(&status.services));
+    }
+
     println!("websockets {} open", status.websockets);
 
     if !status.no_host.is_empty() {
@@ -5934,8 +5939,14 @@ pub struct RestartArgs {
     /// turns, so the restart carries on if the daemon is stopped. For a
     /// managed HTTP server release, every instance, one at a time, each
     /// answering its readiness probe before the next is stopped.
-    #[arg(long, required_unless_present_any = ["worker", "pid", "group", "cancel"])]
+    #[arg(long, required_unless_present_any = ["worker", "pid", "group", "cancel", "index"])]
     all: bool,
+
+    /// One instance of a managed HTTP server release, by its index: it
+    /// is taken out of service, stopped, started and waited for until it
+    /// answers its readiness probe. With --force it is killed at once.
+    #[arg(long, value_name = "N", conflicts_with_all = ["worker", "pid", "all", "group", "cancel"])]
+    index: Option<u32>,
 
     /// Every worker of one worker group, each in its turn.
     #[arg(long, value_name = "NAME", conflicts_with_all = ["worker", "pid"])]
@@ -5974,7 +5985,7 @@ const RESTART_POLL: Duration = Duration::from_millis(250);
 
 /// Replace one worker of a release, or each in turn, with a fresh one.
 pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
-    if args.cancel || args.all || args.group.is_some() {
+    if args.cancel || args.all || args.group.is_some() || args.index.is_some() {
         return restart_release(args).await;
     }
 
@@ -6153,6 +6164,8 @@ async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
             group: args.group.clone().unwrap_or_default(),
             wait: !args.no_wait,
             wait_timeout_ms: 0,
+            index: args.index,
+            force: args.force && args.index.is_some(),
         })
         .await
         .map_err(explain)?
@@ -6178,6 +6191,8 @@ async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
 
     if args.output.json {
         print_answer(&answer)?;
+    } else if let (true, Some(index)) = (answer.instances, args.index) {
+        println!("muru: instance {index} of {name} to be restarted");
     } else if answer.instances {
         println!(
             "muru: {} of {name} to be restarted, one at a time",
@@ -9010,6 +9025,36 @@ fn finish_removal(answer: &pb::RemoveReleasesResponse, json: bool) -> anyhow::Re
     }
 }
 
+/// The services as one line of the status: how many are in each state,
+/// healthiest first, with the names of those that are not running or
+/// stopped, since those are the ones to look at.
+fn services_line(services: &[pb::ServiceBrief]) -> String {
+    let order = [
+        "running", "starting", "stopping", "backoff", "failed", "exited", "stopped",
+    ];
+
+    order
+        .iter()
+        .filter_map(|state| {
+            let names: Vec<&str> = services
+                .iter()
+                .filter(|service| service.state == *state)
+                .map(|service| service.name.as_str())
+                .collect();
+
+            if names.is_empty() {
+                return None;
+            }
+
+            Some(match *state {
+                "running" | "stopped" => format!("{} {state}", names.len()),
+                _ => format!("{} {state} ({})", names.len(), names.join(", ")),
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Where a managed server's instance stands, for `release show`: its
 /// process, or why it has none and when it is started again.
 fn instance_standing(instance: &pb::ServerInstance, now_unix_ms: u64) -> String {
@@ -10232,6 +10277,10 @@ fn resolve_paths(document: &mut muru_config::Document, base: &Path) {
         for root in &mut upstream.sendfile_roots {
             *root = absolute(root);
         }
+    }
+
+    for service in document.service.values_mut() {
+        resolve(&mut service.cwd);
     }
 
     for class in &mut document.client_class {
@@ -14030,6 +14079,24 @@ tls = { ca = "ca.pem" }
             ..server
         };
         assert_eq!(super::workers_column(&running), "1 (2 gunicorn)");
+    }
+
+    #[test]
+    fn the_status_counts_the_services_and_names_those_in_trouble() {
+        let brief = |name: &str, state: &str| pb::ServiceBrief {
+            name: name.to_owned(),
+            state: state.to_owned(),
+        };
+        assert_eq!(
+            super::services_line(&[
+                brief("exporter", "running"),
+                brief("pgbouncer-debug", "stopped"),
+                brief("redis", "running"),
+                brief("beat", "failed"),
+                brief("thumbnailer", "backoff"),
+            ]),
+            "2 running, 1 backoff (thumbnailer), 1 failed (beat), 1 stopped"
+        );
     }
 
     #[test]

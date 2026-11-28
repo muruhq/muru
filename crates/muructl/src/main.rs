@@ -38,6 +38,7 @@ mod serve;
 mod serve_admin;
 mod serve_limits;
 mod serve_scaling;
+mod service;
 mod skill;
 mod watch;
 
@@ -167,6 +168,11 @@ enum Command {
     Upstream {
         #[command(subcommand)]
         command: admin::UpstreamCommand,
+    },
+    /// Manage services: commands the daemon keeps running.
+    Service {
+        #[command(subcommand)]
+        command: service::ServiceCommand,
     },
 
     /// Restore traffic to an application's previous release.
@@ -1152,6 +1158,11 @@ fn running(command: &Command) -> admin::Running {
             daemon_only: true,
             ..admin::Running::default()
         },
+        Command::Service { command } => admin::Running {
+            daemon_only: true,
+            change: command.change(),
+            ..admin::Running::default()
+        },
         Command::Open(args) => admin::Running {
             daemon_only: args.app().is_some(),
             ..admin::Running::default()
@@ -1475,6 +1486,71 @@ fn main() -> anyhow::Result<()> {
                     output,
                 },
         } => runtime.block_on(admin::upstream_list(socket, output.json, deployment)),
+        Command::Service { command } => match command {
+            service::ServiceCommand::List {
+                state,
+                quiet,
+                deployment,
+                socket,
+                output,
+            } => runtime.block_on(service::list(socket, output.json, state, quiet, deployment)),
+            service::ServiceCommand::Status {
+                named,
+                socket,
+                output,
+            } => runtime.block_on(service::status(named, socket, output.json)),
+            service::ServiceCommand::Start {
+                named,
+                index,
+                wait,
+                timeout,
+                socket,
+                output,
+            } => runtime.block_on(service::start(
+                named,
+                index,
+                wait,
+                timeout,
+                socket,
+                output.json,
+            )),
+            service::ServiceCommand::Stop {
+                named,
+                index,
+                timeout,
+                kill,
+                socket,
+                output,
+            } => runtime.block_on(service::stop(
+                named,
+                index,
+                timeout,
+                kill,
+                socket,
+                output.json,
+            )),
+            service::ServiceCommand::Restart {
+                named,
+                index,
+                rolling,
+                socket,
+                output,
+            } => runtime.block_on(service::restart(named, index, rolling, socket, output.json)),
+            service::ServiceCommand::Logs {
+                name,
+                follow,
+                lines,
+                socket,
+                output,
+            } => runtime.block_on(service::logs(name, follow, lines, socket, output.json)),
+            service::ServiceCommand::Signal {
+                name,
+                signal,
+                index,
+                socket,
+                output,
+            } => runtime.block_on(service::signal(name, signal, index, socket, output.json)),
+        },
         Command::Rollback {
             app,
             socket,

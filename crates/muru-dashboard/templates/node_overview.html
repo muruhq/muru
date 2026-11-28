@@ -47,6 +47,15 @@
   {% endfor %}
 </table>
 {% endif %}
+{% if !data.services.is_empty() %}
+<h3>Services</h3>
+<table>
+  <tr><th>Service</th><th>State</th><th class="num">Up</th><th class="num">Pid</th><th>Since</th><th class="num">Restarts</th><th>Command</th></tr>
+  {% for service in data.services %}
+  <tr><td>{{ service.name }}</td><td class="service-{{ service.state }}">{{ service.state }}</td><td class="num">{{ service.up }}</td><td class="num">{{ service.pid }}</td><td><time datetime="{{ service.since }}">{{ service.since }}</time></td><td class="num">{{ service.restarts }}</td><td>{{ service.command }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
 {% if !data.scaling.is_empty() %}
 <h3>Scaling</h3>
 <table>

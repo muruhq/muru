@@ -58,6 +58,7 @@ def test_read_commands_print_the_api_answers(daemon: Daemon) -> None:
         ("host", "hosts"),
         ("route", "routes"),
         ("upstream", "upstreams"),
+        ("service", "services"),
         ("overlay", "overlays"),
     ]:
         assert isinstance(answer(daemon, command, "list")[field], list), command

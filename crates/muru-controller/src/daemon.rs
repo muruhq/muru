@@ -807,6 +807,19 @@ pub enum Command {
         /// What it said.
         message: HostMessage,
     },
+    /// Start, stop, restart or signal a service, or one instance of it,
+    /// by hand (section 9.17).
+    Service {
+        /// The service.
+        name: String,
+        /// One instance, or every one.
+        index: Option<u32>,
+        /// What to do.
+        action: ServiceAction,
+        /// Answered with the index of each instance it was done to, and
+        /// for a signal the pid it went to, or why it could not be done.
+        done: oneshot::Sender<Result<Vec<(u32, u32)>, String>>,
+    },
     /// Restart every instance of a managed server release by hand, one
     /// at a time, or end such a restart (section 9.9, issue 393).
     RestartServers {
@@ -816,6 +829,10 @@ pub enum Command {
         id: String,
         /// End the restart under way instead of beginning one.
         cancel: bool,
+        /// One instance, by its index; every instance when none.
+        index: Option<u32>,
+        /// Kill the instances at once, with no time to stop in.
+        force: bool,
         /// Answered with the index and pid of each instance to restart,
         /// or for a cancel of each left as it was, or why not.
         done: oneshot::Sender<Result<Vec<(u32, u32)>, String>>,
@@ -1202,6 +1219,9 @@ pub struct Info {
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
     pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceStatus>>>,
+    /// The services (section 9.17), by name, as the daemon last checked
+    /// them.
+    pub services: std::sync::Mutex<Vec<crate::services::Status>>,
     /// The restart by hand of each managed server release's instances
     /// (issue 393): how far the one under way has got, or why the last
     /// stopped early, as the daemon last checked them.
@@ -1256,6 +1276,28 @@ pub struct LiveRelease {
     pub surge: BTreeMap<String, crate::budget::Surge>,
     /// The restart of every worker under way, if one is (section 10.14).
     pub restart: Option<RestartProgress>,
+}
+
+/// What is done to a service by hand (section 9.17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceAction {
+    /// Start what does not run.
+    Start,
+    /// Stop it, each instance with `timeout` to stop in where one is
+    /// given, or killed at once with `kill`.
+    Stop {
+        /// The time to stop in, in place of the definition's.
+        timeout: Option<Duration>,
+        /// Skip the stop signal.
+        kill: bool,
+    },
+    /// Stop and start it, one instance at a time with `rolling`.
+    Restart {
+        /// Each instance ready before the next is stopped.
+        rolling: bool,
+    },
+    /// Send a signal: a name, or `reload` for the service's own.
+    Signal(String),
 }
 
 /// The restart by hand of a managed server release's instances.
@@ -2330,6 +2372,8 @@ struct Daemon {
     /// Issue 393: the releases restored at the daemon's start whose
     /// start failed and is to be tried again, by application and release.
     restores: HashMap<(String, String), RestoreRetry>,
+    /// Section 9.17: the services, by name.
+    services: BTreeMap<String, crate::services::Service>,
     /// Issue 693: the applications whose rollout is being promoted.
     promoting: BTreeSet<String>,
     /// Issue 699: the releases being stopped beside the loop.
@@ -2634,6 +2678,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         pass_env: std::sync::RwLock::new(settings.pass_env.clone()),
         service,
         servers: std::sync::Mutex::new(HashMap::new()),
+        services: std::sync::Mutex::new(Vec::new()),
         server_restarts: std::sync::Mutex::new(HashMap::new()),
         conditions: std::sync::Mutex::new(Vec::new()),
         provisioning,
@@ -2870,6 +2915,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         starting: HashMap::new(),
         start_queue: HashMap::new(),
         restores: HashMap::new(),
+        services: BTreeMap::new(),
         promoting: BTreeSet::new(),
         stops: HashMap::new(),
         booted,
@@ -3130,6 +3176,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
                 daemon.check_edge().await;
                 daemon.check_hosts().await;
+                daemon.check_services().await;
                 daemon.run_schedules().await;
                 daemon.expire_sticky().await;
                 daemon.expire_retained().await;
@@ -3270,6 +3317,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             );
         daemon.drain_edge(&policy, deadline).await;
         daemon.stop_all_until(deadline).await;
+        daemon.stop_services(deadline).await;
         let _ = stopping_runs.await;
         daemon
             .edge
@@ -4160,6 +4208,7 @@ fn adoption_message(adopted: &[(u32, crate::supervisor::Adopted)]) -> String {
                 match left {
                     crate::supervisor::Left::Exited => "exited",
                     crate::supervisor::Left::Failed => "failed",
+                    crate::supervisor::Left::Stopped => "been stopped",
                 }
             )),
             Adopted::Gone => gone.push(index.to_string()),
@@ -4666,6 +4715,34 @@ impl Daemon {
             routes,
             scaling,
             rollouts,
+            services: self
+                .services
+                .values()
+                .filter(|service| !service.removing())
+                .map(|service| {
+                    let status = service.status();
+                    let running = status
+                        .instances
+                        .iter()
+                        .filter(|instance| instance.state == "running")
+                        .count();
+
+                    muru_dashboard::ServiceRow {
+                        name: status.name.clone(),
+                        state: status.state.to_owned(),
+                        up: format!("{running}/{}", status.instances.len()),
+                        pid: match status.instances.as_slice() {
+                            [only] if only.pid != 0 => only.pid.to_string(),
+                            _ => String::new(),
+                        },
+                        since: muru_common::log::full(
+                            std::time::UNIX_EPOCH + Duration::from_millis(status.since_unix_ms),
+                        ),
+                        restarts: status.restarts,
+                        command: status.table.command.join(" "),
+                    }
+                })
+                .collect(),
             requests,
             websockets: crate::dashboard::websockets_view(websockets),
             events,
@@ -6448,6 +6525,54 @@ impl Daemon {
             }
         }
 
+        // Section 9.17: the services, each by its name.
+
+        for (name, service) in &self.services {
+            let status = service.status();
+            let label = [("service", name.as_str())];
+            let mut states: BTreeMap<&str, u32> = BTreeMap::new();
+
+            for instance in &status.instances {
+                *states.entry(instance.state).or_default() += 1;
+
+                if instance.started_unix_ms != 0 {
+                    let index = instance.index.to_string();
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_service_start_time_seconds",
+                        &[("service", name.as_str()), ("instance", index.as_str())],
+                        instance.started_unix_ms as f64 / 1000.0,
+                    ));
+                }
+            }
+
+            for (state, count) in states {
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_service_instances",
+                    &[("service", name.as_str()), ("state", state)],
+                    f64::from(count),
+                ));
+            }
+
+            samples.push(muru_edge::metrics::Sample::new(
+                "muru_service_up",
+                &label,
+                f64::from(u8::from(status.state == "running")),
+            ));
+            samples.push(muru_edge::metrics::Sample::new(
+                "muru_service_restarts_total",
+                &label,
+                status.restarts as f64,
+            ));
+
+            for (outcome, count) in service.exits() {
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_service_exits_total",
+                    &[("service", name.as_str()), ("outcome", outcome)],
+                    count as f64,
+                ));
+            }
+        }
+
         muru_edge::metrics::render(&muru_edge::metrics::aggregate(samples))
     }
 
@@ -6458,6 +6583,12 @@ impl Daemon {
 
         self.runs.adopt();
         self.load_conditions();
+
+        // Section 9.17: the services start before the applications that
+        // use them, and are not waited for: a release that needs one at
+        // its start and does not find it is tried again (issue 393).
+
+        self.begin_services().await;
 
         self.maintenance = self
             .store
@@ -6544,6 +6675,458 @@ impl Daemon {
             )
             .await;
         }
+    }
+
+    /// Section 9.17: whom a service's instances run as. A user the table
+    /// names is used when the daemon can switch to it, and warned about
+    /// when it is root; without one they run as the service user.
+    fn service_identity(
+        &self,
+        name: &str,
+        table: &muru_config::Service,
+    ) -> Result<Option<crate::host::Identity>, String> {
+        let Some(user) = &table.user else {
+            return Ok(self.service);
+        };
+
+        if !crate::host::Identity::can_switch() {
+            self.events.emit(
+                "service.user_not_applied",
+                name,
+                "warning",
+                &format!("user {user} not applied: the daemon is not root"),
+            );
+            return Ok(None);
+        }
+
+        let mask = table
+            .umask
+            .as_deref()
+            .and_then(|text| u32::from_str_radix(text, 8).ok());
+        let identity = crate::host::Identity::lookup(user, table.group.as_deref(), mask)
+            .map_err(|error| format!("the service's user cannot be used: {error:#}"))?;
+
+        if identity.is_root() {
+            self.events.emit(
+                "service.user_is_root",
+                name,
+                "warning",
+                &format!(
+                    "user {user}: the service runs as root, which is not recommended; a \
+                     compromised service would have the node"
+                ),
+            );
+        }
+
+        Ok(Some(identity))
+    }
+
+    /// Section 9.17: what a service's instances start from: its
+    /// directories made and given to its user, the directory its command
+    /// runs in, the daemon's clean environment, its own variables with
+    /// their secrets resolved, and its log.
+    async fn service_setting(
+        &self,
+        stored: &crate::store::StoredService,
+    ) -> Result<crate::services::Setting, String> {
+        let name = &stored.name;
+        let table = &stored.service;
+        let identity = self.service_identity(name, table)?;
+        let dirs = self.locations.service_dirs(stored.number);
+        let secrets_dir = dirs.files.join(SECRETS_DIR);
+        let log = self.locations.service_log(name);
+
+        // A directory the table names is the operator's; the one a
+        // service has by default is made here.
+
+        let cwd = match &table.cwd {
+            Some(cwd) => PathBuf::from(cwd),
+            None => self.locations.service_cwd(name),
+        };
+
+        let mut owned = vec![
+            dirs.sockets.clone(),
+            dirs.files.clone(),
+            secrets_dir.clone(),
+        ];
+
+        if table.cwd.is_none() {
+            owned.push(cwd.clone());
+        }
+
+        for path in &owned {
+            std::fs::create_dir_all(path)
+                .map_err(|error| format!("creating {}: {error}", path.display()))?;
+        }
+
+        if let Some(parent) = log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log);
+
+        let specs = table
+            .env
+            .iter()
+            .map(|(variable, value)| crate::config::env_spec_from_table(variable, value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let env = resolve_env(&self.secrets, &specs, &secrets_dir).await?;
+
+        if let Some(identity) = identity {
+            owned.push(log.clone());
+
+            if let Ok(entries) = std::fs::read_dir(&secrets_dir) {
+                owned.extend(entries.flatten().map(|entry| entry.path()));
+            }
+
+            for path in &owned {
+                identity.own(path).map_err(|error| {
+                    format!(
+                        "giving {} to the service's user failed: {error}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+
+        Ok(crate::services::Setting {
+            name: name.clone(),
+            table: table.clone(),
+            dirs,
+            cwd,
+            base: self.daemon_base(None, identity),
+            env,
+            identity,
+            log,
+            relays: Some(self.server_relays(name)?),
+        })
+    }
+
+    /// Section 9.17: bring a recorded service under this daemon. With
+    /// `fresh`, nothing of it can be running, as when the daemon starts
+    /// from nothing or the service was just defined: what an earlier run
+    /// left among its files is removed, and it is started when it starts
+    /// automatically and was not stopped by hand. Otherwise the
+    /// instances a previous daemon recorded are taken over.
+    async fn begin_service(&mut self, stored: crate::store::StoredService, fresh: bool) {
+        let name = stored.name.clone();
+        let dirs = self.locations.service_dirs(stored.number);
+        let record_path = dirs.files.join(crate::services::RECORD);
+
+        if fresh {
+            dirs.remove();
+        }
+
+        let record = read_record::<crate::supervisor::Record>(&record_path)
+            .filter(|record| !record.instances.is_empty());
+
+        let setting = match self.service_setting(&stored).await {
+            Ok(setting) => setting,
+            Err(error) => {
+                self.events.emit(
+                    "service.failed",
+                    &name,
+                    "error",
+                    &format!("the service could not be started: {error}"),
+                );
+                return;
+            }
+        };
+
+        // A stop that outlasts the shutdown's budget is cut short by it.
+
+        let stop_timeout = crate::services::stop_timeout_of(&stored.service);
+
+        if stop_timeout > self.shutdown.budget {
+            tracing::warn!(
+                "service {name}: its stop_timeout of {} is longer than the shutdown budget of \
+                 {}, which is all it has when the daemon shuts down",
+                muru_config::format_duration(stop_timeout),
+                muru_config::format_duration(self.shutdown.budget)
+            );
+        }
+
+        let begin = match &record {
+            Some(record) => crate::services::Begin::Adopt(record),
+            None if crate::services::autostart_of(&stored.service) && !stored.held => {
+                crate::services::Begin::Start
+            }
+            None => crate::services::Begin::Idle,
+        };
+
+        match crate::services::Service::begin(setting, stored.held, begin) {
+            Ok(service) => {
+                if record.is_some() {
+                    self.events.emit(
+                        "service.adopted",
+                        &name,
+                        "info",
+                        &crate::services::adoption_message(&service.adopted()),
+                    );
+                }
+
+                write_record(&record_path, &service.record());
+                self.services.insert(name, service);
+            }
+            Err(error) => self.events.emit(
+                "service.failed",
+                &name,
+                "error",
+                &format!("the service could not be started: {error}"),
+            ),
+        }
+    }
+
+    /// Section 9.17: every recorded service, as the daemon starts.
+    async fn begin_services(&mut self) {
+        let fresh = self.booted;
+
+        if fresh {
+            // What a shutdown or a reboot left of services no longer
+            // recorded goes with the rest.
+
+            let _ = std::fs::remove_dir_all(
+                self.locations.files().join(crate::locations::SERVICES_DIR),
+            );
+        }
+
+        for stored in self.store.services().unwrap_or_default() {
+            self.begin_service(stored, fresh).await;
+        }
+
+        self.publish_services();
+    }
+
+    /// Section 9.17: reap the services' instances that exited, start
+    /// those that are due, and take each one's readiness, with what
+    /// happened as events. A service that was removed is done with once
+    /// nothing of it runs.
+    async fn check_services(&mut self) {
+        let mut gone = Vec::new();
+
+        for (name, service) in &mut self.services {
+            let reports = service.check().await;
+
+            if !reports.is_empty() {
+                write_record(
+                    &service.dirs().files.join(crate::services::RECORD),
+                    &service.record(),
+                );
+            }
+
+            for report in reports {
+                self.events
+                    .emit(report.kind, name, report.level, &report.message);
+            }
+
+            if service.gone() {
+                gone.push(name.clone());
+            }
+        }
+
+        for name in gone {
+            if let Some(service) = self.services.remove(&name) {
+                service.dirs().remove();
+            }
+        }
+
+        self.publish_services();
+    }
+
+    /// Section 9.17: make the services match what is recorded, after an
+    /// apply: one newly declared is begun, one whose definition changed
+    /// takes the change up, and one no longer declared is stopped.
+    async fn reconcile_services(&mut self) {
+        let stored = self.store.services().unwrap_or_default();
+        let declared: BTreeSet<&str> = stored.iter().map(|stored| stored.name.as_str()).collect();
+
+        for (name, service) in &mut self.services {
+            if !declared.contains(name.as_str()) && !service.removing() {
+                service.remove();
+                self.events.emit(
+                    "service.changed",
+                    name,
+                    "info",
+                    "no longer declared; its instances are stopped",
+                );
+            }
+        }
+
+        for stored in stored {
+            let name = stored.name.clone();
+
+            let Some(running) = self.services.get(&name) else {
+                let detail = crate::services::describe_change(None, &stored.service);
+                self.begin_service(stored, true).await;
+                self.events.emit(
+                    "service.changed",
+                    &name,
+                    "info",
+                    &format!("defined: {detail}"),
+                );
+                continue;
+            };
+
+            if running.table() == &stored.service && !running.removing() {
+                continue;
+            }
+
+            match self.service_setting(&stored).await {
+                Ok(setting) => {
+                    if let Some(service) = self.services.get_mut(&name) {
+                        let difference = service.update(setting);
+                        self.events.emit(
+                            "service.changed",
+                            &name,
+                            "info",
+                            &difference.describe(&stored.service),
+                        );
+                    }
+                }
+                Err(error) => self.events.emit(
+                    "service.failed",
+                    &name,
+                    "error",
+                    &format!("the changed definition could not be taken up: {error}"),
+                ),
+            }
+        }
+
+        self.publish_services();
+    }
+
+    /// Section 9.17: work a service's setting out again, its secrets
+    /// resolved afresh, for the processes it starts from now on. One
+    /// whose setting cannot be worked out keeps the one it has, and says
+    /// why.
+    async fn refresh_service(&mut self, name: &str) {
+        let Some(stored) = self
+            .store
+            .services()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|stored| stored.name == name)
+        else {
+            return;
+        };
+
+        match self.service_setting(&stored).await {
+            Ok(setting) => {
+                if let Some(service) = self.services.get_mut(name) {
+                    service.refresh(setting);
+                }
+            }
+            Err(error) => self.events.emit(
+                "service.failed",
+                name,
+                "warning",
+                &format!(
+                    "its environment could not be worked out afresh, and is as it was: {error}"
+                ),
+            ),
+        }
+    }
+
+    /// Section 9.17: do to a service, or one instance of it, what a
+    /// command asks. A service stopped whole is held from then on, and
+    /// one started is no longer.
+    fn act_on_service(
+        &mut self,
+        name: &str,
+        index: Option<u32>,
+        action: ServiceAction,
+    ) -> Result<Vec<(u32, u32)>, String> {
+        let Some(service) = self
+            .services
+            .get_mut(name)
+            .filter(|service| !service.removing())
+        else {
+            return Err(format!("there is no service named {name}"));
+        };
+
+        let plain = |indexes: Vec<u32>| indexes.into_iter().map(|index| (index, 0)).collect();
+
+        let done: Vec<(u32, u32)> = match action {
+            ServiceAction::Start => plain(service.start(index)?),
+            ServiceAction::Stop { timeout, kill } => {
+                let grace = match kill {
+                    true => Some(Duration::ZERO),
+                    false => timeout,
+                };
+
+                plain(service.stop(index, grace)?)
+            }
+            ServiceAction::Restart { rolling } => plain(service.restart(index, rolling)?),
+            ServiceAction::Signal(signal) => {
+                let number = match signal.as_str() {
+                    "reload" => match &service.table().reload_signal {
+                        Some(named) => crate::services::signal_number(named),
+                        None => return Err(format!("{name} names no reload_signal")),
+                    },
+                    "KILL" | "STOP" => {
+                        return Err(format!(
+                            "{signal} is not sent to a service: muructl service stop --kill \
+                             kills it, so that the daemon knows it was asked for"
+                        ));
+                    }
+                    named if muru_config::STOP_SIGNALS.contains(&named) => {
+                        crate::services::signal_number(named)
+                    }
+                    other => {
+                        return Err(format!(
+                            "{other:?} is not a signal a service is sent: reload, or one of {}",
+                            muru_config::STOP_SIGNALS.join(", ")
+                        ));
+                    }
+                };
+
+                service.signal(index, number)?
+            }
+        };
+
+        let held = service.held();
+        write_record(
+            &service.dirs().files.join(crate::services::RECORD),
+            &service.record(),
+        );
+
+        if let Err(error) = self.store.set_service_held(name, held) {
+            tracing::error!(%error, "recording whether a service is held failed");
+        }
+
+        self.publish_services();
+        Ok(done)
+    }
+
+    /// Section 9.17: stop every service as the daemon shuts down, after
+    /// the applications, which use them until their last request. Each
+    /// has its own `stop_timeout` or what is left of the budget,
+    /// whichever ends first.
+    async fn stop_services(&mut self, deadline: Instant) {
+        let stops = std::mem::take(&mut self.services)
+            .into_values()
+            .map(|service| {
+                let grace = crate::services::stop_timeout_of(service.table());
+                let kill_at = deadline.min(Instant::now() + grace);
+                service.stop_until(kill_at)
+            });
+        futures::future::join_all(stops).await;
+        let _ =
+            std::fs::remove_dir_all(self.locations.files().join(crate::locations::SERVICES_DIR));
+        self.publish_services();
+    }
+
+    /// Publish the services for the commands that show them.
+    fn publish_services(&self) {
+        *self.info.services.lock().expect("services poisoned") = self
+            .services
+            .values()
+            .filter(|service| !service.removing())
+            .map(crate::services::Service::status)
+            .collect();
     }
 
     /// Section 9.9 (issue 393): the release the daemon's restore started
@@ -7229,6 +7812,17 @@ impl Daemon {
         for (_, running) in running {
             running.backend.release();
         }
+
+        // Section 9.17: the services run on too, each with its record as
+        // it stands for the next daemon.
+
+        for (_, service) in std::mem::take(&mut self.services) {
+            write_record(
+                &service.dirs().files.join(crate::services::RECORD),
+                &service.record(),
+            );
+            service.release();
+        }
     }
 
     async fn carry_out(&mut self, command: Command) {
@@ -7505,18 +8099,46 @@ impl Daemon {
             } => {
                 let _ = done.send(self.prepare_command(&app, &id, request).await);
             }
+            Command::Service {
+                name,
+                index,
+                action,
+                done,
+            } => {
+                // A start or a restart begins from the service's secrets
+                // as they are now, which is how a changed one reaches it.
+
+                if matches!(action, ServiceAction::Start | ServiceAction::Restart { .. }) {
+                    self.refresh_service(&name).await;
+                }
+
+                let answer = self.act_on_service(&name, index, action);
+
+                // What was asked for is begun now, not at the next check.
+
+                if answer.is_ok() {
+                    self.check_services().await;
+                }
+
+                let _ = done.send(answer);
+            }
             Command::RestartServers {
                 app,
                 id,
                 cancel,
+                index,
+                force,
                 done,
             } => {
-                let grace = self
-                    .store
-                    .release(&app, &id)
-                    .map_or(Duration::from_secs(10), |release| {
-                        Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms)
-                    });
+                let grace = match force {
+                    true => Duration::ZERO,
+                    false => self
+                        .store
+                        .release(&app, &id)
+                        .map_or(Duration::from_secs(10), |release| {
+                            Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms)
+                        }),
+                };
 
                 let answer = match self.running.get_mut(&(app.clone(), id.clone())) {
                     Some(Running {
@@ -7526,7 +8148,7 @@ impl Daemon {
                     Some(Running {
                         backend: Backend::Servers(servers),
                         ..
-                    }) => servers.restart_all(grace),
+                    }) => servers.restart_all(index, grace),
                     Some(_) => Err(format!(
                         "release {app}@{id} runs workers, not a managed HTTP server"
                     )),
@@ -7627,7 +8249,8 @@ impl Daemon {
                     {
                         let _ = done.send(Err(format!(
                             "release {app}@{id} runs a managed HTTP server, which has no workers \
-                             to ask; muructl restart --all restarts its instances, one at a time"
+                             to ask; muructl restart --all restarts its instances, one at a \
+                             time, and --index N one of them"
                         )));
                     }
                     None => {
@@ -11550,6 +12173,8 @@ impl Daemon {
         }
 
         self.load_conditions();
+        self.reconcile_services().await;
+        self.check_services().await;
 
         self.start_referenced().await;
         self.refresh_certificates(true);
@@ -15077,6 +15702,48 @@ impl Daemon {
             }
         }
 
+        // Section 9.17: each service's instances, each under the relay
+        // that carries its output.
+
+        for (name, service) in &self.services {
+            let shown = service
+                .log()
+                .strip_prefix(&self.locations.logs.path)
+                .unwrap_or(service.log())
+                .display()
+                .to_string();
+            let program =
+                crate::processes::program_of(&service.table().command).unwrap_or_default();
+
+            for instance in service.record().instances {
+                if instance.pid == 0 {
+                    continue;
+                }
+
+                let parent = if instance.relay_pid == 0 {
+                    daemon
+                } else {
+                    known.push(Known {
+                        pid: instance.relay_pid,
+                        parent: daemon,
+                        role: "relay",
+                        what: format!("service {name} output to {shown}"),
+                        ..Known::default()
+                    });
+                    instance.relay_pid
+                };
+
+                known.push(Known {
+                    pid: instance.pid,
+                    parent,
+                    role: "service",
+                    what: format!("service {name} instance {}: {program}", instance.index),
+                    index: Some(instance.index),
+                    ..Known::default()
+                });
+            }
+        }
+
         for command in crate::commands::running() {
             known.push(Known {
                 pid: command.pid,
@@ -15177,6 +15844,11 @@ impl Daemon {
             writers.push(self.locations.release_log(app, id));
         }
 
+        writers.extend(
+            self.services
+                .values()
+                .map(|service| service.log().to_path_buf()),
+        );
         writers
     }
 
@@ -15281,6 +15953,10 @@ impl Daemon {
 
         for running in self.running.values() {
             running.backend.reopen_log(false);
+        }
+
+        for service in self.services.values() {
+            service.reopen_log();
         }
 
         self.runs.reopen();

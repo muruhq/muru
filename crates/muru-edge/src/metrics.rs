@@ -332,6 +332,31 @@ pub const FAMILIES: &[Family] = &[
         help: "Instances of a managed HTTP server release that exited, by outcome: clean or failed.",
     },
     Family {
+        name: "muru_service_instances",
+        kind: Kind::Gauge,
+        help: "Instances of a service in each state: stopped, starting, running, backoff, stopping, exited or failed.",
+    },
+    Family {
+        name: "muru_service_up",
+        kind: Kind::Gauge,
+        help: "Whether every instance of a service is running: 1 or 0.",
+    },
+    Family {
+        name: "muru_service_restarts_total",
+        kind: Kind::Counter,
+        help: "Starts of a service's instances that followed an exit the program made.",
+    },
+    Family {
+        name: "muru_service_exits_total",
+        kind: Kind::Counter,
+        help: "Exits a service's instances made themselves, by outcome: clean or failed.",
+    },
+    Family {
+        name: "muru_service_start_time_seconds",
+        kind: Kind::Gauge,
+        help: "When the process of a service's instance was started, in seconds since the epoch.",
+    },
+    Family {
         name: "muru_connections_open",
         kind: Kind::Gauge,
         help: "Connections open on a listener.",

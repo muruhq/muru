@@ -78,8 +78,8 @@ impl File {
                  limits, the proxy, compression, secret stores, logs, shutdown, metrics, \
                  events, the dashboard and the overlay webhook. It is read when the \
                  daemon starts and on `muructl daemon reload`. What the daemon serves is \
-                 not in this file: an application, a host, a route, an upstream or an \
-                 overlay here is refused, with a message that says to give it to \
+                 not in this file: an application, a host, a route, an upstream, a \
+                 service or an overlay here is refused, with a message that says to give it to \
                  `muructl apply`. Client classes, rate limits and conditions defined \
                  here are the node's: every applied file may use them, and none may \
                  define one of the same name. The client classes' list files are taken \
@@ -87,8 +87,8 @@ impl File {
             }
             File::Deployment => {
                 "The keys of the files `muructl apply` reads, which say what the daemon \
-                 serves: applications and their releases, hosts, routes, upstreams and \
-                 overlays, with the client classes, rate limits and conditions that \
+                 serves: applications and their releases, hosts, routes, upstreams, \
+                 services and overlays, with the client classes, rate limits and conditions that \
                  belong to them. A file of this kind kept beside a project's code is \
                  named `muru.deploy.toml`, since `muru.toml` there is the project's \
                  settings, which have other keys. A table of the daemon's own \
@@ -164,8 +164,15 @@ struct LocalBuild {
 /// The top-level keys of a document that say what the daemon serves, and
 /// belong to applied files alone (ADR 0079). Every other key but the
 /// shared ones is the daemon's own.
-pub const DEPLOYMENT_TABLES: [&str; 6] =
-    ["deployment", "app", "host", "route", "upstream", "overlay"];
+pub const DEPLOYMENT_TABLES: [&str; 7] = [
+    "deployment",
+    "app",
+    "host",
+    "route",
+    "upstream",
+    "service",
+    "overlay",
+];
 
 /// The top-level keys both files take: the daemon's file defines them
 /// for the node, and an applied file for what it declares.

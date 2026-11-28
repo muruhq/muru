@@ -285,8 +285,20 @@ The restart is a `restart.started` event and, when it ends,
 `restart.finished`, with each instance's `server.exited`,
 `server.started` and `server.ready` between them. A daemon that is
 stopped or upgraded part way leaves the instances not yet reached as
-they are. The flags that name one worker (`--worker`, `--pid`,
-`--group` and `--force`) do not apply to a managed server.
+they are.
+
+`muructl restart legacy --index 1` restarts one instance the same way
+and leaves the others as they are:
+
+```console
+$ muructl restart legacy --index 1
+muru: instance 1 of legacy@r1 to be restarted
+muru: the restart of legacy@r1 has finished
+```
+
+With `--force` the instance is killed at once, with no time to finish
+its requests. The flags that name a worker (`--worker`, `--pid` and
+`--group`) do not apply to a managed server.
 
 Draining stops new requests at the edge, waits for those in flight, then
 sends the process of each instance the profile's stop signal (`TERM` for

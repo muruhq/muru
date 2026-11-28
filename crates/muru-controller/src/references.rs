@@ -267,6 +267,7 @@ pub fn left_naming_removed(store: &Store, declared: &Declared, plan: &Plan) -> V
             Action::RemoveHost { name } => removed.insert(object(Kind::Host, name)),
             Action::RemoveApp { app } => removed.insert(object(Kind::App, app)),
             Action::RemoveUpstream { name } => removed.insert(object(Kind::Upstream, name)),
+            Action::RemoveService { name } => removed.insert(object(Kind::Service, name)),
             Action::RemoveClientClass { name } => removed.insert(object(Kind::ClientClass, name)),
             Action::RemoveRateLimit { name } => removed.insert(object(Kind::RateLimit, name)),
             Action::RemoveCondition { name } => removed.insert(object(Kind::Condition, name)),
@@ -523,6 +524,10 @@ pub fn dangling(store: &Store) -> Result<Vec<String>, crate::store::StoreError> 
 
     for (name, _) in store.upstreams()? {
         held.insert(object(Kind::Upstream, &name));
+    }
+
+    for stored in store.services()? {
+        held.insert(object(Kind::Service, &stored.name));
     }
 
     for (_, class) in store.client_classes()? {

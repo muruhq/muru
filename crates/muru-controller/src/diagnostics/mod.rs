@@ -262,7 +262,7 @@ pub fn changes_configuration(kind: &str) -> bool {
 /// in a full stop standing for every type that starts with it: a request
 /// past a timeout, a worker killed, recycled or gone, a release or a
 /// server that failed.
-const FAILURE_EVENTS: [&str; 20] = [
+const FAILURE_EVENTS: [&str; 27] = [
     "request.soft_timeout",
     "request.past_deadline",
     "worker.timeout_killed",
@@ -280,6 +280,13 @@ const FAILURE_EVENTS: [&str; 20] = [
     "server.failed",
     "server.crash_looping",
     "server.gave_up",
+    "service.exited",
+    "service.failed",
+    "service.not_ready",
+    "service.crash_looping",
+    "service.gave_up",
+    "service.daemonised",
+    "service.killed",
     "edge.failed",
     "preload.fell_back",
     "memory.leak_suspected",

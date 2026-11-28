@@ -814,7 +814,7 @@ fn rank(role: &str) -> u8 {
         "relay" => 1,
         "host" => 2,
         "worker" => 3,
-        "server" => 4,
+        "server" | "service" => 4,
         "command" => 5,
         _ => 6,
     }

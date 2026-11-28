@@ -150,6 +150,20 @@ pub enum Action {
         /// Whether it is new rather than changed.
         new: bool,
     },
+    /// Create or replace a service (section 9.17).
+    PutService {
+        /// Its name.
+        name: String,
+        /// Its definition.
+        service: Box<muru_config::Service>,
+        /// Whether it is new.
+        new: bool,
+    },
+    /// Remove a service, with `--prune`: its instances are stopped.
+    RemoveService {
+        /// Its name.
+        name: String,
+    },
     /// Drop an HTTP upstream (prune).
     RemoveUpstream {
         /// The upstream's name.
@@ -264,6 +278,9 @@ impl Action {
             Action::PutUpstream { new: true, .. } => "create-upstream",
             Action::PutUpstream { new: false, .. } => "update-upstream",
             Action::RemoveUpstream { .. } => "remove-upstream",
+            Action::PutService { new: true, .. } => "create-service",
+            Action::PutService { new: false, .. } => "update-service",
+            Action::RemoveService { .. } => "remove-service",
             Action::PutOverlay { new: true, .. } => "create-overlay",
             Action::PutOverlay { new: false, .. } => "update-overlay",
             Action::RemoveOverlay { .. } => "remove-overlay",
@@ -356,6 +373,9 @@ impl Change {
             Action::RemoveRoute { host, path } => format!("route {host} {path}"),
             Action::PutUpstream { name, .. } | Action::RemoveUpstream { name } => {
                 format!("upstream {name}")
+            }
+            Action::PutService { name, .. } | Action::RemoveService { name } => {
+                format!("service {name}")
             }
             Action::PutOverlay { name, .. } | Action::RemoveOverlay { name } => {
                 format!("overlay {name}")
@@ -679,6 +699,7 @@ pub fn plan_declared(
 
     plan_hosts(store, document, &defined.rate_limits, &mut plan);
     plan_upstreams(store, document, &mut plan);
+    plan_services(store, document, &mut plan);
     plan_routes(store, document, defined, &mut plan);
     plan_overlays(store, document, defined, prune.any(), &mut plan);
     plan_conditions(store, document, file_conditions, &mut plan);
@@ -2690,6 +2711,51 @@ fn describe_overlay(overlay: &Overlay) -> String {
     parts.join("; ")
 }
 
+/// Section 9.17: the services a document declares, each checked as its
+/// table is and compared with what is recorded, with what the change
+/// does to its instances as the detail.
+fn plan_services(store: &Store, document: &Document, plan: &mut Plan) {
+    let stored: BTreeMap<String, muru_config::Service> = store
+        .services()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|stored| (stored.name, stored.service))
+        .collect();
+
+    for (name, service) in &document.service {
+        if !valid_name(name) {
+            plan.errors
+                .push(format!("service {name:?} is not a valid name"));
+            continue;
+        }
+
+        if let Err(error) = muru_config::check_service(service) {
+            plan.errors.push(format!("service {name}: {error}"));
+            continue;
+        }
+
+        if let Some(cwd) = &service.cwd
+            && !Path::new(cwd).is_dir()
+        {
+            plan.errors
+                .push(format!("service {name}: cwd: {cwd} is not a directory"));
+            continue;
+        }
+
+        match stored.get(name) {
+            Some(recorded) if recorded == service => plan.unchanged += 1,
+            recorded => plan.changes.push(Change {
+                action: Action::PutService {
+                    name: name.clone(),
+                    service: Box::new(service.clone()),
+                    new: recorded.is_none(),
+                },
+                detail: crate::services::describe_change(recorded, service),
+            }),
+        }
+    }
+}
+
 fn plan_upstreams(store: &Store, document: &Document, plan: &mut Plan) {
     let stored: BTreeMap<String, UpstreamTable> =
         store.upstreams().unwrap_or_default().into_iter().collect();
@@ -2893,6 +2959,15 @@ fn plan_removals(
             plan.changes.push(Change {
                 action: Action::RemoveUpstream { name },
                 detail: "not declared".to_owned(),
+            });
+        }
+    }
+
+    for stored in store.services().unwrap_or_default() {
+        if !document.service.contains_key(&stored.name) && reach(Kind::Service, &stored.name) {
+            plan.changes.push(Change {
+                action: Action::RemoveService { name: stored.name },
+                detail: "not declared; its instances are stopped".to_owned(),
             });
         }
     }
@@ -3159,6 +3234,10 @@ fn write(
             new,
         } => writes.put_upstream(name, upstream).map(|()| made(*new))?,
         Action::RemoveUpstream { name } => writes.delete_upstream(name).map(|()| "removed")?,
+        Action::PutService { name, service, new } => {
+            writes.put_service(name, service).map(|()| made(*new))?
+        }
+        Action::RemoveService { name } => writes.delete_service(name).map(|()| "removed")?,
         Action::PutOverlay {
             name,
             overlay,
@@ -3339,6 +3418,14 @@ pub fn export(store: &Store, app: Option<&str>) -> Result<Document, StoreError> 
 
         if app.is_none() || named {
             document.upstream.insert(name, upstream);
+        }
+    }
+
+    // Services are the node's and belong to no application.
+
+    if app.is_none() {
+        for stored in store.services()? {
+            document.service.insert(stored.name, stored.service);
         }
     }
 
@@ -6039,7 +6126,7 @@ fn restart_settings_from(table: &muru_config::Restart) -> pb::RestartSettings {
 }
 
 /// A `restart` table, already checked, with the defaults filled in.
-fn restart_spec_from(table: Option<&muru_config::Restart>) -> crate::model::RestartSpec {
+pub(crate) fn restart_spec_from(table: Option<&muru_config::Restart>) -> crate::model::RestartSpec {
     let defaults = crate::model::RestartSpec::default();
 
     let Some(table) = table else {
@@ -9581,6 +9668,100 @@ mod tests {
             ]
         );
         assert!(plan.errors.is_empty());
+    }
+
+    #[test]
+    fn services_are_applied_exported_changed_and_pruned() {
+        let store = Store::in_memory().unwrap();
+        let planned = |text: &str, prune: bool| {
+            plan(
+                &store,
+                &Document::parse(text).unwrap(),
+                prune,
+                false,
+                &Defined::default(),
+                &crate::provision::Provisioning::off(),
+            )
+        };
+        let lines = |plan: &Plan| -> Vec<String> {
+            plan.changes
+                .iter()
+                .map(|change| {
+                    format!(
+                        "{} {}: {}",
+                        change.action.name(),
+                        change.subject(),
+                        change.detail
+                    )
+                })
+                .collect()
+        };
+        let declared = "[service.redis]\ncommand = ['redis-server']\n\
+                        [service.tunnel]\ncommand = ['cloudflared', 'run']\ninstances = 2\n";
+
+        // New services are created, with their commands as the detail.
+
+        let first = planned(declared, false);
+        assert_eq!(first.errors, Vec::<String>::new());
+        assert_eq!(
+            lines(&first),
+            [
+                "create-service service redis: redis-server",
+                "create-service service tunnel: cloudflared run, 2 instances",
+            ]
+        );
+        commit(&store, &first.changes).unwrap();
+        let recorded = store.services().unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|stored| (stored.name.as_str(), stored.number, stored.held))
+                .collect::<Vec<_>>(),
+            [("redis", 1, false), ("tunnel", 2, false)]
+        );
+
+        // Applied again nothing changes, and the export applies back.
+
+        assert!(planned(declared, false).changes.is_empty());
+        let exported = export(&store, None).unwrap();
+        assert_eq!(exported.service.len(), 2);
+        assert!(
+            planned(&exported.to_toml().unwrap(), true)
+                .changes
+                .is_empty()
+        );
+
+        // A change says what it does, and keeps the service's number
+        // and whether it was stopped by hand.
+
+        store.set_service_held("tunnel", true).unwrap();
+        let changed = planned(
+            "[service.tunnel]\ncommand = ['cloudflared', 'run', 'shop']\ninstances = 2\n",
+            true,
+        );
+        assert_eq!(
+            lines(&changed),
+            [
+                "update-service service tunnel: command changed; its 2 instances are restarted",
+                "remove-service service redis: not declared; its instances are stopped",
+            ]
+        );
+        commit(&store, &changed.changes).unwrap();
+        let recorded = store.services().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!((recorded[0].number, recorded[0].held), (2, true));
+
+        // A table that cannot be run is an error, and plans nothing.
+
+        let refused = planned("[service.Bad]\ncommand = ['x']\n[service.empty]\n", false);
+        assert_eq!(
+            refused.errors,
+            [
+                "service \"Bad\" is not a valid name",
+                "service empty: command: a service needs the command it runs",
+            ]
+        );
+        assert!(refused.changes.is_empty());
     }
 
     #[test]

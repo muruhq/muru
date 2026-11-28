@@ -301,7 +301,9 @@ def test_a_restart_by_hand_restarts_the_instances_one_at_a_time(daemon: Daemon) 
 
     refused = daemon.muructl("restart", "legacy", "--worker", "0", check=False)
     assert refused.returncode != 0
-    assert "muructl restart --all restarts its instances, one at a time" in refused.stderr
+    assert "muructl restart --all restarts its instances, one at a time, and --index N" in (
+        refused.stderr
+    )
     refused = daemon.muructl("restart", "legacy", "--cancel", check=False)
     assert "no restart of its instances is under way" in refused.stderr
 
@@ -350,6 +352,24 @@ def test_a_restart_by_hand_restarts_the_instances_one_at_a_time(daemon: Daemon) 
     assert daemon.releases("legacy") == [
         {"release": "legacy@r1", "state": "ready", "serving": "yes"}
     ]
+
+    # One instance by its index is restarted the same way, and the other
+    # is left with the process it had; with --force it is killed at once.
+
+    one, other = (instance["pid"] for instance in after)
+    restarted = daemon.muructl("restart", "legacy", "--index", "0").stdout.splitlines()
+    assert restarted == [
+        "muru: instance 0 of legacy@r1 to be restarted",
+        "muru: the restart of legacy@r1 has finished",
+    ]
+    now = [instance["pid"] for instance in instances(daemon, "legacy@r1")]
+    assert now[0] not in (0, one) and now[1] == other
+    daemon.muructl("restart", "legacy", "--index", "1", "--force")
+    assert instances(daemon, "legacy@r1")[1]["pid"] not in (0, other)
+    events = daemon.muructl("events").stdout
+    assert "instance 1 stopped for a restart (exited with signal: 9 (SIGKILL))" in events
+    missing = daemon.muructl("restart", "legacy", "--index", "5", check=False)
+    assert "it has no instance 5; it has 2 instances" in missing.stderr
 
 
 def group_gone(pgid: int) -> bool:

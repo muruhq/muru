@@ -1656,6 +1656,7 @@ impl Admin for Service {
     ) -> Result<Response<pb::Status>, Status> {
         let state = &self.state;
         Ok(Response::new(pb::Status {
+            services: Vec::new(),
             budget_memory: None,
             budget_memory_from: String::new(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -2380,6 +2381,8 @@ impl Admin for Service {
         list_hosts(pb::ListHostsRequest) -> pb::ListHostsResponse, "muructl host";
         list_routes(pb::ListRoutesRequest) -> pb::ListRoutesResponse, "muructl route";
         list_upstreams(pb::ListUpstreamsRequest) -> pb::ListUpstreamsResponse, "muructl upstream";
+        list_services(pb::ListServicesRequest) -> pb::ListServicesResponse, "muructl service";
+        act_on_service(pb::ActOnServiceRequest) -> pb::ActOnServiceResponse, "muructl service";
         apply_config(pb::ApplyConfigRequest) -> pb::ConfigReport, "muructl apply";
         diff_config(pb::DiffConfigRequest) -> pb::ConfigReport, "muructl deployment diff";
         list_deployments(pb::ListDeploymentsRequest) -> pb::ListDeploymentsResponse, "muructl deployment list";

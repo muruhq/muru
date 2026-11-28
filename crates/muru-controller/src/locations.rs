@@ -137,6 +137,11 @@ pub const SOCKET_PATH_LIMIT: usize = if cfg!(target_os = "macos") { 104 } else {
 /// holds one directory per host, named by a number.
 pub const HOSTS_DIR: &str = "h";
 
+/// The directory, in the runtime location and in the runtime files, that
+/// holds one directory per service, named by the service's number, since
+/// no path under the runtime location carries a name.
+pub const SERVICES_DIR: &str = "s";
+
 /// The directory in the runtime location that holds the edge's sockets:
 /// the edge's own, so that it can bind them as the service user.
 pub const EDGE_DIR: &str = "e";
@@ -457,6 +462,28 @@ impl Locations {
     /// Both directories of the host of release number `number`.
     pub fn host_dirs(&self, number: u64) -> HostDirs {
         HostDirs::numbered(&self.run.path, &self.files(), number)
+    }
+
+    /// Both directories of the service numbered `number` (section
+    /// 9.17): its relays' sockets and each instance's own directory in
+    /// the runtime location, and its record and its relays' among the
+    /// runtime files.
+    pub fn service_dirs(&self, number: u64) -> HostDirs {
+        HostDirs {
+            sockets: self.run.path.join(SERVICES_DIR).join(number.to_string()),
+            files: self.files().join(SERVICES_DIR).join(number.to_string()),
+        }
+    }
+
+    /// The directory a service's command runs in when its table names
+    /// none: one of its own under the state directory.
+    pub fn service_cwd(&self, name: &str) -> PathBuf {
+        self.state.path.join("services").join(name)
+    }
+
+    /// Where a service's instances' output is written.
+    pub fn service_log(&self, name: &str) -> PathBuf {
+        self.logs.path.join("services").join(format!("{name}.log"))
     }
 
     /// The access log the edge writes, as JSON lines.
