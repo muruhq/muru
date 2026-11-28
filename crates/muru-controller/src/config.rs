@@ -6126,7 +6126,7 @@ fn restart_settings_from(table: &muru_config::Restart) -> pb::RestartSettings {
 }
 
 /// A `restart` table, already checked, with the defaults filled in.
-fn restart_spec_from(table: Option<&muru_config::Restart>) -> crate::model::RestartSpec {
+pub(crate) fn restart_spec_from(table: Option<&muru_config::Restart>) -> crate::model::RestartSpec {
     let defaults = crate::model::RestartSpec::default();
 
     let Some(table) = table else {
