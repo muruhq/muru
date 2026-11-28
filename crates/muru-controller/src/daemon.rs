@@ -2551,6 +2551,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             ..crate::budget::View::default()
         },
         conditions: settings.conditions.clone(),
+        services: settings.services,
         ..client_rules.defined()
     };
 
@@ -4855,7 +4856,22 @@ impl Daemon {
         let mut defined = self.client_rules.defined();
         defined.budget = self.budget_view(self.budget_usage());
         defined.conditions = self.file_conditions.clone();
-        *self.info.defined.write().expect("defined names poisoned") = defined;
+        defined.services = settings.services;
+        let services_was = std::mem::replace(
+            &mut *self.info.defined.write().expect("defined names poisoned"),
+            defined,
+        )
+        .services;
+
+        if services_was != settings.services {
+            report.changed(
+                "[daemon] services",
+                "for what is applied or deployed from now on",
+            );
+        } else {
+            report.unchanged("[daemon] services");
+        }
+
         let pass_env_was = std::mem::replace(
             &mut *self.info.pass_env.write().expect("pass_env poisoned"),
             settings.pass_env.clone(),

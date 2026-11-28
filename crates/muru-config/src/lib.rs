@@ -1798,6 +1798,13 @@ pub struct Daemon {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub detours: Option<bool>,
+    /// Which services this node runs (section 9.17): `all`, those of
+    /// applied files and those its applications' projects declare;
+    /// `node`, only those of applied files; or `none`. What is not run
+    /// is refused when it is applied or deployed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "all"))]
+    pub services: Option<ServicesAccepted>,
     /// The node's budget across every application (section 7.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<Budget>,
@@ -5325,6 +5332,30 @@ pub struct Service {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub required: Option<bool>,
+}
+
+/// Which services a node runs: the daemon's `services` setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ServicesAccepted {
+    /// The node's own and those its applications' projects declare.
+    #[default]
+    All,
+    /// Only the node's own, from `[service.NAME]` in applied files.
+    Node,
+    /// None.
+    None,
+}
+
+impl ServicesAccepted {
+    /// The setting as it is written.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Node => "node",
+            Self::None => "none",
+        }
+    }
 }
 
 /// How a project's service changes over when another release takes over.

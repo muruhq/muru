@@ -668,6 +668,7 @@ pub fn plan_declared(
         let applying = Applying {
             prune: prune.any(),
             hold,
+            services: defined.services,
         };
         promotions.extend(plan_app(
             store,
@@ -699,7 +700,7 @@ pub fn plan_declared(
 
     plan_hosts(store, document, &defined.rate_limits, &mut plan);
     plan_upstreams(store, document, &mut plan);
-    plan_services(store, document, &mut plan);
+    plan_services(store, document, defined.services, &mut plan);
     plan_routes(store, document, defined, &mut plan);
     plan_overlays(store, document, defined, prune.any(), &mut plan);
     plan_conditions(store, document, file_conditions, &mut plan);
@@ -729,6 +730,8 @@ pub fn plan_declared(
 struct Applying {
     prune: bool,
     hold: bool,
+    /// Which services the node runs.
+    services: muru_config::ServicesAccepted,
 }
 
 /// The changes one application's table implies, and the promotion its
@@ -989,13 +992,16 @@ fn plan_app(
             continue;
         };
 
-        let spec = match resolve_declared(name, table, &settings, source, provisioning) {
-            Ok(spec) => spec,
-            Err(error) => {
-                plan.errors.push(format!("{name}@{id}: {error}"));
-                continue;
-            }
-        };
+        let spec =
+            match resolve_declared(name, table, &settings, source, provisioning).and_then(|spec| {
+                refuse_project_services(applying.services, &spec.services).map(|()| spec)
+            }) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    plan.errors.push(format!("{name}@{id}: {error}"));
+                    continue;
+                }
+            };
 
         match store.release(name, id) {
             Ok(recorded) if recorded.spec == spec => plan.unchanged += 1,
@@ -1242,6 +1248,30 @@ pub struct Defined {
     pub conditions: BTreeMap<String, muru_config::Condition>,
     /// The node's budget and what its releases hold.
     pub budget: crate::budget::View,
+    /// `[daemon] services`: which services the node runs (issue 1009).
+    pub services: muru_config::ServicesAccepted,
+}
+
+/// The refusal of a release that declares services on a node that
+/// runs none of a project's.
+pub fn refuse_project_services(
+    accepted: muru_config::ServicesAccepted,
+    services: &BTreeMap<String, muru_config::Service>,
+) -> Result<(), String> {
+    if services.is_empty() || accepted == muru_config::ServicesAccepted::All {
+        return Ok(());
+    }
+
+    Err(format!(
+        "it declares {} ({}), and this node runs no services of a project: services = \
+         '{}' in the [daemon] table of the daemon's file",
+        match services.len() {
+            1 => "a service",
+            _ => "services",
+        },
+        services.keys().cloned().collect::<Vec<_>>().join(", "),
+        accepted.as_str()
+    ))
 }
 
 impl Defined {
@@ -2714,7 +2744,24 @@ fn describe_overlay(overlay: &Overlay) -> String {
 /// Section 9.17: the services a document declares, each checked as its
 /// table is and compared with what is recorded, with what the change
 /// does to its instances as the detail.
-fn plan_services(store: &Store, document: &Document, plan: &mut Plan) {
+fn plan_services(
+    store: &Store,
+    document: &Document,
+    accepted: muru_config::ServicesAccepted,
+    plan: &mut Plan,
+) {
+    // Issue 1009: a node set to run no services refuses the tables,
+    // those already recorded with them, so the file says what runs.
+
+    if accepted == muru_config::ServicesAccepted::None && !document.service.is_empty() {
+        plan.errors.push(format!(
+            "[service.{}]: this node runs no services: services = 'none' in the [daemon] \
+             table of the daemon's file",
+            document.service.keys().next().expect("not empty")
+        ));
+        return;
+    }
+
     let stored: BTreeMap<String, muru_config::Service> = store
         .services()
         .unwrap_or_default()
@@ -9725,6 +9772,50 @@ mod tests {
                 .unwrap_err()
                 .starts_with("services.worker: command: ")
         );
+    }
+
+    #[test]
+    fn a_node_refuses_the_services_its_daemon_is_set_not_to_run() {
+        use muru_config::ServicesAccepted;
+
+        let store = Store::in_memory().unwrap();
+        let errors = |accepted: ServicesAccepted| {
+            plan(
+                &store,
+                &Document::parse("[service.redis]\ncommand = ['redis-server']\n").unwrap(),
+                false,
+                false,
+                &Defined {
+                    services: accepted,
+                    ..Defined::default()
+                },
+                &crate::provision::Provisioning::off(),
+            )
+            .errors
+        };
+        assert_eq!(errors(ServicesAccepted::All), Vec::<String>::new());
+        assert_eq!(errors(ServicesAccepted::Node), Vec::<String>::new());
+        assert_eq!(
+            errors(ServicesAccepted::None),
+            [
+                "[service.redis]: this node runs no services: services = 'none' in the \
+                 [daemon] table of the daemon's file"
+            ]
+        );
+
+        // A release's services are refused by both, and one without
+        // services by neither.
+
+        let declared: BTreeMap<String, muru_config::Service> =
+            toml::from_str("[worker]\ncommand = ['w']\n").unwrap();
+        assert!(refuse_project_services(ServicesAccepted::All, &declared).is_ok());
+        assert!(refuse_project_services(ServicesAccepted::None, &BTreeMap::new()).is_ok());
+        assert_eq!(
+            refuse_project_services(ServicesAccepted::Node, &declared).unwrap_err(),
+            "it declares a service (worker), and this node runs no services of a project: \
+             services = 'node' in the [daemon] table of the daemon's file"
+        );
+        assert!(refuse_project_services(ServicesAccepted::None, &declared).is_err());
     }
 
     #[test]

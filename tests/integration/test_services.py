@@ -617,6 +617,26 @@ def test_a_projects_services_run_with_its_serving_release(daemon: Daemon, tmp_pa
         "service x: switch is for a service a project declares" in refused.stdout + refused.stderr
     )
 
+    # A node set to run only its own services refuses a release that
+    # declares some, and one set to run none refuses a service's table.
+
+    daemon.muructl("daemon", "config", "set", "daemon.services", "node")
+    refused = daemon.muructl(
+        "deploy", "shop", str(project), "--python", sys.executable, check=False
+    )
+    assert refused.returncode != 0
+    assert (
+        "it declares services (reindex, worker), and this node runs no services of a "
+        "project: services = 'node' in the [daemon] table of the daemon's file"
+    ) in refused.stderr
+    assert apply(daemon, tmp_path / "node.toml", table("x", "sleep 600")).returncode == 0
+    daemon.muructl("daemon", "config", "set", "daemon.services", "none")
+    refused = apply(daemon, tmp_path / "node.toml", table("x", "sleep 600"))
+    assert refused.returncode != 0
+    assert (
+        "[service.x]: this node runs no services: services = 'none' in the [daemon] table"
+    ) in refused.stdout + refused.stderr
+
 
 def test_a_projects_services_run_beside_a_development_run(tmp_path: Path) -> None:
     from support import server as support

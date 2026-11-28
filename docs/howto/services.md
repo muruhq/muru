@@ -532,9 +532,10 @@ services = 'node'
 | `node` | Only `[service.NAME]` tables in applied files are run. A release that declares services is refused when it is deployed or applied. |
 | `none` | No service is run. An applied file with a `[service.NAME]` table is refused, as is a release that declares services. |
 
-The refusal names the setting. Services that already run when the
-setting changes are left as they are until they are next applied or
-deployed.
+The refusal names the setting. A change to the setting is taken by a
+reload, and is for what is applied or deployed from then on: a release
+deployed before keeps its services, and a service already applied runs
+on until a file with its table is applied again.
 
 ## Events
 
