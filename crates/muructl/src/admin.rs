@@ -8990,6 +8990,38 @@ fn finish_removal(answer: &pb::RemoveReleasesResponse, json: bool) -> anyhow::Re
     }
 }
 
+/// Where a managed server's instance stands, for `release show`: its
+/// process, or why it has none and when it is started again.
+fn instance_standing(instance: &pb::ServerInstance, now_unix_ms: u64) -> String {
+    let in_a_row = match instance.quick_exits {
+        0 | 1 => String::new(),
+        count => format!(" after {count} quick exits in a row"),
+    };
+
+    match instance.state.as_str() {
+        "starting" => format!("pid {}, starting", instance.pid),
+        "backoff" => {
+            let wait = Duration::from_secs(
+                instance
+                    .next_start_unix_ms
+                    .saturating_sub(now_unix_ms)
+                    .div_ceil(1000),
+            );
+            format!(
+                "backoff, starting again in {}{in_a_row}",
+                muru_config::format_duration(wait)
+            )
+        }
+        "exited" => "exited, not started again".to_owned(),
+        "failed" => format!("failed, not started again{in_a_row}"),
+
+        // A daemon from before the state was given says only whether
+        // the instance has a process.
+        _ if instance.pid == 0 => "waiting to start again".to_owned(),
+        _ => format!("pid {}", instance.pid),
+    }
+}
+
 /// The WORKERS column of `release list`: what runs now, or `-` when
 /// nothing does, and the shape the release asks for in brackets.
 fn workers_column(release: &pb::Release) -> String {
@@ -9161,14 +9193,13 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
         lines.push(("command".to_owned(), release.command.join(" ")));
 
         for instance in &release.server_instances {
-            let process = if instance.pid == 0 {
-                "waiting to start again".to_owned()
-            } else {
-                format!("pid {}", instance.pid)
-            };
             lines.push((
                 format!("instance {}", instance.index),
-                format!("{process}, {}", instance.address),
+                format!(
+                    "{}, {}",
+                    instance_standing(instance, now_unix_ms()),
+                    instance.address
+                ),
             ));
         }
 
@@ -13967,6 +13998,42 @@ tls = { ca = "ca.pem" }
             ..server
         };
         assert_eq!(super::workers_column(&running), "1 (2 gunicorn)");
+    }
+
+    #[test]
+    fn an_instance_is_shown_by_where_it_stands() {
+        let instance = |state: &str, pid: u32, quick_exits: u32| pb::ServerInstance {
+            pid,
+            state: state.to_owned(),
+            next_start_unix_ms: 61_500,
+            quick_exits,
+            ..Default::default()
+        };
+        let shown = |instance: &pb::ServerInstance| super::instance_standing(instance, 50_000);
+
+        assert_eq!(shown(&instance("running", 7, 0)), "pid 7");
+        assert_eq!(shown(&instance("starting", 7, 1)), "pid 7, starting");
+        assert_eq!(
+            shown(&instance("backoff", 0, 1)),
+            "backoff, starting again in 12s"
+        );
+        assert_eq!(
+            shown(&instance("backoff", 0, 4)),
+            "backoff, starting again in 12s after 4 quick exits in a row"
+        );
+        assert_eq!(
+            shown(&instance("exited", 0, 0)),
+            "exited, not started again"
+        );
+        assert_eq!(
+            shown(&instance("failed", 0, 5)),
+            "failed, not started again after 5 quick exits in a row"
+        );
+
+        // A daemon that names no state.
+
+        assert_eq!(shown(&instance("", 0, 0)), "waiting to start again");
+        assert_eq!(shown(&instance("", 7, 0)), "pid 7");
     }
 
     #[tokio::test]

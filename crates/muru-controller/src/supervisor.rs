@@ -55,7 +55,15 @@ pub struct EventNames {
     pub started: &'static str,
     /// An instance could not be started.
     pub failed: &'static str,
+    /// An instance keeps exiting soon after it starts.
+    pub crash_looping: &'static str,
+    /// An instance that keeps exiting is left failed.
+    pub gave_up: &'static str,
 }
+
+/// The quick exits in a row at which an instance is reported as crash
+/// looping: the third, by when the wait has doubled twice.
+pub const CRASH_LOOP_AFTER: u32 = 3;
 
 /// What every instance of a supervised program shares.
 #[derive(Debug, Clone)]
@@ -184,6 +192,46 @@ enum Verdict {
     Restart(Duration),
     /// The instance is left as it is, not started again.
     Leave(Left),
+    /// The instance has exited quickly as often in a row as the policy
+    /// allows, and is left failed.
+    GiveUp,
+}
+
+/// Whether an exit was a clean one, for the count of exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Outcome {
+    /// A status the policy counts as success.
+    Clean,
+    /// Any other end.
+    Failed,
+}
+
+impl Outcome {
+    /// The outcome as a metric's label names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Where an instance stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// It has a process.
+    Running,
+    /// It exited, or could not be started, and its next start is due at
+    /// a known time.
+    Backoff {
+        /// How long until the start is due; nothing when it is due now.
+        wait: Duration,
+    },
+    /// It ended cleanly and the policy does not start it again.
+    Exited,
+    /// It ended in failure and is not started again: the policy is
+    /// `never`, or it kept exiting and was given up on.
+    Failed,
 }
 
 /// How an instance that is not started again was left.
@@ -213,16 +261,26 @@ impl RestartPolicy {
     /// a row it brings the instance to: `always` starts the instance
     /// again whatever the exit, `on-failure` after a failure alone, and
     /// `never` leaves it, as exited after a clean exit and failed after
-    /// any other.
+    /// any other. An exit that would be followed by a start is not once
+    /// the quick exits in a row reach `give_up_after`.
     fn restart_after(&self, exit: &Exit, quick_exits: u32) -> Verdict {
         let clean = self.clean(exit);
 
         match self.mode {
-            RestartMode::Always => Verdict::Restart(self.backoff(quick_exits)),
-            RestartMode::OnFailure if !clean => Verdict::Restart(self.backoff(quick_exits)),
             RestartMode::OnFailure | RestartMode::Never if clean => Verdict::Leave(Left::Exited),
-            RestartMode::OnFailure | RestartMode::Never => Verdict::Leave(Left::Failed),
+            RestartMode::Never => Verdict::Leave(Left::Failed),
+            RestartMode::Always | RestartMode::OnFailure => self.again(quick_exits),
         }
+    }
+
+    /// The start that follows this many quick exits or failed starts in
+    /// a row: after the wait, or not at all once the policy gives up.
+    fn again(&self, in_a_row: u32) -> Verdict {
+        if self.give_up_after.is_some_and(|limit| in_a_row >= limit) {
+            return Verdict::GiveUp;
+        }
+
+        Verdict::Restart(self.backoff(in_a_row))
     }
 
     /// The quick exits in a row after an exit that ended a run of `ran`,
@@ -757,6 +815,32 @@ impl Instance {
         self.process.as_ref().map(Process::pid)
     }
 
+    /// Where the instance stands.
+    pub fn state(&self) -> State {
+        match (&self.process, self.left) {
+            (Some(_), _) => State::Running,
+            (None, Some(Left::Exited)) => State::Exited,
+            (None, Some(Left::Failed)) => State::Failed,
+            (None, None) => State::Backoff {
+                wait: self
+                    .due
+                    .map(|due| due.saturating_duration_since(Instant::now()))
+                    .unwrap_or_default(),
+            },
+        }
+    }
+
+    /// The instance's quick exits and failed starts in a row.
+    pub fn quick_exits(&self) -> u32 {
+        self.quick_exits
+    }
+
+    /// When the instance's process was started, Unix milliseconds; 0 for
+    /// one adopted from a record that did not say.
+    pub fn started_unix_ms(&self) -> u64 {
+        self.started_unix_ms
+    }
+
     /// Remove what the process left behind.
     fn clear_stale(&self) {
         for path in &self.spec.stale {
@@ -815,6 +899,20 @@ pub struct Report {
     pub level: &'static str,
     /// What happened.
     pub message: String,
+    /// For the report of an exit, whether it was a clean one.
+    pub outcome: Option<Outcome>,
+}
+
+impl Report {
+    /// A report that is not of an exit.
+    fn new(kind: &'static str, level: &'static str, message: String) -> Self {
+        Self {
+            kind,
+            level,
+            message,
+            outcome: None,
+        }
+    }
 }
 
 /// The instances as recorded for the next daemon.
@@ -1001,6 +1099,10 @@ impl Supervisor {
                             }
                             Verdict::Leave(left) => {
                                 instance.left = Some(left);
+                                None
+                            }
+                            Verdict::GiveUp => {
+                                instance.left = Some(Left::Failed);
                                 None
                             }
                         };
@@ -1278,6 +1380,12 @@ impl Supervisor {
                 instance.quick_exits = self.policy.count(instance.quick_exits, ran);
                 let verdict = self.policy.restart_after(&exit, instance.quick_exits);
 
+                let outcome = if self.policy.clean(&exit) {
+                    Outcome::Clean
+                } else {
+                    Outcome::Failed
+                };
+
                 let (level, what) = match verdict {
                     Verdict::Restart(wait) => {
                         instance.due = Some(now + wait);
@@ -1302,6 +1410,10 @@ impl Supervisor {
                             ),
                         )
                     }
+                    Verdict::GiveUp => {
+                        instance.left = Some(Left::Failed);
+                        ("error", "it is not started again".to_owned())
+                    }
                 };
 
                 instance.leftover = left_behind.map(|group| Leftover {
@@ -1321,7 +1433,9 @@ impl Supervisor {
                             ""
                         },
                     ),
+                    outcome: Some(outcome),
                 });
+                reports.extend(self.loop_report(position, verdict));
             }
 
             let instance = &mut self.instances[position];
@@ -1375,32 +1489,85 @@ impl Supervisor {
             let index = instance.index;
 
             match self.spawn(position).await {
-                Ok(()) => reports.push(Report {
-                    kind: self.spec.events.started,
-                    level: "info",
-                    message: format!(
+                Ok(()) => reports.push(Report::new(
+                    self.spec.events.started,
+                    "info",
+                    format!(
                         "instance {index} started again (pid {})",
                         self.instances[position].pid().unwrap_or(0)
                     ),
-                }),
+                )),
                 Err(error) => {
+                    // A start that fails counts as a quick exit does.
+
                     let instance = &mut self.instances[position];
-                    instance.quick_exits += 1;
-                    let wait = self.policy.backoff(instance.quick_exits);
-                    instance.due = Some(now + wait);
-                    reports.push(Report {
-                        kind: self.spec.events.failed,
-                        level: "error",
-                        message: format!(
-                            "instance {index} could not be started: {error:#}; trying again in {}",
-                            muru_config::format_duration(wait)
-                        ),
-                    });
+                    instance.quick_exits = instance.quick_exits.saturating_add(1);
+                    let verdict = self.policy.again(instance.quick_exits);
+
+                    let what = match verdict {
+                        Verdict::Restart(wait) => {
+                            instance.due = Some(now + wait);
+                            format!("trying again in {}", muru_config::format_duration(wait))
+                        }
+                        Verdict::Leave(_) | Verdict::GiveUp => {
+                            instance.due = None;
+                            instance.left = Some(Left::Failed);
+                            "it is not tried again".to_owned()
+                        }
+                    };
+
+                    reports.push(Report::new(
+                        self.spec.events.failed,
+                        "error",
+                        format!("instance {index} could not be started: {error:#}; {what}"),
+                    ));
+                    reports.extend(self.loop_report(position, verdict));
                 }
             }
         }
 
         reports
+    }
+
+    /// What makes a crash loop loud, after the quick exit or failed start
+    /// that `verdict` was given for: that the instance is crash looping,
+    /// once, when its quick exits in a row reach `CRASH_LOOP_AFTER` and
+    /// it is still to be started again, or that it has been given up on.
+    fn loop_report(&self, position: usize, verdict: Verdict) -> Option<Report> {
+        let instance = &self.instances[position];
+        let within = muru_config::format_duration(self.policy.stable_after);
+
+        match verdict {
+            Verdict::Restart(_) if instance.quick_exits == CRASH_LOOP_AFTER => Some(Report::new(
+                self.spec.events.crash_looping,
+                "error",
+                format!(
+                    "instance {} is crash looping: it has exited or failed to start {} times in \
+                     a row, each within {within} of starting; it is started again after waits \
+                     of up to {}{}",
+                    instance.index,
+                    instance.quick_exits,
+                    muru_config::format_duration(self.policy.max_delay),
+                    match self.policy.give_up_after {
+                        Some(limit) => format!(", and left failed after {limit} in a row"),
+                        None => " until it stays up".to_owned(),
+                    }
+                ),
+            )),
+            Verdict::GiveUp => Some(Report::new(
+                self.spec.events.gave_up,
+                "error",
+                format!(
+                    "instance {} is left failed after exiting or failing to start {} times in a \
+                     row, each within {within} of starting (give_up_after = {}); a restart by \
+                     hand starts it again",
+                    instance.index,
+                    instance.quick_exits,
+                    self.policy.give_up_after.unwrap_or(instance.quick_exits)
+                ),
+            )),
+            Verdict::Restart(_) | Verdict::Leave(_) => None,
+        }
     }
 
     /// What adoption found of each instance, in order; empty when this
@@ -1517,6 +1684,8 @@ mod tests {
         exited: "thing.exited",
         started: "thing.started",
         failed: "thing.failed",
+        crash_looping: "thing.crash_looping",
+        gave_up: "thing.gave_up",
     };
 
     /// A specification whose instances run in `dir`.
@@ -1691,15 +1860,38 @@ mod tests {
         .await
         .unwrap();
 
-        for wait in [1, 2, 4] {
+        for wait in [1, 2, 4, 8] {
+            let exited = reports(&mut supervisor).await;
             assert_eq!(
-                reports(&mut supervisor).await,
-                [format!(
+                exited[0],
+                format!(
                     "thing.exited warning: instance 0 exited with exit status: 3; \
                      starting it again in {wait}s"
-                )]
+                )
             );
+
+            // The third quick exit in a row is a crash loop, said once.
+
+            match wait {
+                4 => assert_eq!(
+                    exited[1..],
+                    [
+                        "thing.crash_looping error: instance 0 is crash looping: it has exited \
+                      or failed to start 3 times in a row, each within 60s of starting; it \
+                      is started again after waits of up to 60s until it stays up"
+                    ]
+                ),
+                _ => assert_eq!(exited.len(), 1, "{exited:?}"),
+            }
+
             assert_eq!(supervisor.running(), 0);
+            let instance = supervisor.instances().next().unwrap();
+            assert_eq!(
+                instance.state(),
+                State::Backoff {
+                    wait: Duration::from_secs(wait)
+                }
+            );
 
             // Nothing happens until the whole wait has passed.
 
@@ -1714,6 +1906,8 @@ mod tests {
                     pids(&supervisor)[0]
                 )]
             );
+            let instance = supervisor.instances().next().unwrap();
+            assert_eq!(instance.state(), State::Running);
         }
 
         supervisor.stop_until(Instant::now()).await;
@@ -1924,6 +2118,63 @@ mod tests {
         tokio::time::advance(Duration::from_secs(600)).await;
         assert!(supervisor.check().await.is_empty());
         assert_eq!(supervisor.running(), 0);
+        assert_eq!(supervisor.record().instances[0].left, Some(Left::Failed));
+        supervisor.stop_until(Instant::now()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_instance_that_keeps_exiting_is_given_up_on_when_the_policy_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = Supervisor::start(
+            spec(dir.path()),
+            RestartPolicy {
+                give_up_after: Some(2),
+                ..RestartPolicy::default()
+            },
+            vec![instance(&["/bin/sh", "-c", "exit 3"])],
+            STOP_WITHIN,
+        )
+        .await
+        .unwrap();
+
+        let exited = reports(&mut supervisor).await;
+        assert!(exited[0].ends_with("starting it again in 1s"), "{exited:?}");
+        assert_eq!(exited[0].split(' ').nth(1), Some("warning:"));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(reports(&mut supervisor).await[0].starts_with("thing.started"));
+
+        // The second quick exit in a row is the last: the exit counts as
+        // a failure, and the instance is left failed for good.
+
+        let exited: Vec<Report> = loop {
+            let reports = supervisor.check().await;
+
+            if !reports.is_empty() {
+                break reports;
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert_eq!(exited[0].outcome, Some(Outcome::Failed));
+        assert_eq!(
+            exited
+                .iter()
+                .map(|report| format!("{} {}: {}", report.kind, report.level, report.message))
+                .collect::<Vec<_>>(),
+            [
+                "thing.exited error: instance 0 exited with exit status: 3; \
+                 it is not started again",
+                "thing.gave_up error: instance 0 is left failed after exiting or failing to \
+                 start 2 times in a row, each within 60s of starting (give_up_after = 2); a \
+                 restart by hand starts it again",
+            ]
+        );
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(supervisor.check().await.is_empty());
+        let instance = supervisor.instances().next().unwrap();
+        assert_eq!(instance.state(), State::Failed);
+        assert_eq!(instance.quick_exits(), 2);
         assert_eq!(supervisor.record().instances[0].left, Some(Left::Failed));
         supervisor.stop_until(Instant::now()).await;
     }
@@ -2349,16 +2600,21 @@ mod tests {
         assert_eq!(supervisor.running(), 3);
 
         // The exits in a row carry on from the record: with two behind
-        // it, an instance's next exit waits as the third does.
+        // it, an instance's next exit waits as the third does, and is
+        // the one that makes a crash loop.
 
         kill(now[1]);
+        let exited = reports(&mut supervisor).await;
         assert_eq!(
-            reports(&mut supervisor).await,
-            [
-                "thing.exited warning: instance 1 exited with signal: 9 (SIGKILL); \
-              starting it again in 4s"
-            ]
+            exited[0],
+            "thing.exited warning: instance 1 exited with signal: 9 (SIGKILL); \
+             starting it again in 4s"
         );
+        assert!(
+            exited[1].starts_with("thing.crash_looping error: instance 1 is crash looping: "),
+            "{exited:?}"
+        );
+        assert_eq!(exited.len(), 2);
 
         // An adopted process that exits is seen to be gone and started
         // again as a child.
@@ -2366,8 +2622,8 @@ mod tests {
         survivor.kill().unwrap();
         survivor.wait().unwrap();
         assert_eq!(
-            reports(&mut supervisor).await,
-            ["thing.exited warning: instance 0 is gone; starting it again in 4s"]
+            reports(&mut supervisor).await[0],
+            "thing.exited warning: instance 0 is gone; starting it again in 4s"
         );
         tokio::time::advance(Duration::from_secs(4)).await;
         assert_eq!(supervisor.check().await.len(), 2);
@@ -2499,8 +2755,8 @@ mod tests {
         // signals nothing: the bystander runs on.
 
         assert_eq!(
-            reports(&mut supervisor).await,
-            ["thing.exited warning: instance 0 is gone; starting it again in 4s"]
+            reports(&mut supervisor).await[0],
+            "thing.exited warning: instance 0 is gone; starting it again in 4s"
         );
         supervisor.stop_until(Instant::now()).await;
         assert_eq!(bystander.try_wait().unwrap(), None);

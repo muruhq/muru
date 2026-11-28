@@ -231,6 +231,60 @@ def test_a_crashed_instance_is_started_again(daemon: Daemon) -> None:
     ]
 
 
+def test_a_crash_loop_is_loud_and_ends_as_the_restart_table_says(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    # The instance serves until the file is there, and from then on
+    # exits as soon as it is started.
+
+    broken = tmp_path / "broken"
+    script = f"test -e {shlex.quote(str(broken))} && exit 7; exec {shlex.join(SERVER)}"
+    deploy_server(
+        daemon, "legacy", "--restart", "give_up_after=4", command=["/bin/sh", "-c", script]
+    )
+    assert [instance["state"] for instance in instances(daemon, "legacy@r1")] == ["running"]
+    broken.touch()
+    report(daemon, "/crash")
+
+    def events(kind: str) -> list[str]:
+        lines = daemon.muructl("events").stdout.splitlines()
+        return [line for line in lines if f" {kind} " in line]
+
+    # The third quick exit in a row is a crash loop, and the instance
+    # waits in backoff, with when it is started next.
+
+    wait_for(lambda: len(events("server.crash_looping")) == 1, 30)
+    assert (
+        "instance 0 is crash looping: it has exited or failed to start 3 times"
+        in (events("server.crash_looping")[0])
+    )
+    (waiting,) = instances(daemon, "legacy@r1")
+    assert (waiting["state"], waiting["pid"], waiting["quick_exits"]) == ("backoff", 0, 3)
+    assert waiting["next_start_unix_ms"] > time.time() * 1000
+    shown = daemon.muructl("release", "show", "legacy@r1").stdout
+    assert re.search(r"backoff, starting again in \ds after 3 quick exits in a row", shown), shown
+
+    # The fourth is the last the table allows: the instance is left
+    # failed, the release stays ready, and the exits are counted.
+
+    wait_for(lambda: len(events("server.gave_up")) == 1, 30)
+    assert "(give_up_after = 4)" in events("server.gave_up")[0]
+    (failed,) = instances(daemon, "legacy@r1")
+    assert (failed["state"], failed["pid"], failed["quick_exits"]) == ("failed", 0, 4)
+    shown = daemon.muructl("release", "show", "legacy@r1").stdout
+    assert "failed, not started again after 4 quick exits in a row" in shown
+    exits = [line for line in events("server.exited") if "exit status" in line]
+    assert len(exits) == 4, exits
+    assert exits[-1].endswith("exited with exit status: 7; it is not started again")
+    metrics = daemon.muructl("metrics").stdout
+    assert 'muru_server_exits_total{app="legacy",release="r1",outcome="failed"} 4' in metrics
+    assert daemon.releases("legacy") == [
+        {"release": "legacy@r1", "state": "ready", "serving": "yes"}
+    ]
+    time.sleep(2.5)
+    assert len(events("server.started")) == 3
+
+
 def group_gone(pgid: int) -> bool:
     """Whether nothing is left of a process group; signal 0 sends nothing."""
 

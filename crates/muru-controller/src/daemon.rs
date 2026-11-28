@@ -1179,7 +1179,7 @@ pub struct Info {
     pub interfaces: Interfaces,
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
-    pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceRecord>>>,
+    pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceStatus>>>,
     /// Section 9.10 (issue 123): the conditions and their states, as of the
     /// last evaluation.
     pub conditions: std::sync::Mutex<Vec<crate::conditions::Status>>,
@@ -6349,6 +6349,22 @@ impl Daemon {
                     &[("app", app.as_str()), ("release", id.as_str())],
                     dropped as f64,
                 ));
+            }
+
+            // Section 9.9: a managed server's instances that exited.
+
+            if let Backend::Servers(servers) = &running.backend {
+                for (outcome, count) in servers.exits() {
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_server_exits_total",
+                        &[
+                            ("app", app.as_str()),
+                            ("release", id.as_str()),
+                            ("outcome", outcome),
+                        ],
+                        count as f64,
+                    ));
+                }
             }
 
             // Section 7.8: the swaps waiting their turn in each group.
@@ -14018,7 +14034,7 @@ impl Daemon {
             .running
             .iter()
             .filter_map(|(key, running)| match &running.backend {
-                Backend::Servers(servers) => Some((key.clone(), servers.record().instances)),
+                Backend::Servers(servers) => Some((key.clone(), servers.status())),
                 _ => None,
             })
             .collect();

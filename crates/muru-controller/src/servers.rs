@@ -42,6 +42,8 @@ const EVENTS: EventNames = EventNames {
     exited: "server.exited",
     started: "server.started",
     failed: "server.failed",
+    crash_looping: "server.crash_looping",
+    gave_up: "server.gave_up",
 };
 
 /// Where one instance listens.
@@ -130,6 +132,31 @@ impl InstanceRecord {
     }
 }
 
+/// One instance as `release show` gives it: what is recorded of it, and
+/// where it stands now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceStatus {
+    /// The instance's index, from 0.
+    pub index: u32,
+    /// Its pid; 0 when it has no process.
+    pub pid: u32,
+    /// Where it listens, as an upstream names it.
+    pub address: String,
+    /// When its process was started, Unix milliseconds; 0 when it has
+    /// none or it is not known.
+    pub started_unix_ms: u64,
+    /// `running`, `starting` (its process has not answered the readiness
+    /// probe since it was started again), `backoff` (it exited and its
+    /// next start is due), `exited` or `failed` (it is not started
+    /// again).
+    pub state: &'static str,
+    /// For an instance in `backoff`, when its next start is due, Unix
+    /// milliseconds; 0 otherwise.
+    pub next_start_unix_ms: u64,
+    /// Its quick exits and failed starts in a row.
+    pub quick_exits: u32,
+}
+
 /// How the daemon has each instance's log relay started: from `executable`,
 /// with its counts and events going to `watcher`.
 #[derive(Clone)]
@@ -193,6 +220,8 @@ pub struct Servers {
     dropped: Arc<AtomicU64>,
     /// The program the command runs, as the process view names it.
     program: String,
+    /// The instances' exits this daemon has seen, by outcome.
+    exits: std::collections::BTreeMap<supervisor::Outcome, u64>,
 }
 
 impl Servers {
@@ -251,6 +280,7 @@ impl Servers {
             supervisor,
             dropped,
             program: crate::processes::program_of(&spec.command).unwrap_or_default(),
+            exits: std::collections::BTreeMap::new(),
         })
     }
 
@@ -344,6 +374,7 @@ impl Servers {
             supervisor,
             dropped,
             program: crate::processes::program_of(&spec.command).unwrap_or_default(),
+            exits: std::collections::BTreeMap::new(),
         })
     }
 
@@ -418,6 +449,11 @@ impl Servers {
     /// `probed` here takes the answer (issue 917).
     pub async fn check(&mut self, probed: &Probed) -> Vec<Report> {
         let reports = self.supervisor.check().await;
+
+        for outcome in reports.iter().filter_map(|report| report.outcome) {
+            *self.exits.entry(outcome).or_default() += 1;
+        }
+
         let pids: Vec<Option<u32>> = self
             .supervisor
             .instances()
@@ -485,6 +521,7 @@ impl Servers {
                 kind: READY_EVENT,
                 level: "info",
                 message: format!("instance {index} answers and takes requests again"),
+                outcome: None,
             });
         }
 
@@ -500,6 +537,7 @@ impl Servers {
                     .map(|path| format!(" ({path} did not answer 2xx or 3xx)"))
                     .unwrap_or_default()
             ),
+            outcome: None,
         })
     }
 
@@ -567,6 +605,49 @@ impl Servers {
     /// How many instances have a process right now.
     pub fn running(&self) -> usize {
         self.supervisor.running()
+    }
+
+    /// The instances' exits this daemon has seen, by outcome: `clean`
+    /// or `failed`.
+    pub fn exits(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        self.exits
+            .iter()
+            .map(|(outcome, count)| (outcome.as_str(), *count))
+    }
+
+    /// Each instance as `release show` gives it.
+    pub fn status(&self) -> Vec<InstanceStatus> {
+        let now_unix_ms = crate::model::now_unix_ms();
+
+        self.supervisor
+            .instances()
+            .zip(&self.binds)
+            .zip(&self.starting)
+            .map(|((instance, bind), starting)| {
+                let (state, next_start_unix_ms) = match instance.state() {
+                    supervisor::State::Running if starting.marked => ("starting", 0),
+                    supervisor::State::Running => ("running", 0),
+                    supervisor::State::Backoff { wait } => {
+                        ("backoff", now_unix_ms + wait.as_millis() as u64)
+                    }
+                    supervisor::State::Exited => ("exited", 0),
+                    supervisor::State::Failed => ("failed", 0),
+                };
+
+                InstanceStatus {
+                    index: instance.index(),
+                    pid: instance.pid().unwrap_or(0),
+                    address: bind.address(),
+                    started_unix_ms: match instance.pid() {
+                        Some(_) => instance.started_unix_ms(),
+                        None => 0,
+                    },
+                    state,
+                    next_start_unix_ms,
+                    quick_exits: instance.quick_exits(),
+                }
+            })
+            .collect()
     }
 
     /// The instances as a record for the next daemon.

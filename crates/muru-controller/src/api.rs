@@ -5060,6 +5060,9 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
                     pid: instance.pid,
                     address: instance.address.clone(),
                     started_unix_ms: instance.started_unix_ms,
+                    state: instance.state.to_owned(),
+                    next_start_unix_ms: instance.next_start_unix_ms,
+                    quick_exits: instance.quick_exits,
                 })
                 .collect()
         })

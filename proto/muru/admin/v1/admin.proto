@@ -1360,6 +1360,9 @@ message ServerInstance {
   uint32 pid = 2;                   // 0 while it waits to be started again
   string address = 3;               // where it listens, as an upstream names it
   uint64 started_unix_ms = 4;       // when its process was started; 0 when not known
+  string state = 5;                 // running, starting (not yet answering its readiness probe), backoff (waiting to be started again), exited or failed (not started again)
+  uint64 next_start_unix_ms = 6;    // for an instance in backoff, when its next start is due; 0 otherwise
+  uint32 quick_exits = 7;           // its exits and failed starts in a row, each within stable_after of its start
 }
 
 // A named mount of a release: a path served by another entrypoint in
