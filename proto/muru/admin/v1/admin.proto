@@ -1456,6 +1456,8 @@ message RestartReleaseRequest {
   string group = 3;                 // one worker group; every group when empty
   bool wait = 4;                    // answer once every marked worker has been replaced, or the wait is over
   uint64 wait_timeout_ms = 5;       // how long to wait; ten minutes when 0
+  optional uint32 index = 6;        // for a managed server release: one instance, by its index; every instance when absent
+  bool force = 7;                   // for a managed server release: kill the instances at once, with no time to stop in
 }
 
 message CancelRestartRequest {

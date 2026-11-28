@@ -2466,6 +2466,14 @@ impl Admin for Service {
             return self.restart_servers(request, release).await;
         }
 
+        if request.index.is_some() {
+            return Err(Status::invalid_argument(format!(
+                "release {}@{release} runs workers: one is named with --worker, and --index \
+                 names an instance of a managed HTTP server",
+                request.app
+            )));
+        }
+
         let marked = self
             .ask_host(
                 &request.app,
@@ -2506,7 +2514,10 @@ impl Admin for Service {
         let instances = self.is_managed(&request.app, &release);
 
         let left = match instances {
-            true => self.ask_servers(&request.app, &release, true).await?,
+            true => {
+                self.ask_servers(&request.app, &release, true, None, false)
+                    .await?
+            }
             false => {
                 self.ask_host(
                     &request.app,
@@ -4794,6 +4805,8 @@ impl Service {
         app: &str,
         release: &str,
         cancel: bool,
+        index: Option<u32>,
+        force: bool,
     ) -> Result<Vec<pb::Worker>, Status> {
         let (done_tx, done_rx) = oneshot::channel();
         self.handle
@@ -4802,6 +4815,8 @@ impl Service {
                 app: app.to_owned(),
                 id: release.to_owned(),
                 cancel,
+                index,
+                force,
                 done: done_tx,
             })
             .await
@@ -4838,7 +4853,9 @@ impl Service {
             )));
         }
 
-        let marked = self.ask_servers(&request.app, &release, false).await?;
+        let marked = self
+            .ask_servers(&request.app, &release, false, request.index, request.force)
+            .await?;
 
         if request.wait {
             let deadline = tokio::time::Instant::now() + restart_wait(request.wait_timeout_ms);

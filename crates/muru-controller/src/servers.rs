@@ -566,20 +566,42 @@ impl Servers {
     /// started all the same. The next checks carry it out; `restart`
     /// says how far it has got, and `restart_failure` why it stopped
     /// early if it did. Refused while one is under way.
-    pub fn restart_all(&mut self, grace: Duration) -> Result<Vec<(u32, u32)>, String> {
+    ///
+    /// With `only`, the one instance with that index is restarted, the
+    /// same way (issue 1002).
+    pub fn restart_all(
+        &mut self,
+        only: Option<u32>,
+        grace: Duration,
+    ) -> Result<Vec<(u32, u32)>, String> {
         if self.rolling.is_some() {
             return Err("a restart of its instances is already under way".to_owned());
         }
 
-        let instances: Vec<(u32, u32)> = self
+        let chosen: Vec<(usize, u32, u32)> = self
             .supervisor
             .instances()
-            .map(|instance| (instance.index(), instance.pid().unwrap_or(0)))
+            .enumerate()
+            .filter(|(_, instance)| only.is_none_or(|index| instance.index() == index))
+            .map(|(position, instance)| (position, instance.index(), instance.pid().unwrap_or(0)))
+            .collect();
+
+        if chosen.is_empty() {
+            return Err(format!(
+                "it has no instance {}; it has {}",
+                only.unwrap_or(0),
+                counted(self.supervisor.instances().count())
+            ));
+        }
+
+        let instances: Vec<(u32, u32)> = chosen
+            .iter()
+            .map(|(_, index, pid)| (*index, *pid))
             .collect();
 
         self.restart_failure = None;
         self.rolling = Some(Rolling {
-            queue: (0..instances.len()).collect(),
+            queue: chosen.iter().map(|(position, _, _)| *position).collect(),
             current: None,
             total: instances.len() as u32,
             started_unix_ms: crate::model::now_unix_ms(),
@@ -588,11 +610,14 @@ impl Servers {
         self.pending.push(Report {
             kind: RESTART_STARTED,
             level: "info",
-            message: format!(
-                "restarting {} one at a time, each to answer its readiness probe before the \
-                 next is stopped",
-                counted(instances.len())
-            ),
+            message: match only {
+                Some(index) => format!("restarting instance {index}"),
+                None => format!(
+                    "restarting {} one at a time, each to answer its readiness probe before \
+                     the next is stopped",
+                    counted(instances.len())
+                ),
+            },
             outcome: None,
             index: None,
             change: supervisor::Change::None,
@@ -674,11 +699,15 @@ impl Servers {
         match rolling.current {
             None => {
                 let Some(position) = rolling.queue.pop_front() else {
+                    let whole = rolling.total as usize == self.binds.len();
                     self.rolling = None;
                     self.pending.push(Report {
                         kind: RESTART_FINISHED,
                         level: "info",
-                        message: "every instance has been restarted and answers".to_owned(),
+                        message: match whole {
+                            true => "every instance has been restarted and answers".to_owned(),
+                            false => "the instance has been restarted and answers".to_owned(),
+                        },
                         outcome: None,
                         index: None,
                         change: supervisor::Change::None,

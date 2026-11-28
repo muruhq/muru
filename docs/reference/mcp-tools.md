@@ -58,7 +58,7 @@ it out.
 | `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code`, `ok` and `message`, as a tool error unless `ok`: the command exited with 0 and was not stopped; with `detach`, `muructl command run --detach`, answering with the `run` id at once | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references), `detach` |
 | `stop_command_run` | changes | `muructl command stop` | `run` |
 | `detour_traffic` | changes | `muructl detour traffic` | `detour`, `traffic` (preview, all, share=N, class=NAME), `for` (a duration, after which the detour takes preview again), `paths` (the client URL paths it takes requests under alone), `all_paths` (every path again) |
-| `restart` | changes | `muructl restart`: one worker, or with `all` or `group` every worker in turn, and `cancel` ends such a restart | `target`, `worker`, `all`, `group`, `cancel`, `no_wait`, `force` |
+| `restart` | changes | `muructl restart`: one worker, or with `all` or `group` every worker in turn, and `cancel` ends such a restart | `target`, `worker`, `all`, `group`, `cancel`, `index` (one instance of a managed server), `no_wait`, `force` |
 | `service` | changes | `muructl service start`, `stop` or `restart`, for a service that is already defined | `action`, `name`, `index`, `rolling` |
 | `overlay` | changes | `muructl overlay activate`, `end` or `promote` | `action`, `name`, `for` |
 | `maintenance` | changes | `muructl maintenance on` or `off` | `app` or `host`, `on` |

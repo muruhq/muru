@@ -5939,8 +5939,14 @@ pub struct RestartArgs {
     /// turns, so the restart carries on if the daemon is stopped. For a
     /// managed HTTP server release, every instance, one at a time, each
     /// answering its readiness probe before the next is stopped.
-    #[arg(long, required_unless_present_any = ["worker", "pid", "group", "cancel"])]
+    #[arg(long, required_unless_present_any = ["worker", "pid", "group", "cancel", "index"])]
     all: bool,
+
+    /// One instance of a managed HTTP server release, by its index: it
+    /// is taken out of service, stopped, started and waited for until it
+    /// answers its readiness probe. With --force it is killed at once.
+    #[arg(long, value_name = "N", conflicts_with_all = ["worker", "pid", "all", "group", "cancel"])]
+    index: Option<u32>,
 
     /// Every worker of one worker group, each in its turn.
     #[arg(long, value_name = "NAME", conflicts_with_all = ["worker", "pid"])]
@@ -5979,7 +5985,7 @@ const RESTART_POLL: Duration = Duration::from_millis(250);
 
 /// Replace one worker of a release, or each in turn, with a fresh one.
 pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
-    if args.cancel || args.all || args.group.is_some() {
+    if args.cancel || args.all || args.group.is_some() || args.index.is_some() {
         return restart_release(args).await;
     }
 
@@ -6158,6 +6164,8 @@ async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
             group: args.group.clone().unwrap_or_default(),
             wait: !args.no_wait,
             wait_timeout_ms: 0,
+            index: args.index,
+            force: args.force && args.index.is_some(),
         })
         .await
         .map_err(explain)?
@@ -6183,6 +6191,8 @@ async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
 
     if args.output.json {
         print_answer(&answer)?;
+    } else if let (true, Some(index)) = (answer.instances, args.index) {
+        println!("muru: instance {index} of {name} to be restarted");
     } else if answer.instances {
         println!(
             "muru: {} of {name} to be restarted, one at a time",

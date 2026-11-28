@@ -829,6 +829,10 @@ pub enum Command {
         id: String,
         /// End the restart under way instead of beginning one.
         cancel: bool,
+        /// One instance, by its index; every instance when none.
+        index: Option<u32>,
+        /// Kill the instances at once, with no time to stop in.
+        force: bool,
         /// Answered with the index and pid of each instance to restart,
         /// or for a cancel of each left as it was, or why not.
         done: oneshot::Sender<Result<Vec<(u32, u32)>, String>>,
@@ -8083,14 +8087,19 @@ impl Daemon {
                 app,
                 id,
                 cancel,
+                index,
+                force,
                 done,
             } => {
-                let grace = self
-                    .store
-                    .release(&app, &id)
-                    .map_or(Duration::from_secs(10), |release| {
-                        Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms)
-                    });
+                let grace = match force {
+                    true => Duration::ZERO,
+                    false => self
+                        .store
+                        .release(&app, &id)
+                        .map_or(Duration::from_secs(10), |release| {
+                            Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms)
+                        }),
+                };
 
                 let answer = match self.running.get_mut(&(app.clone(), id.clone())) {
                     Some(Running {
@@ -8100,7 +8109,7 @@ impl Daemon {
                     Some(Running {
                         backend: Backend::Servers(servers),
                         ..
-                    }) => servers.restart_all(grace),
+                    }) => servers.restart_all(index, grace),
                     Some(_) => Err(format!(
                         "release {app}@{id} runs workers, not a managed HTTP server"
                     )),
@@ -8201,7 +8210,8 @@ impl Daemon {
                     {
                         let _ = done.send(Err(format!(
                             "release {app}@{id} runs a managed HTTP server, which has no workers \
-                             to ask; muructl restart --all restarts its instances, one at a time"
+                             to ask; muructl restart --all restarts its instances, one at a \
+                             time, and --index N one of them"
                         )));
                     }
                     None => {
