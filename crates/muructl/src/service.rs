@@ -1,5 +1,5 @@
 //! `muructl service`: the services the daemon keeps running (design
-//! specification section 9.13), listed, shown, started, stopped,
+//! specification section 9.17), listed, shown, started, stopped,
 //! restarted and signalled, and their logs.
 
 use std::time::{Duration, Instant, UNIX_EPOCH};

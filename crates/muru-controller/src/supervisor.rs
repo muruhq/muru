@@ -2047,6 +2047,20 @@ impl Supervisor {
         true
     }
 
+    /// Give the instance at `position` what its next process starts
+    /// with: the one it has, if any, runs on as it was started.
+    pub fn respecify(&mut self, position: usize, spec: InstanceSpec) {
+        if let Some(instance) = self.instances.get_mut(position) {
+            instance.spec = spec;
+        }
+    }
+
+    /// Give every instance the environment its next process starts
+    /// from, apart from its own variables.
+    pub fn set_env(&mut self, env: Vec<(String, String)>) {
+        self.spec.env = env;
+    }
+
     /// Follow another policy from now on: the exits to come are judged
     /// by it, and the waits already under way are left as they are.
     pub fn set_policy(&mut self, policy: RestartPolicy) {

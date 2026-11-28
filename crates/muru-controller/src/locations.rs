@@ -465,7 +465,7 @@ impl Locations {
     }
 
     /// Both directories of the service numbered `number` (section
-    /// 9.13): its relays' sockets and each instance's own directory in
+    /// 9.17): its relays' sockets and each instance's own directory in
     /// the runtime location, and its record and its relays' among the
     /// runtime files.
     pub fn service_dirs(&self, number: u64) -> HostDirs {

@@ -1222,7 +1222,7 @@ impl Store {
         self.with(|connection| Writes { connection }.delete_upstream(name))
     }
 
-    /// Every service, by name (section 9.13).
+    /// Every service, by name (section 9.17).
     pub fn services(&self) -> Result<Vec<StoredService>, StoreError> {
         self.with(|connection| {
             let mut statement = connection

@@ -22,7 +22,7 @@ pub struct Existing {
     apps: HashSet<String>,
     /// The runs the store keeps, by id (issue 692).
     runs: HashSet<u64>,
-    /// The services, each of which has a log of its own (section 9.13).
+    /// The services, each of which has a log of its own (section 9.17).
     services: HashSet<String>,
 }
 
@@ -115,7 +115,7 @@ pub enum Kind {
     /// The files of a command's runs, one for each run the daemon keeps
     /// (issue 692), listed as the log's archives.
     Commands,
-    /// A service's output (section 9.13); the log's `release` is the
+    /// A service's output (section 9.17); the log's `release` is the
     /// service's name.
     Service,
 }
@@ -198,7 +198,7 @@ pub fn list(directory: &Path, existing: Option<&Existing>) -> io::Result<Vec<Log
         add(&mut logs, &name, &metadata, existing, root_log);
     }
 
-    // Section 9.13: each service's log, in `services`.
+    // Section 9.17: each service's log, in `services`.
 
     for (name, metadata) in regular_files(&directory.join("services"))? {
         let qualified = format!("services/{name}");

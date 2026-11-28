@@ -150,7 +150,7 @@ pub enum Action {
         /// Whether it is new rather than changed.
         new: bool,
     },
-    /// Create or replace a service (section 9.13).
+    /// Create or replace a service (section 9.17).
     PutService {
         /// Its name.
         name: String,
@@ -2711,7 +2711,7 @@ fn describe_overlay(overlay: &Overlay) -> String {
     parts.join("; ")
 }
 
-/// Section 9.13: the services a document declares, each checked as its
+/// Section 9.17: the services a document declares, each checked as its
 /// table is and compared with what is recorded, with what the change
 /// does to its instances as the detail.
 fn plan_services(store: &Store, document: &Document, plan: &mut Plan) {

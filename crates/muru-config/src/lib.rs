@@ -5228,7 +5228,7 @@ pub fn check_maintenance(table: &Maintenance) -> Result<(), String> {
     Ok(())
 }
 
-/// A service (section 9.13), one of the `[service.NAME]` tables: a named
+/// A service (section 9.17), one of the `[service.NAME]` tables: a named
 /// command the daemon keeps running, which takes no requests from the
 /// edge.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -6462,7 +6462,7 @@ pub struct Document {
     /// HTTP upstreams by name (section 4.13).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub upstream: BTreeMap<String, Upstream>,
-    /// Services by name (section 9.13): commands the daemon keeps
+    /// Services by name (section 9.17): commands the daemon keeps
     /// running.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub service: BTreeMap<String, Service>,

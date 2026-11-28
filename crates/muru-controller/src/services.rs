@@ -1,4 +1,4 @@
-//! Services (design specification section 9.13): named commands the
+//! Services (design specification section 9.17): named commands the
 //! daemon keeps running beside the applications, which take no requests
 //! from the edge. Their processes are run by the supervisor managed HTTP
 //! servers share (`supervisor.rs`), under the one restart policy (ADR
@@ -48,7 +48,7 @@ const HISTORY: usize = 5;
 /// How long one readiness probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The part of each wait that is added to it at random (section 9.13).
+/// The part of each wait that is added to it at random (section 9.17).
 const JITTER: f32 = 0.1;
 
 /// How many instances a table declares.
@@ -944,7 +944,7 @@ impl Service {
             .collect())
     }
 
-    /// Take up a changed definition (section 9.13). What a process is
+    /// Take up a changed definition (section 9.17). What a process is
     /// started with cannot be changed under it, so a change to any of
     /// that stops every instance and starts it again from the new
     /// definition. A changed count starts or stops the difference, and
@@ -1012,6 +1012,31 @@ impl Service {
         }
 
         difference
+    }
+
+    /// Take up what the daemon has worked out afresh for the same
+    /// definition, its secrets above all, which may have changed in
+    /// their stores: the next process of each instance starts with it,
+    /// and those that run are left as they are. A start or a restart by
+    /// hand does this first, so that it is how a changed secret reaches
+    /// a service.
+    pub fn refresh(&mut self, setting: Setting) {
+        if setting.table != self.setting.table {
+            return;
+        }
+
+        self.setting = setting;
+        self.supervisor.set_env(self.setting.base.clone());
+        let indexes: Vec<u32> = self
+            .supervisor
+            .instances()
+            .map(supervisor::Instance::index)
+            .collect();
+
+        for (position, index) in indexes.into_iter().enumerate() {
+            self.supervisor
+                .respecify(position, self.setting.instance(index));
+        }
     }
 
     /// Stop every instance because the service is no longer declared.
@@ -1619,10 +1644,20 @@ mod tests {
         );
         assert!(service.held());
 
-        // Started by hand it runs again, with nothing counted.
+        // Started by hand it runs again, with nothing counted, and from
+        // what the daemon worked out for it since, as a secret that has
+        // changed would be.
 
+        let mut renewed = setting(dir.path(), "copies", table);
+        renewed.env = vec![("WHO".to_owned(), "renewed {index} in {run_dir}".to_owned())];
+        service.refresh(renewed);
         assert_eq!(service.start(None).unwrap(), [0, 1]);
         settle(&mut service, |status| status.state == "running").await;
+        let log = std::fs::read_to_string(dir.path().join("service.log")).unwrap();
+        assert!(
+            log.contains(&format!("renewed 1 in {}/1 copies", run.display())),
+            "{log}"
+        );
         assert_eq!((service.status().restarts, service.held()), (0, false));
         assert_eq!(service.start(None).unwrap(), Vec::<u32>::new());
 

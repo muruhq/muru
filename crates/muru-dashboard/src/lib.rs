@@ -359,7 +359,7 @@ pub struct NodeData {
     /// Rollouts, those under way first, then the latest ended ones
     /// (section 9.3).
     pub rollouts: Vec<RolloutRow>,
-    /// The services the daemon keeps running (section 9.13).
+    /// The services the daemon keeps running (section 9.17).
     pub services: Vec<ServiceRow>,
     /// Recent requests, newest first.
     pub requests: Vec<NodeRequestRow>,

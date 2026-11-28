@@ -1563,7 +1563,7 @@ impl Admin for Service {
         // when none is named.
 
         let (app, release, path) = if !request.service.is_empty() {
-            // Section 9.13: a service's output is one file, every instance's.
+            // Section 9.17: a service's output is one file, every instance's.
 
             let known = self
                 .handle

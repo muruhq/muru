@@ -808,7 +808,7 @@ pub enum Command {
         message: HostMessage,
     },
     /// Start, stop, restart or signal a service, or one instance of it,
-    /// by hand (section 9.13).
+    /// by hand (section 9.17).
     Service {
         /// The service.
         name: String,
@@ -1219,7 +1219,7 @@ pub struct Info {
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
     pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceStatus>>>,
-    /// The services (section 9.13), by name, as the daemon last checked
+    /// The services (section 9.17), by name, as the daemon last checked
     /// them.
     pub services: std::sync::Mutex<Vec<crate::services::Status>>,
     /// The restart by hand of each managed server release's instances
@@ -1278,7 +1278,7 @@ pub struct LiveRelease {
     pub restart: Option<RestartProgress>,
 }
 
-/// What is done to a service by hand (section 9.13).
+/// What is done to a service by hand (section 9.17).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceAction {
     /// Start what does not run.
@@ -2372,7 +2372,7 @@ struct Daemon {
     /// Issue 393: the releases restored at the daemon's start whose
     /// start failed and is to be tried again, by application and release.
     restores: HashMap<(String, String), RestoreRetry>,
-    /// Section 9.13: the services, by name.
+    /// Section 9.17: the services, by name.
     services: BTreeMap<String, crate::services::Service>,
     /// Issue 693: the applications whose rollout is being promoted.
     promoting: BTreeSet<String>,
@@ -6525,7 +6525,7 @@ impl Daemon {
             }
         }
 
-        // Section 9.13: the services, each by its name.
+        // Section 9.17: the services, each by its name.
 
         for (name, service) in &self.services {
             let status = service.status();
@@ -6584,7 +6584,7 @@ impl Daemon {
         self.runs.adopt();
         self.load_conditions();
 
-        // Section 9.13: the services start before the applications that
+        // Section 9.17: the services start before the applications that
         // use them, and are not waited for: a release that needs one at
         // its start and does not find it is tried again (issue 393).
 
@@ -6677,7 +6677,7 @@ impl Daemon {
         }
     }
 
-    /// Section 9.13: whom a service's instances run as. A user the table
+    /// Section 9.17: whom a service's instances run as. A user the table
     /// names is used when the daemon can switch to it, and warned about
     /// when it is root; without one they run as the service user.
     fn service_identity(
@@ -6721,7 +6721,7 @@ impl Daemon {
         Ok(Some(identity))
     }
 
-    /// Section 9.13: what a service's instances start from: its
+    /// Section 9.17: what a service's instances start from: its
     /// directories made and given to its user, the directory its command
     /// runs in, the daemon's clean environment, its own variables with
     /// their secrets resolved, and its log.
@@ -6805,7 +6805,7 @@ impl Daemon {
         })
     }
 
-    /// Section 9.13: bring a recorded service under this daemon. With
+    /// Section 9.17: bring a recorded service under this daemon. With
     /// `fresh`, nothing of it can be running, as when the daemon starts
     /// from nothing or the service was just defined: what an earlier run
     /// left among its files is removed, and it is started when it starts
@@ -6880,7 +6880,7 @@ impl Daemon {
         }
     }
 
-    /// Section 9.13: every recorded service, as the daemon starts.
+    /// Section 9.17: every recorded service, as the daemon starts.
     async fn begin_services(&mut self) {
         let fresh = self.booted;
 
@@ -6900,7 +6900,7 @@ impl Daemon {
         self.publish_services();
     }
 
-    /// Section 9.13: reap the services' instances that exited, start
+    /// Section 9.17: reap the services' instances that exited, start
     /// those that are due, and take each one's readiness, with what
     /// happened as events. A service that was removed is done with once
     /// nothing of it runs.
@@ -6936,7 +6936,7 @@ impl Daemon {
         self.publish_services();
     }
 
-    /// Section 9.13: make the services match what is recorded, after an
+    /// Section 9.17: make the services match what is recorded, after an
     /// apply: one newly declared is begun, one whose definition changed
     /// takes the change up, and one no longer declared is stopped.
     async fn reconcile_services(&mut self) {
@@ -6998,7 +6998,39 @@ impl Daemon {
         self.publish_services();
     }
 
-    /// Section 9.13: do to a service, or one instance of it, what a
+    /// Section 9.17: work a service's setting out again, its secrets
+    /// resolved afresh, for the processes it starts from now on. One
+    /// whose setting cannot be worked out keeps the one it has, and says
+    /// why.
+    async fn refresh_service(&mut self, name: &str) {
+        let Some(stored) = self
+            .store
+            .services()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|stored| stored.name == name)
+        else {
+            return;
+        };
+
+        match self.service_setting(&stored).await {
+            Ok(setting) => {
+                if let Some(service) = self.services.get_mut(name) {
+                    service.refresh(setting);
+                }
+            }
+            Err(error) => self.events.emit(
+                "service.failed",
+                name,
+                "warning",
+                &format!(
+                    "its environment could not be worked out afresh, and is as it was: {error}"
+                ),
+            ),
+        }
+    }
+
+    /// Section 9.17: do to a service, or one instance of it, what a
     /// command asks. A service stopped whole is held from then on, and
     /// one started is no longer.
     fn act_on_service(
@@ -7069,7 +7101,7 @@ impl Daemon {
         Ok(done)
     }
 
-    /// Section 9.13: stop every service as the daemon shuts down, after
+    /// Section 9.17: stop every service as the daemon shuts down, after
     /// the applications, which use them until their last request. Each
     /// has its own `stop_timeout` or what is left of the budget,
     /// whichever ends first.
@@ -7781,7 +7813,7 @@ impl Daemon {
             running.backend.release();
         }
 
-        // Section 9.13: the services run on too, each with its record as
+        // Section 9.17: the services run on too, each with its record as
         // it stands for the next daemon.
 
         for (_, service) in std::mem::take(&mut self.services) {
@@ -8073,6 +8105,13 @@ impl Daemon {
                 action,
                 done,
             } => {
+                // A start or a restart begins from the service's secrets
+                // as they are now, which is how a changed one reaches it.
+
+                if matches!(action, ServiceAction::Start | ServiceAction::Restart { .. }) {
+                    self.refresh_service(&name).await;
+                }
+
                 let answer = self.act_on_service(&name, index, action);
 
                 // What was asked for is begun now, not at the next check.
@@ -15663,7 +15702,7 @@ impl Daemon {
             }
         }
 
-        // Section 9.13: each service's instances, each under the relay
+        // Section 9.17: each service's instances, each under the relay
         // that carries its output.
 
         for (name, service) in &self.services {

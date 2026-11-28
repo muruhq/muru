@@ -1,4 +1,4 @@
-"""Services (design specification section 9.13).
+"""Services (design specification section 9.17).
 
 A `[service.NAME]` table in an applied file names a command the daemon
 keeps running: it starts the instances, starts again one that exits by
