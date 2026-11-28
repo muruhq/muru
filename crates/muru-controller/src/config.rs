@@ -6811,6 +6811,7 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         ),
         stop_signal: table.stop_signal.clone().unwrap_or_default(),
         restart: table.restart.as_ref().map(restart_settings_from),
+        wait_services: false,
         entrypoint: table.entrypoint.clone(),
         interface: table
             .interface

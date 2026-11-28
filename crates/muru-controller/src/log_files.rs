@@ -36,7 +36,8 @@ impl Existing {
                 .contains(&(log.app.clone(), log.release.clone())),
             Kind::Host => !self.hosts.contains_key(&log.name),
             Kind::Commands => !self.apps.contains(&log.app),
-            Kind::Service => !self.services.contains(&log.release),
+            Kind::Service if log.app.is_empty() => !self.services.contains(&log.release),
+            Kind::Service => !self.apps.contains(&log.app),
             _ => false,
         }
     }
@@ -214,6 +215,25 @@ pub fn list(directory: &Path, existing: Option<&Existing>) -> io::Result<Vec<Log
             let qualified = format!("apps/{app}/{name}");
             let classify =
                 |base: &str, existing: Option<&Existing>| release_log(&app, base, existing);
+            add(&mut logs, &qualified, &metadata, existing, classify);
+        }
+
+        // Section 9.17: the logs of the application's services, which
+        // go on across its releases.
+
+        for (name, metadata) in regular_files(&app_directory.join("services"))? {
+            let qualified = format!("apps/{app}/services/{name}");
+            let classify = |base: &str, existing: Option<&Existing>| {
+                let service = base.strip_suffix(".log")?;
+
+                Some(Classified {
+                    kind: Kind::Service,
+                    app: app.clone(),
+                    release: service.to_owned(),
+                    hosts: Vec::new(),
+                    orphaned: existing.is_some_and(|existing| !existing.apps.contains(&app)),
+                })
+            };
             add(&mut logs, &qualified, &metadata, existing, classify);
         }
 

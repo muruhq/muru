@@ -1490,10 +1490,18 @@ fn main() -> anyhow::Result<()> {
             service::ServiceCommand::List {
                 state,
                 quiet,
+                app,
                 deployment,
                 socket,
                 output,
-            } => runtime.block_on(service::list(socket, output.json, state, quiet, deployment)),
+            } => runtime.block_on(service::list(
+                socket,
+                output.json,
+                state,
+                quiet,
+                app,
+                deployment,
+            )),
             service::ServiceCommand::Status {
                 named,
                 socket,

@@ -470,6 +470,9 @@ pub struct Setting {
     /// How each instance's log relay is started; none starts the
     /// instances directly, as the tests do.
     pub relays: Option<crate::servers::Relays>,
+    /// For a project's service, the application and the release it is
+    /// of; none for a node's.
+    pub owner: Option<(String, String)>,
 }
 
 impl Setting {
@@ -603,8 +606,11 @@ pub struct InstanceStatus {
 /// A service as `service list` and `status` give it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
-    /// Its name.
+    /// Its name: a node's own, or `APP/NAME` for a project's.
     pub name: String,
+    /// For a project's service, the application and the release it is
+    /// of.
+    pub owner: Option<(String, String)>,
     /// Its definition.
     pub table: Table,
     /// The least healthy of its instances' states.
@@ -647,6 +653,10 @@ pub struct Service {
     /// Whether the instances are to be started once the retiring ones
     /// have gone.
     start_after_retiring: bool,
+    /// The retiring instances run on beside the new ones, and are asked
+    /// to stop once the new ones are ready or this time has passed: a
+    /// changeover that starts first.
+    overlap_until: Option<Instant>,
     /// Each instance's readiness, by index.
     probes: BTreeMap<u32, Probe>,
     /// Each instance's last exits, by index.
@@ -731,6 +741,7 @@ impl Service {
             supervisor: Box::new(supervisor),
             retiring: None,
             start_after_retiring: false,
+            overlap_until: None,
             probes,
             history: BTreeMap::new(),
             rolling: VecDeque::new(),
@@ -1039,6 +1050,89 @@ impl Service {
         }
     }
 
+    /// The application and the release a project's service is of.
+    pub fn owner(&self) -> Option<&(String, String)> {
+        self.setting.owner.as_ref()
+    }
+
+    /// Change over to another release's instances (section 9.17): what
+    /// runs was started for the release before, and `setting` is the new
+    /// release's. With `start_first` the new instances are started at
+    /// once and the old ones asked to stop when the new are ready, or
+    /// when their readiness timeout has passed if they never are, so
+    /// that there is no gap; otherwise the old ones are stopped and the
+    /// new started once they have gone, so that there are never two. A
+    /// service stopped by hand stays stopped, and one that does not
+    /// start automatically is not carried over.
+    pub fn replace(&mut self, setting: Setting, start_first: bool) {
+        let start = autostart_of(&setting.table) && !self.held;
+        self.setting = setting;
+        self.readiness = Readiness::of(&self.setting.table);
+        self.removing = false;
+
+        let fresh = Supervisor::idle(
+            self.setting.spec(&self.dropped),
+            policy_of(&self.setting.table),
+            self.setting.instances(),
+        );
+        let mut old = std::mem::replace(&mut self.supervisor, Box::new(fresh));
+
+        // A changeover already under way is ended: what was retiring
+        // goes at once, and what was current retires in its turn.
+
+        if let Some(earlier) = self.retiring.take() {
+            earlier.kill_all();
+            earlier.release();
+        }
+
+        self.probes.clear();
+        self.rolling.clear();
+        self.rolling_at = None;
+
+        if start_first && start && old.running() > 0 {
+            for position in 0..self.supervisor.instances().count() {
+                self.supervisor.start_instance(position);
+            }
+
+            self.start_after_retiring = false;
+            self.overlap_until = Some(Instant::now() + self.readiness.timeout);
+        } else {
+            let kill_at = Instant::now() + stop_timeout_of(&self.setting.table);
+
+            for position in 0..old.instances().count() {
+                old.stop(position, kill_at);
+            }
+
+            self.start_after_retiring = start;
+            self.overlap_until = None;
+        }
+
+        self.retiring = Some(old);
+    }
+
+    /// Stop the instances without holding the service, as its
+    /// application's host stopping for idleness does: `resume` starts
+    /// them again.
+    pub fn pause(&mut self) {
+        let kill_at = Instant::now() + stop_timeout_of(&self.setting.table);
+
+        for position in 0..self.supervisor.instances().count() {
+            self.supervisor.stop(position, kill_at);
+        }
+    }
+
+    /// Start what `pause` stopped, unless the service is held or does
+    /// not start automatically.
+    pub fn resume(&mut self) {
+        if self.held || !autostart_of(&self.setting.table) {
+            return;
+        }
+
+        for position in 0..self.supervisor.instances().count() {
+            self.supervisor.start_instance(position);
+        }
+    }
+
     /// Stop every instance because the service is no longer declared.
     /// `gone` says when nothing of it is left.
     pub fn remove(&mut self) {
@@ -1073,6 +1167,30 @@ impl Service {
         // The instances a changed definition is replacing go first.
 
         if let Some(retiring) = &mut self.retiring {
+            // In a changeover that starts first, the old instances are
+            // asked to stop once every new one is ready, or when the new
+            // ones have had the time they have to be.
+
+            if let Some(until) = self.overlap_until {
+                let ready = self.supervisor.instances().all(|instance| {
+                    instance.state() == State::Running
+                        && self
+                            .probes
+                            .get(&instance.index())
+                            .is_some_and(|probe| probe.ready && probe.pid == instance.pid())
+                });
+
+                if ready || until <= Instant::now() {
+                    let kill_at = Instant::now() + stop_timeout_of(&self.setting.table);
+
+                    for position in 0..retiring.instances().count() {
+                        retiring.stop(position, kill_at);
+                    }
+
+                    self.overlap_until = None;
+                }
+            }
+
             reports.extend(retiring.check().await);
 
             if retiring.running() == 0 {
@@ -1303,7 +1421,10 @@ impl Service {
 
     /// The least healthy of the instances' states.
     fn worst(&self) -> &'static str {
-        if self.retiring.is_some() {
+        // While the old instances of a changeover that stops first are
+        // going, nothing of the new runs yet.
+
+        if self.retiring.is_some() && self.overlap_until.is_none() {
             return "stopping";
         }
 
@@ -1349,6 +1470,7 @@ impl Service {
 
         Status {
             name: self.setting.name.clone(),
+            owner: self.setting.owner.clone(),
             table: self.setting.table.clone(),
             state: self.worst(),
             since_unix_ms: self.since_unix_ms,
@@ -1411,7 +1533,11 @@ impl Service {
     /// Leave the instances running and forget them, for a daemon that
     /// detaches.
     pub fn release(self) {
+        // What a changeover is still stopping is in no record, so the
+        // next daemon could not find it: it is killed here.
+
         if let Some(retiring) = self.retiring {
+            retiring.kill_all();
             retiring.release();
         }
 
@@ -1543,6 +1669,7 @@ mod tests {
             identity: None,
             log: dir.join("service.log"),
             relays: None,
+            owner: None,
         }
     }
 
@@ -1840,6 +1967,81 @@ mod tests {
                     .all(|(instance, pid)| instance.pid != *pid)
         })
         .await;
+        service.stop_until(std::time::Instant::now()).await;
+    }
+
+    #[tokio::test]
+    async fn a_changeover_to_another_release_stops_first_or_starts_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let of = |release: u32, seconds: u32| {
+            let table = format!(
+                "command = ['/bin/sleep', '{seconds}']\nreadiness = {{ after = '300ms' }}\n"
+            );
+            let mut setting = setting(dir.path(), "shop/worker", &table);
+            setting.dirs = HostDirs {
+                sockets: dir.path().join(format!("run/r{release}")),
+                files: dir.path().join(format!("files/r{release}")),
+            };
+            setting.owner = Some(("shop".to_owned(), format!("r{release}")));
+            setting
+        };
+        let pid = |service: &Service| service.status().instances[0].pid;
+
+        // Whether a process is there, without reaping it, which would
+        // keep its supervisor from seeing it end.
+
+        let there = |pid: u32| crate::host::signal_process(pid, 0);
+        let mut service = Service::begin(of(1, 600), false, Begin::Start).unwrap();
+        settle(&mut service, |status| status.state == "running").await;
+        let first = pid(&service);
+
+        // Stopping first, there are never two: the new one is started
+        // once the old has gone.
+
+        service.replace(of(2, 601), false);
+        assert_eq!(service.status().state, "stopping");
+        assert_eq!(service.owner().unwrap().1, "r2");
+        settle(&mut service, |status| status.instances[0].pid != 0).await;
+        assert!(!there(first));
+        settle(&mut service, |status| status.state == "running").await;
+        let second = pid(&service);
+        assert_ne!(second, first);
+
+        // Starting first, there is no gap: the old one runs on until the
+        // new is ready, and is stopped then.
+
+        service.replace(of(3, 602), true);
+        settle(&mut service, |status| status.instances[0].pid != 0).await;
+        assert!(there(second));
+        assert_eq!(service.status().state, "starting");
+        settle(&mut service, |status| status.state == "running").await;
+        let third = pid(&service);
+        assert_ne!(third, second);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+
+        while there(second) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the old one never stopped"
+            );
+            let _ = service.check().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Nothing was counted as a restart or an exit of its own.
+
+        assert_eq!(service.status().restarts, 0);
+        assert!(service.exits().next().is_none());
+
+        // One stopped by hand stays stopped when the release changes.
+
+        service.stop(None, None).unwrap();
+        settle(&mut service, |status| status.state == "stopped").await;
+        service.replace(of(4, 603), true);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        settle(&mut service, |status| status.state == "stopped").await;
+        assert!(service.held());
+        assert!(!there(third));
         service.stop_until(std::time::Instant::now()).await;
     }
 

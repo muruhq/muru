@@ -4923,6 +4923,12 @@ pub struct DeployArgs {
     #[arg(long)]
     hold: bool,
 
+    /// Wait as well for the release's services that start automatically
+    /// to be running, and fail when one is not within its readiness
+    /// timeout; the release is serving all the same.
+    #[arg(long, conflicts_with_all = ["no_wait", "hold"])]
+    wait_services: bool,
+
     /// With --hold, open an entry link to the release's preview in the
     /// browser once it is ready.
     #[arg(long, requires = "hold", conflicts_with_all = ["no_wait", "dry_run"])]
@@ -5311,6 +5317,7 @@ impl ReleaseArgs {
                 .map(|timeout| timeout.as_millis() as u64),
             stop_signal: self.stop_signal.unwrap_or_default(),
             restart: restart_settings(&self.restart),
+            wait_services: false,
             entrypoint: self.entrypoint.unwrap_or_default(),
             interface: self
                 .interface
@@ -5454,6 +5461,7 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
         release: args.release.unwrap_or_default(),
         wait: !args.no_wait,
         hold: args.hold,
+        wait_services: args.wait_services,
         override_freeze: args.override_freeze,
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         retain_workers: args.retain_workers,

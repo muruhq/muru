@@ -2372,8 +2372,12 @@ struct Daemon {
     /// Issue 393: the releases restored at the daemon's start whose
     /// start failed and is to be tried again, by application and release.
     restores: HashMap<(String, String), RestoreRetry>,
-    /// Section 9.17: the services, by name.
+    /// Section 9.17: the services, by name: a node's by its own, and a
+    /// project's as `APP/NAME`.
     services: BTreeMap<String, crate::services::Service>,
+    /// Section 9.17: why a project's service could not be brought up for
+    /// its release, as last said, so that it is said once.
+    service_failures: BTreeMap<String, String>,
     /// Issue 693: the applications whose rollout is being promoted.
     promoting: BTreeSet<String>,
     /// Issue 699: the releases being stopped beside the loop.
@@ -2916,6 +2920,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         start_queue: HashMap::new(),
         restores: HashMap::new(),
         services: BTreeMap::new(),
+        service_failures: BTreeMap::new(),
         promoting: BTreeSet::new(),
         stops: HashMap::new(),
         booted,
@@ -3176,6 +3181,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
                 daemon.check_edge().await;
                 daemon.check_hosts().await;
+                daemon.sync_app_services().await;
                 daemon.check_services().await;
                 daemon.run_schedules().await;
                 daemon.expire_sticky().await;
@@ -6802,6 +6808,7 @@ impl Daemon {
             identity,
             log,
             relays: Some(self.server_relays(name)?),
+            owner: None,
         })
     }
 
@@ -6880,6 +6887,355 @@ impl Daemon {
         }
     }
 
+    /// Section 9.17: what a project's service starts from, for the
+    /// release it is of. It runs with what a command of the release runs
+    /// with (ADR 0040): the release's environment and secrets, its
+    /// interpreter first on `PATH`, the application's user, in the
+    /// release's source directory, with `python` as its first word
+    /// standing for the release's interpreter. A managed server
+    /// release's service has that release's environment and no
+    /// interpreter. Its directories are numbered for the service and,
+    /// under that, for the release, since two releases' instances run
+    /// side by side in a changeover that starts first.
+    async fn app_service_setting(
+        &self,
+        release: &Release,
+        name: &str,
+        table: &muru_config::Service,
+        number: u64,
+    ) -> Result<crate::services::Setting, String> {
+        let (app, id) = (release.app.as_str(), release.id.as_str());
+        let spec = &release.spec;
+        let subject = format!("{app}@{id}");
+        let address = format!("{app}/{name}");
+        let identity = self.resolve_identity(app, &subject)?;
+        let of_service = self.locations.service_dirs(number);
+        let own = format!("r{}", release.number);
+        let dirs = HostDirs {
+            sockets: of_service.sockets.join(&own),
+            files: of_service.files.join(&own),
+        };
+        let secrets_dir = dirs.files.join(SECRETS_DIR);
+        let log = self.locations.app_service_log(app, name);
+        let owned = [
+            dirs.sockets.clone(),
+            dirs.files.clone(),
+            secrets_dir.clone(),
+        ];
+
+        for path in &owned {
+            std::fs::create_dir_all(path)
+                .map_err(|error| format!("creating {}: {error}", path.display()))?;
+        }
+
+        if let Some(parent) = log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log);
+
+        // The release's own variables and the service's are resolved
+        // apart: the first are what everything of the release starts
+        // from, and the second go over them.
+
+        let release_env = resolve_env(&self.secrets, &spec.env, &secrets_dir).await?;
+        let specs = table
+            .env
+            .iter()
+            .map(|(variable, value)| crate::config::env_spec_from_table(variable, value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let env = resolve_env(&self.secrets, &specs, &secrets_dir).await?;
+
+        if let Some(identity) = identity {
+            for path in owned.iter().chain([&log]) {
+                identity.own(path).map_err(|error| {
+                    format!(
+                        "giving {} to the application's user failed: {error}",
+                        path.display()
+                    )
+                })?;
+            }
+
+            own_secret_files(identity, &secrets_dir)?;
+        }
+
+        let mut table = table.clone();
+
+        let base = if spec.http.is_some() {
+            self.server_environment(release_env, app, id, spec, identity)
+        } else {
+            // A release that builds its environment has it once it has
+            // started.
+
+            let python = if spec.build.builds {
+                let python = crate::provision::Provisioning::environment_dir(
+                    &self.locations.state.path,
+                    app,
+                    id,
+                )
+                .join("bin")
+                .join("python");
+
+                if !python.is_file() {
+                    return Err(format!("{subject} has no environment built yet"));
+                }
+
+                python
+            } else {
+                spec.python.clone()
+            };
+
+            let library = self.runtime_library(&python).await?;
+            let pycache = self.pycache_prefix(app, id, spec, identity);
+            let places = self.places(app, id, identity);
+            self.make_places(spec, &places, identity)
+                .map_err(|message| format!("{subject}: {message}"))?;
+            let bytecode = Some(spec.bytecode.effective());
+            let base = self.daemon_base(bytecode, identity);
+            table.command = crate::commands::with_interpreter(table.command, &python);
+
+            crate::commands::environment(
+                release_env,
+                &crate::commands::Interpreter {
+                    python: &python,
+                    runtime: library.pythonpath.as_deref(),
+                    pycache: pycache.as_deref(),
+                    bytecode,
+                    base: Some(&base),
+                    places: &places.variables(),
+                },
+                app,
+                id,
+                &spec.source,
+            )
+        };
+
+        let cwd = match &table.cwd {
+            Some(inside) => spec.source.join(inside),
+            None => spec.source.clone(),
+        };
+
+        Ok(crate::services::Setting {
+            name: address.clone(),
+            table,
+            dirs,
+            cwd,
+            base,
+            env,
+            identity,
+            log,
+            relays: Some(self.server_relays(&address)?),
+            owner: Some((app.to_owned(), id.to_owned())),
+        })
+    }
+
+    /// Section 9.17: make each application's services those of its
+    /// serving release, the one the store names as current. A release
+    /// that becomes current brings its services with it: one the release
+    /// before also had changes over as its `switch` says, one that is
+    /// new is started, and one the new release does not declare, or
+    /// whose application has no serving release any more, is stopped.
+    /// A release that is held, retained or a rollout's candidate is not
+    /// current and runs none; one whose host is being started again is
+    /// still current, so its services run on. This is called on every
+    /// check, so the services follow a switch within a second.
+    async fn sync_app_services(&mut self) {
+        let mut wanted: BTreeMap<String, (Release, String, muru_config::Service)> = BTreeMap::new();
+
+        for app in self.store.apps().unwrap_or_default() {
+            let Some(current) = &app.current else {
+                continue;
+            };
+
+            let Ok(release) = self.store.release(&app.name, current) else {
+                continue;
+            };
+
+            for (name, table) in &release.spec.services {
+                wanted.insert(
+                    format!("{}/{name}", app.name),
+                    (release.clone(), name.clone(), table.clone()),
+                );
+            }
+        }
+
+        // What no serving release declares any more is stopped, and
+        // forgotten once nothing of it runs.
+
+        for (address, service) in &mut self.services {
+            let Some((app, _)) = service.owner().cloned() else {
+                continue;
+            };
+
+            if wanted.contains_key(address) || service.removing() {
+                continue;
+            }
+
+            service.remove();
+            self.events.emit(
+                "service.changed",
+                address,
+                "info",
+                "its application's serving release does not declare it; its instances are stopped",
+            );
+
+            if let Some((_, name)) = address.split_once('/') {
+                let _ = self.store.forget_app_service(&app, name);
+            }
+
+            self.service_failures.remove(address);
+        }
+
+        for (address, (release, name, table)) in wanted {
+            let of_same = self
+                .services
+                .get(&address)
+                .and_then(|service| service.owner().cloned())
+                .is_some_and(|(_, id)| id == release.id);
+            let removing = self
+                .services
+                .get(&address)
+                .is_some_and(crate::services::Service::removing);
+
+            if of_same && !removing {
+                continue;
+            }
+
+            let (number, held) = match self.store.app_service(&release.app, &name) {
+                Ok(kept) => kept,
+                Err(error) => {
+                    tracing::error!(%error, "reading what is kept of {address} failed");
+                    continue;
+                }
+            };
+
+            let setting = match self
+                .app_service_setting(&release, &name, &table, number)
+                .await
+            {
+                Ok(setting) => setting,
+                Err(error) => {
+                    // Said once for each reason: the next check tries
+                    // again, which is how a release whose environment is
+                    // still being built gets its services.
+
+                    if self.service_failures.get(&address) != Some(&error) {
+                        self.events.emit(
+                            "service.failed",
+                            &address,
+                            "error",
+                            &format!("the service could not be started: {error}"),
+                        );
+                        self.service_failures.insert(address.clone(), error);
+                    }
+
+                    continue;
+                }
+            };
+
+            self.service_failures.remove(&address);
+            let record_path = setting.dirs.files.join(crate::services::RECORD);
+            let start_first = table.switch == Some(muru_config::ServiceSwitch::StartFirst);
+            let subject = format!("{}@{}", release.app, release.id);
+
+            if let Some(service) = self.services.get_mut(&address) {
+                // Another release's instances run: they change over.
+
+                service.replace(setting, start_first);
+                write_record(&record_path, &service.record());
+                self.events.emit(
+                    "service.changed",
+                    &address,
+                    "info",
+                    &format!(
+                        "{subject} takes over; {}",
+                        match start_first {
+                            true =>
+                                "its instances are started, and the old ones stopped once \
+                                     they are ready",
+                            false => "the old instances are stopped, and its own started then",
+                        }
+                    ),
+                );
+                continue;
+            }
+
+            // Nothing of it runs under this daemon: what a daemon before
+            // recorded for this release is taken over, and it is started
+            // otherwise unless it is held or started only by hand. One
+            // whose host is stopped for idleness waits to be woken, when
+            // that is what it asks for.
+
+            let record = read_record::<crate::supervisor::Record>(&record_path)
+                .filter(|record| !record.instances.is_empty());
+            let idle = table.on_idle == Some(muru_config::ServiceIdle::Stop)
+                && matches!(
+                    self.running
+                        .get(&(release.app.clone(), release.id.clone()))
+                        .map(|running| &running.backend),
+                    Some(Backend::Dormant)
+                );
+
+            let begin = match &record {
+                Some(record) => crate::services::Begin::Adopt(record),
+                None if crate::services::autostart_of(&table) && !held && !idle => {
+                    crate::services::Begin::Start
+                }
+                None => crate::services::Begin::Idle,
+            };
+
+            match crate::services::Service::begin(setting, held, begin) {
+                Ok(service) => {
+                    let (kind, message) = match record.is_some() {
+                        true => (
+                            "service.adopted",
+                            crate::services::adoption_message(&service.adopted()),
+                        ),
+                        false => (
+                            "service.changed",
+                            format!(
+                                "{subject} serves: {}",
+                                crate::services::describe_change(None, service.table())
+                            ),
+                        ),
+                    };
+
+                    self.events.emit(kind, &address, "info", &message);
+                    write_record(&record_path, &service.record());
+                    self.services.insert(address, service);
+                }
+                Err(error) => self.events.emit(
+                    "service.failed",
+                    &address,
+                    "error",
+                    &format!("the service could not be started: {error}"),
+                ),
+            }
+        }
+    }
+
+    /// Section 9.17: the services of an application that follow its host
+    /// when it stops for idleness (`on_idle = 'stop'`) are stopped with
+    /// it, or started as it is woken.
+    fn idle_app_services(&mut self, app: &str, woken: bool) {
+        for service in self.services.values_mut() {
+            let follows = service.owner().is_some_and(|(owner, _)| owner == app)
+                && service.table().on_idle == Some(muru_config::ServiceIdle::Stop);
+
+            if !follows {
+                continue;
+            }
+
+            match woken {
+                true => service.resume(),
+                false => service.pause(),
+            }
+        }
+    }
+
     /// Section 9.17: every recorded service, as the daemon starts.
     async fn begin_services(&mut self) {
         let fresh = self.booted;
@@ -6944,6 +7300,12 @@ impl Daemon {
         let declared: BTreeSet<&str> = stored.iter().map(|stored| stored.name.as_str()).collect();
 
         for (name, service) in &mut self.services {
+            // A project's service follows its release, not the files.
+
+            if service.owner().is_some() {
+                continue;
+            }
+
             if !declared.contains(name.as_str()) && !service.removing() {
                 service.remove();
                 self.events.emit(
@@ -7093,7 +7455,12 @@ impl Daemon {
             &service.record(),
         );
 
-        if let Err(error) = self.store.set_service_held(name, held) {
+        let recorded = match name.split_once('/') {
+            Some((app, service)) => self.store.set_app_service_held(app, service, held),
+            None => self.store.set_service_held(name, held),
+        };
+
+        if let Err(error) = recorded {
             tracing::error!(%error, "recording whether a service is held failed");
         }
 
@@ -9786,6 +10153,7 @@ impl Daemon {
                         }
 
                         self.mark_ready(&app, &id, "woken by a request");
+                        self.idle_app_services(&app, true);
                         self.make_worker_room(&subject).await;
                     }
                     Err(error) => {
@@ -12980,6 +13348,7 @@ impl Daemon {
             );
         }
 
+        self.idle_app_services(app, false);
         self.events.emit(
             "release.idle",
             &format!("{app}@{id}"),

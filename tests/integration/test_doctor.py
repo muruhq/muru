@@ -119,7 +119,7 @@ def test_doctor_lists_an_installation_and_fails_on_what_is_wrong(base: Path) -> 
         assert sockets[str(run_dir / "e" / "edge-1.sock")]["condition"] == "answering"
 
         files = {item["what"]: item for item in document["files"]}
-        assert files["state store"]["condition"].startswith("schema 25, ")
+        assert files["state store"]["condition"].startswith("schema 26, ")
         assert files["lock on the state directory"]["condition"] == f"held by pid {pid}"
         assert files["registry entry"]["condition"] == f"locked by pid {pid}"
         assert files["the host of shop@r1, for the next daemon"]["ok"]
@@ -374,7 +374,7 @@ def test_doctor_store_checks_the_store_dumps_its_schema_and_copies_it(base: Path
 
         code, document = report(daemon, "store")
         assert (code, document["ok"]) == (0, True), document
-        assert document["schema_version"] == document["expected_schema_version"] == 25
+        assert document["schema_version"] == document["expected_schema_version"] == 26
         assert document["tables"]["releases"] == 1 and document["tables"]["apps"] == 1
         assert document["bytes"] > 0
         names = [check["check"] for check in document["checks"]]
@@ -384,7 +384,7 @@ def test_doctor_store_checks_the_store_dumps_its_schema_and_copies_it(base: Path
         text = doctor(daemon, "store")
         assert text.returncode == 0, text.stdout + text.stderr
         assert "TABLES\n" in text.stdout
-        assert "ok      schema        version 25, as this muructl expects" in text.stdout
+        assert "ok      schema        version 26, as this muructl expects" in text.stdout
 
         schema = doctor(daemon, "store", "--dump-schema")
         assert schema.returncode == 0

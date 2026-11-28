@@ -486,6 +486,17 @@ impl Locations {
         self.logs.path.join("services").join(format!("{name}.log"))
     }
 
+    /// Where the output of an application's service is written, across
+    /// its releases.
+    pub fn app_service_log(&self, app: &str, name: &str) -> PathBuf {
+        self.logs
+            .path
+            .join("apps")
+            .join(app)
+            .join("services")
+            .join(format!("{name}.log"))
+    }
+
     /// The access log the edge writes, as JSON lines.
     pub fn access_log(&self) -> PathBuf {
         self.logs.path.join("access.log")

@@ -21,13 +21,17 @@ const WAIT: Duration = Duration::from_secs(120);
 /// The services a command is for.
 #[derive(Args, Clone)]
 pub struct Named {
-    /// The services.
+    /// The services: a node's by its name, and a project's as APP/NAME.
     #[arg(value_name = "NAME", required_unless_present = "all")]
     names: Vec<String>,
 
-    /// Every service.
+    /// Every service, or with --app every service of that application.
     #[arg(long, conflicts_with = "names")]
     all: bool,
+
+    /// With --all, only the services of this application.
+    #[arg(long, value_name = "APP", requires = "all")]
+    app: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -44,6 +48,10 @@ pub enum ServiceCommand {
         /// check that no service is in the states named.
         #[arg(long)]
         quiet: bool,
+
+        /// Only the services of this application.
+        #[arg(long, value_name = "APP")]
+        app: Option<String>,
 
         /// Only what this deployment owns.
         #[arg(long, value_name = "NAME")]
@@ -210,9 +218,19 @@ type Client = pb::admin_client::AdminClient<tonic::transport::Channel>;
 
 /// The services asked for, as the daemon has them.
 async fn listed(client: &mut Client, names: &[String]) -> anyhow::Result<pb::ListServicesResponse> {
+    listed_of(client, names, None).await
+}
+
+/// The services asked for, or those of one application.
+async fn listed_of(
+    client: &mut Client,
+    names: &[String],
+    app: Option<&str>,
+) -> anyhow::Result<pb::ListServicesResponse> {
     Ok(client
         .list_services(pb::ListServicesRequest {
             names: names.to_vec(),
+            app: app.unwrap_or_default().to_owned(),
         })
         .await
         .map_err(explain)?
@@ -225,7 +243,7 @@ async fn names_of(client: &mut Client, named: &Named) -> anyhow::Result<Vec<Stri
         return Ok(named.names.clone());
     }
 
-    Ok(listed(client, &[])
+    Ok(listed_of(client, &[], named.app.as_deref())
         .await?
         .services
         .into_iter()
@@ -314,10 +332,11 @@ pub async fn list(
     json: bool,
     states: Vec<String>,
     quiet: bool,
+    app: Option<String>,
     deployment: Option<String>,
 ) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let mut answer = listed(&mut client, &[]).await?;
+    let mut answer = listed_of(&mut client, &[], app.as_deref()).await?;
     answer.services.retain(|service| {
         (states.is_empty() || states.contains(&service.state))
             && deployment

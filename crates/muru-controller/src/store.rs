@@ -118,6 +118,13 @@ CREATE TABLE IF NOT EXISTS services (
     held INTEGER NOT NULL DEFAULT 0,
     resource_version INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS app_services (
+    app TEXT NOT NULL,
+    name TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    held INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (app, name)
+);
 CREATE TABLE IF NOT EXISTS overlays (
     name TEXT PRIMARY KEY,
     spec TEXT NOT NULL,
@@ -211,7 +218,7 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 26;
 
 /// Insert an event that happened at `happened_unix_ms`, or now when none
 /// is given, and drop those past retention. A time ahead of the clock is
@@ -312,7 +319,8 @@ impl Store {
         // (issue 928), given here to the releases that have none, and
         // version 24 the last event recorded from each release's host
         // (issue 982), and version 25 the services of applied files
-        // (issue 486).
+        // (issue 486), and version 26 what is kept of an application's
+        // services across its releases (issue 488).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -1088,6 +1096,7 @@ impl Store {
             connection.execute("DELETE FROM runs WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM gates WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM host_events WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM app_services WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM apps WHERE name = ?1", [name])?;
             Ok(())
         })
@@ -1259,6 +1268,55 @@ impl Store {
     /// Remove a service.
     pub fn delete_service(&self, name: &str) -> Result<(), StoreError> {
         self.with(|connection| Writes { connection }.delete_service(name))
+    }
+
+    /// What is kept of an application's service across its releases
+    /// (section 9.17): the number that names its directories, and
+    /// whether it was stopped by hand. One not kept yet is given the
+    /// number after the highest any service has.
+    pub fn app_service(&self, app: &str, name: &str) -> Result<(u64, bool), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT OR IGNORE INTO app_services (app, name, number) \
+                 VALUES (?1, ?2, (SELECT COALESCE(MAX(number), 0) + 1 FROM (\
+                     SELECT number FROM services UNION ALL SELECT number FROM app_services)))",
+                params![app, name],
+            )?;
+            let (number, held) = connection.query_row(
+                "SELECT number, held FROM app_services WHERE app = ?1 AND name = ?2",
+                params![app, name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )?;
+            Ok((number.max(0) as u64, held))
+        })
+    }
+
+    /// Record whether an application's service was stopped by hand.
+    pub fn set_app_service_held(
+        &self,
+        app: &str,
+        name: &str,
+        held: bool,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE app_services SET held = ?3 WHERE app = ?1 AND name = ?2",
+                params![app, name, held],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Forget an application's service that its serving release no
+    /// longer declares.
+    pub fn forget_app_service(&self, app: &str, name: &str) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute(
+                "DELETE FROM app_services WHERE app = ?1 AND name = ?2",
+                params![app, name],
+            )?;
+            Ok(())
+        })
     }
 
     /// Record whether a service was stopped by hand, and so stays
@@ -2508,7 +2566,8 @@ impl Writes<'_> {
             toml::to_string(service).map_err(|error| StoreError::Decode(error.to_string()))?;
         self.connection.execute(
             "INSERT INTO services (name, number, spec) \
-                 VALUES (?1, (SELECT COALESCE(MAX(number), 0) + 1 FROM services), ?2) \
+                 VALUES (?1, (SELECT COALESCE(MAX(number), 0) + 1 FROM (\
+                     SELECT number FROM services UNION ALL SELECT number FROM app_services)), ?2) \
                  ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, \
                  resource_version = resource_version + 1",
             params![name, encoded],

@@ -2206,6 +2206,16 @@ impl Supervisor {
         futures::future::join_all(stops).await;
     }
 
+    /// Kill every instance's process and group, without waiting for
+    /// them to go, for instances no record will name.
+    pub fn kill_all(&self) {
+        for instance in &self.instances {
+            if let Some(process) = &instance.process {
+                process.force();
+            }
+        }
+    }
+
     /// Leave the instances running and forget them, for a daemon that
     /// detaches. What an instance that exited left running is killed
     /// here: the record has no place for it, so the next daemon would
