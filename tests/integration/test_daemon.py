@@ -131,6 +131,78 @@ def test_drain_takes_the_release_out_of_traffic(daemon: Daemon) -> None:
     assert daemon.releases("shop") == [{"release": "shop@r1", "state": "stopped", "serving": ""}]
 
 
+def test_a_release_of_workers_that_cannot_start_when_the_daemon_does_is_tried_again(
+    tmp_path: Path,
+) -> None:
+    # An application that loads unless the file is there, as one whose
+    # database is not up yet would fail to.
+
+    project = tmp_path / "late"
+    project.mkdir()
+    missing = tmp_path / "database-is-down"
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'late'\nversion = '0.0.0'\n\n"
+        "[tool.muru]\nentrypoint = 'late:application'\nprocesses = 1\n"
+    )
+    (project / "late.py").write_text(
+        "import os\n\n"
+        f"if os.path.exists({str(missing)!r}):\n"
+        "    raise RuntimeError('the database is not up')\n\n\n"
+        "def application(environ, start_response):\n"
+        "    start_response('200 OK', [('Content-Type', 'text/plain')])\n"
+        "    return [b'late']\n"
+    )
+    first = start_daemon(tmp_path)
+    first.deploy("late", project)
+    assert first.get().body == b"late"
+
+    # A shutdown leaves nothing running, as a reboot does, and the next
+    # daemon starts the release afresh.
+
+    first.stop(shutdown=True)
+    missing.touch()
+    second = start_daemon(tmp_path)
+
+    try:
+
+        def events(kind: str) -> list[str]:
+            lines = second.muructl("events").stdout.splitlines()
+            return [line for line in lines if f" {kind} " in line]
+
+        # Each start that fails is followed by when the next is, with
+        # the waits of the default restart policy: one second, then two.
+
+        wait_for = time.monotonic() + 60
+
+        while len(events("release.restarting")) < 2 and time.monotonic() < wait_for:
+            time.sleep(0.2)
+
+        again = events("release.restarting")
+        assert len(again) >= 2, second.muructl("events").stdout
+        assert "could not restart after the daemon restarted (attempt 1): " in again[0]
+        assert again[0].endswith("trying again in 1s")
+        assert "(attempt 2)" in again[1] and again[1].endswith("trying again in 2s")
+        assert "the database is not up" in again[0]
+        assert second.releases("late") == [
+            {"release": "late@r1", "state": "failed", "serving": "yes"}
+        ]
+
+        # Once the application can load, the next attempt brings it back.
+
+        missing.unlink()
+        wait_for = time.monotonic() + 60
+
+        while second.get().status != 200 and time.monotonic() < wait_for:
+            time.sleep(0.2)
+
+        assert second.get().body == b"late"
+        assert second.releases("late") == [
+            {"release": "late@r1", "state": "ready", "serving": "yes"}
+        ]
+    finally:
+        second.stop(shutdown=True)
+
+
 def test_failed_deploy_keeps_the_previous_release_serving(daemon: Daemon) -> None:
     daemon.deploy("shop", SHOP)
     completed = daemon.muructl(
