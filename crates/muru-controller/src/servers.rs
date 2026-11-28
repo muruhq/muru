@@ -1040,6 +1040,23 @@ impl Servers {
         new
     }
 
+    /// The addresses of the instances that exited and are not to be
+    /// started again, `exited` or `failed`: with every one of a release
+    /// among them the edge answers at once (issue 1001).
+    pub fn down(&self) -> Vec<String> {
+        self.binds
+            .iter()
+            .zip(self.supervisor.instances())
+            .filter(|(_, instance)| {
+                matches!(
+                    instance.state(),
+                    supervisor::State::Exited | supervisor::State::Failed
+                )
+            })
+            .map(|(bind, _)| bind.address())
+            .collect()
+    }
+
     /// The addresses of the instances marked starting, which the edge
     /// keeps out of service without ejecting them.
     pub fn starting(&self) -> Vec<String> {

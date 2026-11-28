@@ -1499,6 +1499,7 @@ impl Backend {
             name: format!("{app}@{id}"),
             addresses: servers.addresses(),
             starting: servers.starting(),
+            down: servers.down(),
             protocol: "http1".to_owned(),
             trust_muru_headers: true,
             eject_after: 3,
@@ -14972,9 +14973,9 @@ impl Daemon {
             // it answers (issue 917), which the edge hears in a snapshot.
 
             if let Backend::Servers(servers) = &mut running.backend {
-                let marked = servers.starting();
+                let marked = (servers.starting(), servers.down());
                 let changes = servers.check(&probed(&self.commands, &key.0, &key.1)).await;
-                marks_changed |= servers.starting() != marked;
+                marks_changed |= (servers.starting(), servers.down()) != marked;
 
                 if !changes.is_empty() {
                     write_record(
@@ -16933,6 +16934,7 @@ fn upstream_message(name: &str, table: &muru_config::Upstream) -> anyhow::Result
         sendfile_header: table.sendfile_header.clone().unwrap_or_default(),
         detour: false,
         starting: Vec::new(),
+        down: Vec::new(),
         connect_timeout_ms: millis(table.connect_timeout.as_deref()),
         probe: health.map(|health| pb::UpstreamProbe {
             path: health.path.clone().unwrap_or_default(),

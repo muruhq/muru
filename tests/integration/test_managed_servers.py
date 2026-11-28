@@ -345,6 +345,14 @@ def test_a_crash_loop_is_loud_and_ends_as_the_restart_table_says(
     time.sleep(2.5)
     assert len(events("server.started")) == 3
 
+    # With its one instance failed nothing is going to answer, and a
+    # request is told so at once, not held for one to start.
+
+    asked = time.monotonic()
+    down = daemon.request("/", headers={"Accept": "application/json"})
+    assert (down.status, json.loads(down.body)["reason"]) == (503, "upstream_down")
+    assert time.monotonic() - asked < 2
+
     # A restart by hand starts the instance that was given up on.
 
     broken.unlink()
