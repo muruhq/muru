@@ -6809,6 +6809,7 @@ impl Daemon {
             log,
             relays: Some(self.server_relays(name)?),
             owner: None,
+            sink: None,
         })
     }
 
@@ -7029,6 +7030,7 @@ impl Daemon {
             log,
             relays: Some(self.server_relays(&address)?),
             owner: Some((app.to_owned(), id.to_owned())),
+            sink: None,
         })
     }
 

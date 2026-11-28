@@ -1111,6 +1111,7 @@ fn process_spec(
             watcher: relays.watcher,
             dropped: Arc::clone(dropped),
         }),
+        sink: None,
         stop_signal: stop_signal(spec),
         stop_group: false,
         events: EVENTS,

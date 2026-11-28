@@ -473,6 +473,9 @@ pub struct Setting {
     /// For a project's service, the application and the release it is
     /// of; none for a node's.
     pub owner: Option<(String, String)>,
+    /// Takes the instances' lines in place of the log, where there are
+    /// no relays: `muructl serve` and `muructl run` print them.
+    pub sink: Option<supervisor::Sink>,
 }
 
 impl Setting {
@@ -536,6 +539,7 @@ impl Setting {
                 watcher: relays.watcher,
                 dropped: Arc::clone(dropped),
             }),
+            sink: self.sink.clone(),
             stop_signal: signal_number(self.table.stop_signal.as_deref().unwrap_or("TERM")),
             stop_group: self.table.stop_group.unwrap_or(false),
             events: EVENTS,
@@ -1670,6 +1674,7 @@ mod tests {
             log: dir.join("service.log"),
             relays: None,
             owner: None,
+            sink: None,
         }
     }
 
