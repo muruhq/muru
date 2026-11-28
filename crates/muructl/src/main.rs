@@ -1919,6 +1919,42 @@ pub(crate) fn parse_restart_setting(text: &str) -> Result<(String, String), Stri
     Ok((key.to_owned(), value.to_owned()))
 }
 
+/// A --liveness setting of a managed server as KEY=VALUE, checked as the
+/// `liveness` table's key of that name is.
+pub(crate) fn parse_liveness_setting(text: &str) -> Result<(String, String), String> {
+    let (key, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not KEY=VALUE, for example path=/healthz"))?;
+    let (key, value) = (key.trim(), value.trim());
+
+    match key {
+        "path" => {
+            if !value.starts_with('/') {
+                return Err(format!("path: {value:?} must start with /"));
+            }
+        }
+        "interval" | "timeout" => {
+            if muru_config::parse_duration(value)?.is_zero() {
+                return Err(format!("{key} must be longer than nothing"));
+            }
+        }
+        "failures" => {
+            value
+                .parse::<u32>()
+                .ok()
+                .filter(|count| *count > 0)
+                .ok_or_else(|| format!("failures: {value:?} is not a count of at least 1"))?;
+        }
+        _ => {
+            return Err(format!(
+                "{key:?} is not a liveness setting: path, interval, timeout or failures"
+            ));
+        }
+    }
+
+    Ok((key.to_owned(), value.to_owned()))
+}
+
 /// The memory policy from --memory settings over a project table
 /// (section 7.7), with the defaults of appendix C.
 pub(crate) fn memory_policy(

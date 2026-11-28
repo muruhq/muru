@@ -7826,6 +7826,7 @@ impl Daemon {
             &self.host_log(app, id),
             Some(relays),
             record,
+            Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms),
         )
         .await;
 

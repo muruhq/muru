@@ -207,6 +207,29 @@ impl Drop for Starting {
     }
 }
 
+/// The liveness of one instance in service (issue 491): the check under
+/// way, when the next is due, and how many have failed in a row.
+#[derive(Default)]
+struct Alive {
+    /// The process it is about; none while the instance is out of
+    /// service.
+    pid: Option<u32>,
+    check: Option<tokio::task::JoinHandle<bool>>,
+    due: Option<Instant>,
+    unanswered: u32,
+}
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        if let Some(check) = self.check.take() {
+            check.abort();
+        }
+    }
+}
+
+/// The event of an instance that failed its liveness check.
+const UNRESPONSIVE_EVENT: &str = "server.unresponsive";
+
 /// A restart of every instance by hand (issue 393), one at a time: each
 /// is taken out of service, stopped, started again and waited for until
 /// it answers its readiness probe before the next is touched.
@@ -260,6 +283,14 @@ pub struct Servers {
     readiness_timeout: Duration,
     /// Each instance's starting mark, in the supervisor's order.
     starting: Vec<Starting>,
+    /// The check made of each instance in service, when the release has
+    /// one.
+    liveness: Option<crate::model::LivenessSpec>,
+    /// Each instance's liveness, in the supervisor's order.
+    alive: Vec<Alive>,
+    /// How long an instance stopped for failing its liveness check has
+    /// before it is killed: the release's shutdown timeout.
+    stop_grace: Duration,
     dirs: HostDirs,
     /// Each instance's address, in the supervisor's order.
     binds: Vec<Bind>,
@@ -331,6 +362,9 @@ impl Servers {
             readiness_path: spec.readiness_path.clone(),
             readiness_timeout: readiness_timeout(spec),
             starting: binds.iter().map(|_| Starting::default()).collect(),
+            liveness: spec.liveness.clone(),
+            alive: binds.iter().map(|_| Alive::default()).collect(),
+            stop_grace: grace,
             dirs: dirs.clone(),
             binds,
             supervisor: Box::new(supervisor),
@@ -369,6 +403,7 @@ impl Servers {
         log: &Path,
         relays: Option<Relays>,
         record: &ServersRecord,
+        grace: Duration,
     ) -> anyhow::Result<Self> {
         let mut binds = Vec::new();
 
@@ -428,6 +463,9 @@ impl Servers {
             readiness_path: spec.readiness_path.clone(),
             readiness_timeout: readiness_timeout(spec),
             starting,
+            liveness: spec.liveness.clone(),
+            alive: binds.iter().map(|_| Alive::default()).collect(),
+            stop_grace: grace,
             dirs: dirs.clone(),
             binds,
             supervisor: Box::new(supervisor),
@@ -557,6 +595,110 @@ impl Servers {
 
         self.roll_after();
         reports.append(&mut self.pending);
+        reports.extend(self.ask_alive());
+        reports
+    }
+
+    /// Ask each instance in service whether it still answers (issue
+    /// 491), one check at a time: one that fails enough in a row is
+    /// taken out of service and stopped as one that failed, which the
+    /// restart policy then judges.
+    fn ask_alive(&mut self) -> Vec<Report> {
+        let Some(liveness) = self.liveness.clone() else {
+            return Vec::new();
+        };
+
+        let interval = Duration::from_millis(liveness.interval_ms);
+        let timeout = Duration::from_millis(liveness.timeout_ms);
+        let now = Instant::now();
+        let mut reports = Vec::new();
+        let instances: Vec<(u32, Option<u32>, bool)> = self
+            .supervisor
+            .instances()
+            .map(|instance| (instance.index(), instance.pid(), instance.stopping()))
+            .collect();
+
+        for (position, (index, pid, stopping)) in instances.into_iter().enumerate() {
+            let alive = &mut self.alive[position];
+
+            // One that is starting, stopping or has no process is not
+            // asked, and its count starts over when it serves again.
+
+            if pid.is_none() || stopping || self.starting[position].marked {
+                if alive.pid.is_some() {
+                    *alive = Alive::default();
+                }
+
+                continue;
+            }
+
+            if alive.pid != pid {
+                *alive = Alive::default();
+                alive.pid = pid;
+                alive.due = Some(now + interval);
+                continue;
+            }
+
+            if alive
+                .check
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                let answered = alive
+                    .check
+                    .take()
+                    .and_then(futures::FutureExt::now_or_never)
+                    .and_then(Result::ok)
+                    .unwrap_or(false);
+
+                alive.unanswered = match answered {
+                    true => 0,
+                    false => alive.unanswered + 1,
+                };
+
+                if alive.unanswered >= liveness.failures {
+                    let failed = match liveness.failures {
+                        1 => "its liveness check".to_owned(),
+                        failures => format!("its liveness check {failures} times in a row"),
+                    };
+
+                    reports.push(Report {
+                        kind: UNRESPONSIVE_EVENT,
+                        level: "warning",
+                        message: format!("instance {index} failed {failed} and is stopped"),
+                        outcome: None,
+                        index: Some(index),
+                        change: supervisor::Change::None,
+                    });
+                    *alive = Alive::default();
+
+                    // Out of service at once, with no probe until its
+                    // next process is there.
+
+                    self.starting[position] = Starting {
+                        marked: true,
+                        pid,
+                        probe: None,
+                    };
+                    self.supervisor.fail(
+                        position,
+                        now + self.stop_grace,
+                        format!("failed {failed}"),
+                    );
+                    continue;
+                }
+            }
+
+            if alive.check.is_none() && alive.due.is_none_or(|due| due <= now) {
+                let bind = self.binds[position].clone();
+                let path = liveness.path.clone();
+                alive.due = Some(now + interval);
+                alive.check = Some(tokio::spawn(async move {
+                    probe(&bind, path.as_deref(), timeout).await
+                }));
+            }
+        }
+
         reports
     }
 
@@ -1486,6 +1628,7 @@ mod tests {
             command: command(&["/bin/sleep", "600"]),
             bind: ServerBind::Port,
             instances: 1,
+            liveness: None,
             readiness_path: None,
             readiness_timeout_ms: 1000,
             stop_signal: None,
@@ -1531,6 +1674,7 @@ mod tests {
                 &dir.path().join("output.log"),
                 None,
                 &record,
+                Duration::from_secs(1),
             )
             .await
             .unwrap();

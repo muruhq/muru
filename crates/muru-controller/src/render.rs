@@ -466,6 +466,7 @@ fn workers(
         cwd: None,
         bind: None,
         restart: None,
+        liveness: None,
         instances: None,
         readiness: None,
         stop_signal: None,
@@ -659,6 +660,35 @@ fn managed(
         ),
         give_up_after: writer.given("restart.give_up_after", asked.give_up_after, None),
     };
+
+    // The liveness table, when the release has one: each key the flags
+    // gave, and the defaults of the rest when every setting is written.
+
+    let liveness = http.liveness.as_ref().map(|resolved| {
+        let asked = given.liveness.clone().unwrap_or_default();
+
+        muru_config::Liveness {
+            path: writer.given("liveness.path", asked.path, None),
+            interval: writer.one(
+                "liveness.interval",
+                asked.interval,
+                None,
+                Some(format_ms(resolved.interval_ms)),
+            ),
+            timeout: writer.one(
+                "liveness.timeout",
+                asked.timeout,
+                None,
+                Some(format_ms(resolved.timeout_ms)),
+            ),
+            failures: writer.one(
+                "liveness.failures",
+                asked.failures,
+                None,
+                Some(resolved.failures),
+            ),
+        }
+    });
     let mut env = BTreeMap::new();
 
     for (name, value) in env_from(request) {
@@ -676,6 +706,7 @@ fn managed(
         readiness: (path.is_some() || timeout.is_some())
             .then_some(muru_config::Readiness { path, timeout }),
         restart: (restart != muru_config::Restart::default()).then_some(restart),
+        liveness,
         stop_signal: given.stop_signal,
         timeouts: shutdown_timeout.map(|shutdown_timeout| muru_config::Timeouts {
             shutdown_timeout: Some(shutdown_timeout),

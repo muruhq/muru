@@ -1205,6 +1205,40 @@ pub struct HttpServerSpec {
     /// What happens when an instance exits.
     #[serde(default)]
     pub restart: RestartSpec,
+    /// The check made of each running instance, when the release has
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<LivenessSpec>,
+}
+
+/// The `liveness` table of a managed HTTP release as resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivenessSpec {
+    /// The path asked for, which passes with a 2xx or 3xx answer; any
+    /// HTTP response passes when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How often an instance is asked, in milliseconds.
+    pub interval_ms: u64,
+    /// How long one answer may take, in milliseconds.
+    pub timeout_ms: u64,
+    /// How many failures in a row stop the instance.
+    pub failures: u32,
+}
+
+impl LivenessSpec {
+    /// The check as a phrase, for a plan and a status.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} every {}, restarted after {} in a row",
+            self.path.as_deref().unwrap_or("any answer"),
+            muru_config::format_duration(std::time::Duration::from_millis(self.interval_ms)),
+            match self.failures {
+                1 => "1 failure".to_owned(),
+                failures => format!("{failures} failures"),
+            }
+        )
+    }
 }
 
 /// The `restart` table of a managed HTTP release as resolved: when an

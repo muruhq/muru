@@ -125,6 +125,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `interface` | string | `"auto"` | The interface, when declared rather than detected. `auto`: Detect from the callable: a coroutine function or an object with an `async def __call__` is ASGI, anything else WSGI. `wsgi`: PEP 3333. `asgi`: ASGI 3. `grpc`: gRPC services: the entrypoint is a registration function given a server to add grpcio servicers to. |
 | `kind` | string | `"workers"` | What the release runs: `workers` from an entrypoint, the default, or `http`, an HTTP server started from `command`. `workers`: Muru's own workers, from an entrypoint. `http`: An HTTP server Muru starts and supervises, from a command. |
 | `lazy_imports` | boolean | the source's | Defer imports with unwrapt; when given, it takes the place of the source's `lazy_imports`. |
+| `liveness` | table, {ref}`[app.NAME.release.ID.liveness] <config-deployment-app-name-release-id-liveness>` |  | A check that each running instance of an `http` release still answers; one that fails it is stopped and started again. |
 | `logging` | table, {ref}`[app.NAME.release.ID.logging] <config-deployment-app-name-release-id-logging>` |  | How Python logging is set up in the workers. |
 | `maintenance` | table, {ref}`[host.NAME.maintenance] <config-deployment-host-name-maintenance>` |  | What maintenance mode lets through. |
 | `max_body_size` | string | the host's, else `max_body_size` in `[limits]` | The largest body of a request the release serves, for example 50MB, which the edge enforces. |
@@ -256,6 +257,18 @@ One instrumentation module of a release: a tool such as an import timer or an AP
 | --- | --- | --- | --- |
 | `module` | string | required | The module, as a dotted Python module name. |
 | `settings` | table |  | The settings its `configure` function is given, as a table of any values. |
+
+(config-deployment-app-name-release-id-liveness)=
+## `[app.NAME.release.ID.liveness]`
+
+The `liveness` table of a managed HTTP release: a check made of each instance for as long as it runs.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `failures` | integer | `3` | How many failures in a row stop the instance; at least 1. |
+| `interval` | string | `"10s"` | How often an instance is asked. |
+| `path` | string |  | The path asked for with a GET, which passes with a 2xx or 3xx answer: the readiness `path` when absent, and without either any HTTP response passes. |
+| `timeout` | string | `"2s"` | How long one answer may take. |
 
 (config-deployment-app-name-release-id-logging)=
 ## `[app.NAME.release.ID.logging]`

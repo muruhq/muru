@@ -6218,6 +6218,63 @@ pub(crate) fn restart_spec_from(table: Option<&muru_config::Restart>) -> crate::
     }
 }
 
+/// A request's liveness settings as the `liveness` table they amount to.
+fn liveness_table_from(settings: &pb::LivenessSettings) -> muru_config::Liveness {
+    muru_config::Liveness {
+        path: settings.path.clone(),
+        interval: settings.interval_ms.map(format_ms),
+        timeout: settings.timeout_ms.map(format_ms),
+        failures: settings.failures,
+    }
+}
+
+/// A `liveness` table as a request's liveness settings; a wait that does
+/// not parse is left out, and the validation of the declared release
+/// reports it.
+fn liveness_settings_from(table: &muru_config::Liveness) -> pb::LivenessSettings {
+    pb::LivenessSettings {
+        path: table.path.clone(),
+        interval_ms: duration_field(table.interval.as_ref()),
+        timeout_ms: duration_field(table.timeout.as_ref()),
+        failures: table.failures,
+    }
+}
+
+/// A `liveness` table, already checked, with the defaults filled in:
+/// without a path of its own it asks for the readiness path.
+fn liveness_spec_from(
+    table: &muru_config::Liveness,
+    readiness_path: Option<&str>,
+) -> crate::model::LivenessSpec {
+    let wait = |text: &Option<String>, default: Duration| {
+        duration_field(text.as_ref()).unwrap_or(default.as_millis() as u64)
+    };
+
+    crate::model::LivenessSpec {
+        path: table
+            .path
+            .clone()
+            .or_else(|| readiness_path.map(str::to_owned)),
+        interval_ms: wait(&table.interval, muru_config::DEFAULT_LIVENESS_INTERVAL),
+        timeout_ms: wait(&table.timeout, muru_config::DEFAULT_LIVENESS_TIMEOUT),
+        failures: table
+            .failures
+            .unwrap_or(muru_config::DEFAULT_LIVENESS_FAILURES)
+            .max(1),
+    }
+}
+
+/// A resolved liveness check as the table that declares it, every key
+/// written.
+fn liveness_table_of(spec: &crate::model::LivenessSpec) -> muru_config::Liveness {
+    muru_config::Liveness {
+        path: spec.path.clone(),
+        interval: Some(format_ms(spec.interval_ms)),
+        timeout: Some(format_ms(spec.timeout_ms)),
+        failures: Some(spec.failures),
+    }
+}
+
 /// A resolved restart policy as the table that declares it, every key
 /// written.
 fn restart_table_of(spec: &crate::model::RestartSpec) -> muru_config::Restart {
@@ -6244,6 +6301,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         .as_ref()
         .map(restart_table_from)
         .transpose()?;
+    let liveness = request.liveness.as_ref().map(liveness_table_from);
     let timeouts_given = request.soft_timeout_ms.is_some()
         || request.hard_timeout_ms.is_some()
         || request.hard_drain_grace_ms.is_some()
@@ -6278,6 +6336,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         instances: request.instances,
         readiness,
         restart,
+        liveness,
         stop_signal: (!request.stop_signal.is_empty()).then(|| request.stop_signal.clone()),
         source: Some(request.source.clone()),
         entrypoint: request.entrypoint.clone(),
@@ -6456,6 +6515,12 @@ fn resolve_http_spec(
             readiness_timeout_ms,
             stop_signal: table.stop_signal.clone(),
             restart: restart_spec_from(table.restart.as_ref()),
+            liveness: table.liveness.as_ref().map(|liveness| {
+                liveness_spec_from(
+                    liveness,
+                    (!request.readiness_path.is_empty()).then_some(request.readiness_path.as_str()),
+                )
+            }),
         }),
         layers: crate::model::Layers(env_layers),
         interpreter: None,
@@ -6858,6 +6923,7 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         ),
         stop_signal: table.stop_signal.clone().unwrap_or_default(),
         restart: table.restart.as_ref().map(restart_settings_from),
+        liveness: table.liveness.as_ref().map(liveness_settings_from),
         wait_services: false,
         entrypoint: table.entrypoint.clone(),
         interface: table
@@ -7036,6 +7102,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 timeout: Some(format_ms(http.readiness_timeout_ms)),
             }),
             restart: Some(restart_table_of(&http.restart)),
+            liveness: http.liveness.as_ref().map(liveness_table_of),
             stop_signal: http.stop_signal.clone(),
             max_body_size: spec.limits.max_body_size_text(),
             timeouts: with_served(
@@ -7062,6 +7129,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         cwd: None,
         bind: None,
         restart: None,
+        liveness: None,
         instances: None,
         readiness: None,
         stop_signal: None,
@@ -7281,7 +7349,7 @@ fn describe_http(http: Option<&HttpServerSpec>) -> String {
     };
 
     format!(
-        "{} {:?} bind {} instances {} readiness {}/{}{} restart {}",
+        "{} {:?} bind {} instances {} readiness {}/{}{} restart {}{}",
         http.profile.as_str(),
         http.command,
         http.bind.as_str(),
@@ -7292,7 +7360,11 @@ fn describe_http(http: Option<&HttpServerSpec>) -> String {
             .as_ref()
             .map(|signal| format!(" stop {signal}"))
             .unwrap_or_default(),
-        http.restart.describe()
+        http.restart.describe(),
+        http.liveness
+            .as_ref()
+            .map(|liveness| format!(" liveness {}", liveness.describe()))
+            .unwrap_or_default()
     )
 }
 

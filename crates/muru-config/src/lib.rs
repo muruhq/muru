@@ -317,6 +317,30 @@ pub struct Readiness {
     pub timeout: Option<String>,
 }
 
+/// The `liveness` table of a managed HTTP release (section 9.9): a
+/// check made of each instance for as long as it runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Liveness {
+    /// The path asked for with a GET, which passes with a 2xx or 3xx
+    /// answer: the readiness `path` when absent, and without either any
+    /// HTTP response passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How often an instance is asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10s"))]
+    pub interval: Option<String>,
+    /// How long one answer may take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "2s"))]
+    pub timeout: Option<String>,
+    /// How many failures in a row stop the instance; at least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 3))]
+    pub failures: Option<u32>,
+}
+
 /// A Python logging level (section 11.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
@@ -1092,6 +1116,10 @@ pub struct Release {
     /// What happens when an `http` release's instance exits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<Restart>,
+    /// A check that each running instance of an `http` release still
+    /// answers; one that fails it is stopped and started again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<Liveness>,
     /// The signal that stops an `http` release's instance gracefully:
     /// TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic
     /// profile; the other profiles know their server's.
@@ -5944,7 +5972,7 @@ pub const UPSTREAM_PROTOCOLS: [&str; 3] = ["http1", "h2c", "h2"];
 /// the worker settings, and a workers release takes none of the server
 /// ones.
 pub fn check_release_kind(table: &Release) -> Result<(), String> {
-    let server_keys: [(&str, bool); 8] = [
+    let server_keys: [(&str, bool); 9] = [
         ("profile", table.profile.is_some()),
         ("command", !table.command.is_empty()),
         ("cwd", table.cwd.is_some()),
@@ -5952,6 +5980,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
         ("instances", table.instances.is_some()),
         ("readiness", table.readiness.is_some()),
         ("restart", table.restart.is_some()),
+        ("liveness", table.liveness.is_some()),
         ("stop_signal", table.stop_signal.is_some()),
     ];
 
@@ -6086,6 +6115,32 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
 
     if let Some(restart) = &table.restart {
         check_restart(restart)?;
+    }
+
+    if let Some(liveness) = &table.liveness {
+        if let Some(path) = &liveness.path
+            && !path.starts_with('/')
+        {
+            return Err(format!("liveness.path {path:?} must start with /"));
+        }
+
+        for (key, text) in [
+            ("interval", &liveness.interval),
+            ("timeout", &liveness.timeout),
+        ] {
+            if let Some(text) = text {
+                let duration =
+                    parse_duration(text).map_err(|error| format!("liveness.{key}: {error}"))?;
+
+                if duration.is_zero() {
+                    return Err(format!("liveness.{key} must be longer than nothing"));
+                }
+            }
+        }
+
+        if liveness.failures == Some(0) {
+            return Err("liveness.failures must be at least 1".to_owned());
+        }
     }
 
     match &table.stop_signal {
@@ -10162,6 +10217,52 @@ mod restart_tests {
         assert_eq!(
             check_release_kind(&workers),
             Err("restart applies to a managed HTTP release (kind = 'http')".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_liveness_table_is_read_and_checked() {
+        let server = |liveness: &str| {
+            let release: Release = toml::from_str(&format!(
+                "kind = 'http'\nprofile = 'gunicorn'\ncommand = ['gunicorn', 'shop:app']\n\
+                 cwd = '/srv'\nliveness = {liveness}\n"
+            ))
+            .unwrap();
+            check_release_kind(&release)
+        };
+
+        // Every key has a default, so an empty table is a check.
+
+        assert_eq!(server("{}"), Ok(()));
+        assert_eq!(
+            server("{ path = '/healthz', interval = '5s', timeout = '1s', failures = 2 }"),
+            Ok(())
+        );
+        assert_eq!(
+            server("{ path = 'healthz' }").unwrap_err(),
+            "liveness.path \"healthz\" must start with /"
+        );
+        assert_eq!(
+            server("{ interval = '0s' }").unwrap_err(),
+            "liveness.interval must be longer than nothing"
+        );
+        assert!(
+            server("{ timeout = 'soon' }")
+                .unwrap_err()
+                .starts_with("liveness.timeout: ")
+        );
+        assert_eq!(
+            server("{ failures = 0 }").unwrap_err(),
+            "liveness.failures must be at least 1"
+        );
+        assert!(toml::from_str::<Release>("liveness = { tcp = '127.0.0.1:1' }").is_err());
+
+        // The table is a managed server's, not a release of workers'.
+
+        let workers: Release = toml::from_str("source = '/srv'\nliveness = {}\n").unwrap();
+        assert_eq!(
+            check_release_kind(&workers),
+            Err("liveness applies to a managed HTTP release (kind = 'http')".to_owned())
         );
     }
 }

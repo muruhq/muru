@@ -919,6 +919,7 @@ message DeployRequest {
   optional uint32 initial_processes = 63;   // the workers each group starts with and keeps while the release takes no traffic, where that is fewer than its processes (issue 964); its processes when absent
   map<string, uint32> group_initial_processes = 64; // the same for one named worker group, over initial_processes
   RestartSettings restart = 65;             // what happens when an http release's instance exits; the defaults when absent
+  LivenessSettings liveness = 67;           // the check made of each running instance of an http release; none when absent
   bool wait_services = 66;                  // with wait: answer once the release's services that start automatically are running, or with an error when one is not within its readiness timeout
 }
 
@@ -931,6 +932,15 @@ message RestartSettings {
   optional uint64 max_delay_ms = 4;         // the longest wait, which doubles with each quick exit in a row; 1 min when absent
   optional uint64 stable_after_ms = 5;      // a run this long clears the count of quick exits; 1 min when absent
   optional uint32 give_up_after = 6;        // quick exits in a row after which the instance is left failed; never when absent
+}
+
+// The liveness table of an http release: the check made of each
+// instance for as long as it runs.
+message LivenessSettings {
+  optional string path = 1;                 // the path asked for; the readiness path when absent
+  optional uint64 interval_ms = 2;          // how often an instance is asked; 10 s when absent
+  optional uint64 timeout_ms = 3;           // how long one answer may take; 2 s when absent
+  optional uint32 failures = 4;             // failures in a row that stop the instance; 3 when absent
 }
 
 // What a deploy would do. With refusals nothing would be deployed.
