@@ -98,6 +98,8 @@ Recipes for specific tasks, assuming you already know the basics. The
   run.
 - [Managed HTTP servers](managed-servers.md): gunicorn, uvicorn and
   others run as releases, for a cutover.
+- [Services](services.md): commands the daemon keeps running beside the
+  applications, such as a cache or a queue worker.
 - [Response compression](compression.md): compressing responses at the
   edge.
 - [Connections and keep-alive](connections.md): connection limits and
@@ -201,6 +203,7 @@ error-pages
 auth-subrequests
 upstreams
 managed-servers
+services
 compression
 connections
 worker-groups
