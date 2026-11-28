@@ -132,7 +132,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | 429 | rate_limited |
 | 500 | app_error, redirect_loop, sendfile_refused |
 | 502 | worker_crashed, worker_stalled, worker_unavailable, upstream_failed |
-| 503 | queue_full, no_workers, cold_start_timeout, release_failed, draining, maintenance, read_only, auth_unavailable, edge_overloaded, mount_not_loaded |
+| 503 | queue_full, no_workers, cold_start_timeout, release_failed, draining, maintenance, read_only, auth_unavailable, edge_overloaded, mount_not_loaded, upstream_starting, upstream_down |
 | 504 | deadline, soft_timeout, hard_timeout |
 | 507 | upload_spool_full |
 | 403, 405 | blocked (client class or rule), method_not_allowed |
@@ -145,7 +145,7 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | --- | --- |
 | Configuration | config.applied, config.apply_failed, route.changed, traffic_policy.changed, maintenance.changed, access_log.changed, access_log.reverted |
 | Releases | release.created, release.building, release.built, release.build_failed, release.loaded, release.state_changed, release.removed, rollout.started, rollout.step, rollout.capacity, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden, release.idle, release.woken |
-| Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.oom_killed, worker.recycled, worker.timeout_killed, worker.loop_stalled, worker.gil_stalled, worker.restarted, worker.swap_waiting, restart.started, restart.finished, host.events_dropped, server.started, server.ready, server.exited, server.failed, server.crash_looping, server.gave_up, service.started, service.ready, service.exited, service.failed, service.not_ready, service.crash_looping, service.gave_up, service.daemonised, service.stopped, service.killed, service.restart_stopped, service.adopted, service.changed, service.user_is_root, service.user_not_applied |
+| Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.oom_killed, worker.recycled, worker.timeout_killed, worker.loop_stalled, worker.gil_stalled, worker.restarted, worker.swap_waiting, restart.started, restart.finished, host.events_dropped, server.started, server.ready, server.exited, server.failed, server.crash_looping, server.gave_up, server.unresponsive, service.started, service.ready, service.exited, service.failed, service.not_ready, service.unresponsive, service.crash_looping, service.gave_up, service.daemonised, service.stopped, service.killed, service.restart_stopped, service.adopted, service.changed, service.user_is_root, service.user_not_applied |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired, schedule.end_refused, schedule.over_budget |
 | Platform | daemon.started, daemon.upgraded, daemon.restarted, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, logs.rotated, logs.truncated, logs.pruned, clock.unsynchronised, clock.synchronised |
 | Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable, output.dropping, output.held, output.failing, output.caught_up, output.relay_restarting |

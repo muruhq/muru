@@ -87,7 +87,8 @@ Safeguards keep a broken handler from making things worse:
 - the handler has 2 s, queueing included, from when it is asked;
 - an application is not asked for its own page when the error was one
   of capacity (`no_workers`, `queue_full`, `cold_start_timeout`,
-  `draining`, `release_failed` or `edge_overloaded`), since its workers
+  `upstream_starting`, `upstream_down`, `draining`, `release_failed` or
+  `edge_overloaded`), since its workers
   are what failed;
 - a handler that fails, answers 400 or above, or redirects internally,
   leaves the built-in page in place, so an error never recurses;
