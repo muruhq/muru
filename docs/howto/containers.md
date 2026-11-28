@@ -827,6 +827,14 @@ RUN DJANGO_SECRET_KEY=build /app/.venv/bin/python manage.py collectstatic --noin
 `--static-dir`, `MURU_SERVE_STATIC_DIR` or `static_dir` in the serve
 table names another directory, a relative one taken from the project.
 
+## Services beside the application
+
+A project's [services](services.md#in-a-container), such as a queue's
+worker or a replication sidecar, run in the container beside the
+application. `--services`, `MURU_SERVE_SERVICES` or `services` in the
+serve table chooses which, and a service with `required = true` is part
+of the container's health.
+
 ## Inside the container
 
 `muructl` inside the container talks to `muructl serve` over the admin

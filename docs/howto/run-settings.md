@@ -261,6 +261,13 @@ served; the reload patterns and the access log excludes add the same way.
 A boolean a file turns on has a flag to turn it off for one run:
 `--no-reload`, `--no-https` and `--no-https-only`.
 
+## Services
+
+`muructl run` starts the project's [services](services.md#in-development)
+that start automatically beside the application. `--no-services` turns
+that off for one run, `services = false` in the run table or in
+`muru.local.toml` for good, and `--services worker` picks some.
+
 ## Reload
 
 A development run reloads on change without a flag: it watches the
