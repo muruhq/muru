@@ -23,7 +23,8 @@ stop_timeout = '30s'
 
 ```console
 $ muructl apply -f node.toml
-create-service service redis created: redis-server /etc/redis/muru.conf --daemonize no
+muru: applied
+  create-service  service redis            created
 ```
 
 That is a complete definition. The service starts when it is applied
@@ -35,7 +36,7 @@ is stopped with `TERM`.
 | `description` | none | One line shown by `muructl service list` and `status`. |
 | `command` | required | The program and its arguments, run without a shell. A bare name is found on `PATH`, and a relative path with a directory in it is taken from `cwd`. |
 | `cwd` | a directory of the service's own under the state directory | The directory the command runs in. A relative path is taken from the file's directory. |
-| `env` | none | Environment variables: values, or secret references resolved each time an instance starts, as for a release. |
+| `env` | none | Environment variables: values, or secret references as a release has them, resolved when the daemon starts the service. |
 | `user`, `group`, `umask` | the service user and its primary group; the daemon's umask | Whom the instances run as, when the daemon runs as root. |
 | `autostart` | `true` | Whether the service starts with the daemon. With `false` it is defined and listed, and runs only between `muructl service start` and a stop. |
 | `instances` | `1` | How many copies of the command run. |
@@ -60,7 +61,7 @@ the daemon. Over that come the service's `env` and these:
 | --- | --- |
 | `MURU_SERVICE` | the service's name |
 | `MURU_SERVICE_INDEX` | the instance's index, from 0 |
-| `MURU_SERVICE_RUN_DIR` | a directory of the instance's own under the runtime directory, for a socket; it is removed when the service is stopped |
+| `MURU_SERVICE_RUN_DIR` | a directory of the instance's own under the runtime directory, for a socket; it is removed when the service is removed and when the daemon shuts down |
 
 In `command`, in the values of `env` and in the addresses of
 `readiness`, `{index}` is replaced by the instance's index and
@@ -77,8 +78,12 @@ reported as a `service.daemonised` error: the processes it left are
 stopped and the service is `failed`. Most servers have an option for
 it, such as `--daemonize no` for Redis.
 
-Secrets belong in `env`. A secret reference in `command` is refused,
-since a command line is visible to every user of the node.
+Secrets belong in `env`, which takes a secret by reference. `command`
+takes none: a command line is visible to every user of the node. A
+secret is resolved when the daemon starts the service: when it is
+applied, when the daemon starts, and on `muructl service start` and
+`muructl service restart`. An instance started again after an exit of
+its own has the values its service was started with.
 
 ### More examples
 
@@ -259,8 +264,8 @@ started again a second later each time.
 
 ## Commands
 
-Every command takes `--json`. Where a command takes `NAME` it takes
-several, and `--all` for every service.
+Every command takes `--json`. `status`, `start`, `stop` and `restart`
+take several names, or `--all` for every service.
 
 ### `muructl service list`
 
@@ -293,7 +298,6 @@ service      thumbnailer
 state        backoff since 2026-11-06T09:41:20Z (40s)
 command      thumbnailer --listen 127.0.0.1:91{index}0
 cwd          /var/lib/muru/services/thumbnailer
-user         muru
 autostart    yes
 restart      always, 1s to 60s, stable after 60s
 readiness    tcp 127.0.0.1:91{index}0 within 60s
@@ -305,11 +309,15 @@ instance 2   backoff, starting again in 22s after 7 quick exits in a row
 instance 3   running, pid 61005, up 2d 1h
 
 last exits of instance 2
-  09:39:16  exited with exit status: 1 after 0.4s
-  09:39:48  exited with exit status: 1 after 0.4s
-  09:40:20  exited with exit status: 1 after 0.4s
-  09:41:20  exited with exit status: 1 after 0.4s
+  09:39:16  exited with exit status: 1 after 1s
+  09:39:48  exited with exit status: 1 after 1s
+  09:40:20  exited with exit status: 1 after 1s
+  09:41:20  exited with exit status: 1 after 1s
 ```
+
+The `user` line is there when the table names one. The times an
+instance ran for are as the daemon saw them, which it does once a
+second.
 
 The exits listed are those the daemon has seen since it started. The
 [events](events.md) have every one.
@@ -395,9 +403,25 @@ the daemon knows it was asked for.
 
 ### Elsewhere
 
-`muructl status` has a line for the services, `muructl status
---processes` shows each instance and the process that carries its
-output, and the daemon's dashboard lists the services.
+`muructl status` has a line for the services, which names those that
+are not running or stopped:
+
+```
+services 6 running, 1 backoff (thumbnailer), 1 stopped
+```
+
+`muructl status --processes` shows each instance and the process that
+carries its output, the daemon's [dashboard](dashboard.md) lists the
+services, `muructl logs list` lists their logs, and the [MCP
+server](../reference/mcp-tools.md) has tools that list, show, start,
+stop and restart them.
+
+A service that answers HTTP can be the address of an
+[upstream](upstreams.md), which routes requests to it. That gives a
+server Muru supervises and proxies to with none of a release's
+lifecycle: no deploys, traffic shares, drains or rollbacks. A server
+that should have those is a [managed HTTP
+server](managed-servers.md).
 
 ## Logs
 
@@ -434,16 +458,16 @@ node match them.
 `--dry-run` says what an apply would do before it does it:
 
 ```console
-$ muructl apply -f node.toml --dry-run
-update-service service tunnel would be updated: env changed; its 1 instance is restarted
-update-service service thumbnailer would be updated: instances 4 to 6; 2 instances are started
-remove-service service old-agent would be removed: not declared
+$ muructl apply -f node.toml --prune --dry-run
+muru: plan (nothing changed)
+  update-service  service tunnel           env changed; its 1 instance is restarted
+  update-service  service thumbnailer      instances 4 to 6; 2 instances are started
+  remove-service  service old-agent        not declared; its instances are stopped
 ```
 
 A `failed` service whose definition changes is started again. A
 service stopped by hand stays stopped. A secret that has changed in its
-store reaches a service at its next start, which `muructl service
-restart` brings about.
+store reaches a service when `muructl service restart` restarts it.
 
 ## The daemon stopping and starting
 
@@ -481,11 +505,13 @@ The subject of each event is the service's name.
 | `service.crash_looping` | error | the third quick exit in a row |
 | `service.gave_up` | error | `give_up_after` was reached, and the instance is `failed` |
 | `service.daemonised` | error | the program put itself in the background |
-| `service.stopped` | info | a stop finished |
-| `service.killed` | warning | an instance did not stop within its timeout and was killed |
+| `service.stopped` | info | an instance asked to stop has stopped |
+| `service.restart_stopped` | error | a restart one at a time ended early, an instance not having come back |
+| `service.killed` | warning | an instance did not stop within its timeout and was killed, or was killed with `--kill` |
 | `service.adopted` | info | a daemon took over the running instances |
 | `service.changed` | info | a definition was added, changed or removed, with what that did |
 | `service.user_is_root` | warning | a service started as root |
+| `service.user_not_applied` | warning | a service names a user and the daemon is not root, so its instances run as the daemon does |
 
 ## Metrics
 
