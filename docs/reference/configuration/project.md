@@ -50,6 +50,7 @@ The JSON Schema of the same keys, for an editor that checks TOML against one, is
 | `sendfile_header` | string |  | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile` for the frameworks that send that one. |
 | `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. `source:SUBDIR`, or a relative path, is taken from the project's directory, the release's source, and `media:SUBDIR` from the media part. |
 | `serve` | table, {ref}`[tool.muru.serve] <config-project-tool-muru-serve>` |  | How `muructl serve` runs the project in a container, which the daemon and `muructl run` ignore. |
+| `services` | table of tables, {ref}`[tool.muru.services.NAME] <config-project-tool-muru-services-name>` |  | Services the application declares, by name: commands kept running beside the release while it serves. |
 | `static` | array of tables, {ref}`[[tool.muru.static]] <config-project-tool-muru-static>` |  | The application's own static directories, served by the edge from the release's source, which is the project directory under `muructl run`. |
 | `sync_threads` | integer | `8` | Threads for synchronous code called from an ASGI application. |
 | `threads` | integer | `4` | Application threads per worker. |
@@ -119,6 +120,8 @@ When the daemon runs a command by itself.
 ## `[tool.muru.env.NAME]`
 
 A secret reference in an `[env]` table.
+
+The same keys apply at `[tool.muru.services.NAME.env.NAME]`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -392,6 +395,61 @@ The `[tool.muru.serve]` table (`[serve]` in muru.toml, and in the file `muructl 
 | `timestamps` | boolean | `false` | Whether every line carries the full UTC time. |
 | `trusted_proxy` | array of strings | loopback peers, for their forwarding headers alone | The proxies whose forwarding headers are applied: addresses, CIDR ranges, or loopback, private and unix. A proxy named here also gets a proxy's share of connections and keep-alive timeout. |
 | `uploads_dir` | string | `"uploads"` | The uploads part, never served, a relative one taken from the data directory. |
+
+(config-project-tool-muru-services-name)=
+## `[tool.muru.services.NAME]`
+
+A service, one of the `[service.NAME]` tables: a named command the daemon keeps running, which takes no requests from the edge.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `autostart` | boolean | `true` | Whether the service starts with the daemon. With `false` it is defined and listed, and runs only between `muructl service start` and a stop. |
+| `command` | array of strings |  | The program and its arguments, run without a shell. A bare name is found on `PATH`, and a relative path with a directory in it is taken from `cwd`. `{index}` is the instance's index and `{run_dir}` its own directory under the runtime directory. |
+| `cwd` | string | a directory of the service's own under the state directory | The directory the command runs in. A relative path is taken from the file's directory. |
+| `description` | string |  | One line shown by `muructl service list` and `status`. |
+| `env` | table of strings or tables, {ref}`[tool.muru.env.NAME] <config-project-tool-muru-env-name>` |  | Environment variables: a value, or a secret reference resolved each time an instance starts. `{index}` and `{run_dir}` are filled in a value as in `command`. |
+| `group` | string | the user's primary group | The group the instances run as. |
+| `instances` | integer | `1` | How many copies of the command run. |
+| `on_idle` | string | `"run"` | For a project's service, whether it runs on while the application's host is stopped for idleness (`run`) or stops with it and starts when a request wakes it (`stop`). `run`: It runs on. `stop`: It stops with the host and starts when a request wakes it. |
+| `readiness` | table, {ref}`[tool.muru.services.NAME.readiness] <config-project-tool-muru-services-name-readiness>` |  | How an instance is known to be up. |
+| `reload_signal` | string |  | The signal `muructl service signal NAME reload` sends. |
+| `required` | boolean | `false` | For a project's service under `muructl serve`: the container is not ready while the service is not running, and muructl exits when it has failed. |
+| `restart` | table, {ref}`[tool.muru.services.NAME.restart] <config-project-tool-muru-services-name-restart>` |  | What happens when an instance exits. |
+| `stop_group` | boolean | `false` | Send the stop signal to the instance's whole process group, not its leader alone. The kill after `stop_timeout` always goes to the group. |
+| `stop_signal` | string | `"TERM"` | The signal that asks an instance to stop: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. |
+| `stop_timeout` | string | `"10s"` | How long an instance asked to stop has before it is killed. |
+| `switch` | string | `"stop-first"` | For a project's service, what happens when another release takes over: `stop-first` stops the old release's instances before the new release's are started, and `start-first` starts the new and stops the old once the new are ready. `stop-first`: The old release's instances stop before the new release's start. `start-first`: The new release's instances are ready before the old ones stop. |
+| `umask` | string | the daemon's | The umask of the instances, in octal. |
+| `user` | string | the service user | The user the instances run as, when the daemon runs as root. |
+
+(config-project-tool-muru-services-name-readiness)=
+## `[tool.muru.services.NAME.readiness]`
+
+The `readiness` table of a service: how an instance is known to be up. One of `after`, `tcp`, `unix`, `http` and `command` says how; `after = '1s'` when none does.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `after` | string |  | Ready once the process has stayed up this long. |
+| `command` | array of strings |  | Ready once this command, run as the service's user with its environment, exits 0. |
+| `http` | string |  | Ready once a GET of this `http://` URL answers 2xx or 3xx. |
+| `interval` | string | `"500ms"` | How often a form that probes tries. |
+| `tcp` | string |  | Ready once a TCP connection to this `host:port` is accepted. |
+| `timeout` | string | `"60s"` | How long an instance has to be ready before it is stopped. |
+| `unix` | string |  | Ready once a connection to this Unix socket is accepted. |
+
+(config-project-tool-muru-services-name-restart)=
+## `[tool.muru.services.NAME.restart]`
+
+The `restart` table of a managed HTTP release: what happens when an instance exits.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `delay` | string | `"1s"` | The wait before the next start after a run that lasted, and after the first quick exit. |
+| `give_up_after` | integer |  | Quick exits in a row after which the instance is left failed until it is restarted by hand. Without it the instance is started again every `max_delay`, without end. |
+| `max_delay` | string | `"1m"` | The longest wait: the wait doubles with each quick exit in a row up to this. |
+| `policy` | string | `"always"` | When an instance that exited is started again: `always`, after any exit; `on-failure`, after a failure, with a clean exit left alone; or `never`. `always`: After any exit. `on-failure`: After a failure; a clean exit is left alone. `never`: Never. |
+| `stable_after` | string | `"1m"` | A run this long was not a quick exit, and clears the count of them. |
+| `success_exit_codes` | array of integers | `[0]` | The exit statuses that count as a clean exit. Any other status, and death by a signal, is a failure. |
 
 (config-project-tool-muru-static)=
 ## `[[tool.muru.static]]`

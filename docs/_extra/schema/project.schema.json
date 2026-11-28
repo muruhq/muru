@@ -813,6 +813,72 @@
       },
       "type": "object"
     },
+    "Restart": {
+      "additionalProperties": false,
+      "description": "The `restart` table of a managed HTTP release: what happens when an instance exits.",
+      "properties": {
+        "delay": {
+          "default": "1s",
+          "description": "The wait before the next start after a run that lasted, and after the first quick exit.",
+          "type": "string"
+        },
+        "give_up_after": {
+          "description": "Quick exits in a row after which the instance is left failed until it is restarted by hand. Without it the instance is started again every `max_delay`, without end.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_delay": {
+          "default": "1m",
+          "description": "The longest wait: the wait doubles with each quick exit in a row up to this.",
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/RestartMode",
+          "default": "always",
+          "description": "When an instance that exited is started again: `always`, after any exit; `on-failure`, after a failure, with a clean exit left alone; or `never`."
+        },
+        "stable_after": {
+          "default": "1m",
+          "description": "A run this long was not a quick exit, and clears the count of them.",
+          "type": "string"
+        },
+        "success_exit_codes": {
+          "default": [
+            0
+          ],
+          "description": "The exit statuses that count as a clean exit. Any other status, and death by a signal, is a failure.",
+          "items": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "RestartMode": {
+      "description": "When a supervised process that exited is started again.",
+      "oneOf": [
+        {
+          "const": "always",
+          "description": "After any exit.",
+          "type": "string"
+        },
+        {
+          "const": "on-failure",
+          "description": "After a failure; a clean exit is left alone.",
+          "type": "string"
+        },
+        {
+          "const": "never",
+          "description": "Never.",
+          "type": "string"
+        }
+      ]
+    },
     "RunPort": {
       "anyOf": [
         {
@@ -1360,6 +1426,175 @@
       },
       "type": "object"
     },
+    "Service": {
+      "additionalProperties": false,
+      "description": "A service, one of the `[service.NAME]` tables: a named command the daemon keeps running, which takes no requests from the edge.",
+      "properties": {
+        "autostart": {
+          "default": true,
+          "description": "Whether the service starts with the daemon. With `false` it is defined and listed, and runs only between `muructl service start` and a stop.",
+          "type": "boolean"
+        },
+        "command": {
+          "description": "The program and its arguments, run without a shell. A bare name is found on `PATH`, and a relative path with a directory in it is taken from `cwd`. `{index}` is the instance's index and `{run_dir}` its own directory under the runtime directory.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "description": "The directory the command runs in. A relative path is taken from the file's directory.",
+          "type": "string",
+          "x-default": "a directory of the service's own under the state directory"
+        },
+        "description": {
+          "description": "One line shown by `muructl service list` and `status`.",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "$ref": "#/$defs/EnvValue"
+          },
+          "description": "Environment variables: a value, or a secret reference resolved each time an instance starts. `{index}` and `{run_dir}` are filled in a value as in `command`.",
+          "type": "object"
+        },
+        "group": {
+          "description": "The group the instances run as.",
+          "type": "string",
+          "x-default": "the user's primary group"
+        },
+        "instances": {
+          "default": 1,
+          "description": "How many copies of the command run.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "on_idle": {
+          "$ref": "#/$defs/ServiceIdle",
+          "default": "run",
+          "description": "For a project's service, whether it runs on while the application's host is stopped for idleness (`run`) or stops with it and starts when a request wakes it (`stop`)."
+        },
+        "readiness": {
+          "$ref": "#/$defs/ServiceReadiness",
+          "description": "How an instance is known to be up."
+        },
+        "reload_signal": {
+          "description": "The signal `muructl service signal NAME reload` sends.",
+          "type": "string"
+        },
+        "required": {
+          "default": false,
+          "description": "For a project's service under `muructl serve`: the container is not ready while the service is not running, and muructl exits when it has failed.",
+          "type": "boolean"
+        },
+        "restart": {
+          "$ref": "#/$defs/Restart",
+          "description": "What happens when an instance exits."
+        },
+        "stop_group": {
+          "default": false,
+          "description": "Send the stop signal to the instance's whole process group, not its leader alone. The kill after `stop_timeout` always goes to the group.",
+          "type": "boolean"
+        },
+        "stop_signal": {
+          "default": "TERM",
+          "description": "The signal that asks an instance to stop: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH.",
+          "type": "string"
+        },
+        "stop_timeout": {
+          "default": "10s",
+          "description": "How long an instance asked to stop has before it is killed.",
+          "type": "string"
+        },
+        "switch": {
+          "$ref": "#/$defs/ServiceSwitch",
+          "default": "stop-first",
+          "description": "For a project's service, what happens when another release takes over: `stop-first` stops the old release's instances before the new release's are started, and `start-first` starts the new and stops the old once the new are ready."
+        },
+        "umask": {
+          "description": "The umask of the instances, in octal.",
+          "type": "string",
+          "x-default": "the daemon's"
+        },
+        "user": {
+          "description": "The user the instances run as, when the daemon runs as root.",
+          "type": "string",
+          "x-default": "the service user"
+        }
+      },
+      "type": "object"
+    },
+    "ServiceIdle": {
+      "description": "What a project's service does while its application's host is stopped for idleness.",
+      "oneOf": [
+        {
+          "const": "run",
+          "description": "It runs on.",
+          "type": "string"
+        },
+        {
+          "const": "stop",
+          "description": "It stops with the host and starts when a request wakes it.",
+          "type": "string"
+        }
+      ]
+    },
+    "ServiceReadiness": {
+      "additionalProperties": false,
+      "description": "The `readiness` table of a service: how an instance is known to be up. One of `after`, `tcp`, `unix`, `http` and `command` says how; `after = '1s'` when none does.",
+      "properties": {
+        "after": {
+          "description": "Ready once the process has stayed up this long.",
+          "type": "string"
+        },
+        "command": {
+          "description": "Ready once this command, run as the service's user with its environment, exits 0.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "http": {
+          "description": "Ready once a GET of this `http://` URL answers 2xx or 3xx.",
+          "type": "string"
+        },
+        "interval": {
+          "default": "500ms",
+          "description": "How often a form that probes tries.",
+          "type": "string"
+        },
+        "tcp": {
+          "description": "Ready once a TCP connection to this `host:port` is accepted.",
+          "type": "string"
+        },
+        "timeout": {
+          "default": "60s",
+          "description": "How long an instance has to be ready before it is stopped.",
+          "type": "string"
+        },
+        "unix": {
+          "description": "Ready once a connection to this Unix socket is accepted.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ServiceSwitch": {
+      "description": "How a project's service changes over when another release takes over.",
+      "oneOf": [
+        {
+          "const": "stop-first",
+          "description": "The old release's instances stop before the new release's start.",
+          "type": "string"
+        },
+        {
+          "const": "start-first",
+          "description": "The new release's instances are ready before the old ones stop.",
+          "type": "string"
+        }
+      ]
+    },
     "StaticDir": {
       "additionalProperties": false,
       "description": "A directory of an application's own files, an entry of the `[[tool.muru.static]]` or `[[app.NAME.release.ID.static]]` array: a path prefix the edge serves from a directory under the release's source, with the application taking what no file answers. Served by `muructl run` and the daemon alike, from the release the request was routed to.",
@@ -1711,6 +1946,13 @@
     "serve": {
       "$ref": "#/$defs/ServeSettings",
       "description": "How `muructl serve` runs the project in a container, which the daemon and `muructl run` ignore."
+    },
+    "services": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Service"
+      },
+      "description": "Services the application declares, by name: commands kept running beside the release while it serves.",
+      "type": "object"
     },
     "static": {
       "description": "The application's own static directories, served by the edge from the release's source, which is the project directory under `muructl run`.",

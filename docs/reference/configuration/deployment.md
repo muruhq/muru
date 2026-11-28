@@ -145,6 +145,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `scaling` | table, {ref}`[app.NAME.release.ID.scaling] <config-deployment-app-name-release-id-scaling>` |  | How the default group is scaled; static when absent. |
 | `sendfile_header` | string |  | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile` for the frameworks that send that one. |
 | `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. `source:SUBDIR`, or a relative path, is taken from the release's `source`, and `media:SUBDIR` from the media part. |
+| `services` | table of tables, {ref}`[service.NAME] <config-deployment-service-name>` |  | Services the application declares, by name: commands kept running beside the release while it serves, in place of the source's own. |
 | `source` | string |  | The source directory. A relative path is taken from the file's directory. Required by `muructl apply` for a `workers` release. |
 | `static` | array of tables, {ref}`[[app.NAME.release.ID.static]] <config-deployment-app-name-release-id-static>` |  | The application's own static directories, served by the edge from the release's source, which is the project directory under `muructl run`. |
 | `stop_signal` | string | the profile's, `TERM` | The signal that stops an `http` release's instance gracefully: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic profile; the other profiles know their server's. |
@@ -857,6 +858,8 @@ A route's traffic policy: the share of requests each release takes, the key requ
 
 A service, one of the `[service.NAME]` tables: a named command the daemon keeps running, which takes no requests from the edge.
 
+The same keys apply at `[app.NAME.release.ID.services.NAME]`.
+
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `autostart` | boolean | `true` | Whether the service starts with the daemon. With `false` it is defined and listed, and runs only between `muructl service start` and a stop. |
@@ -866,12 +869,15 @@ A service, one of the `[service.NAME]` tables: a named command the daemon keeps 
 | `env` | table of strings or tables, {ref}`[app.NAME.env.NAME] <config-deployment-app-name-env-name>` |  | Environment variables: a value, or a secret reference resolved each time an instance starts. `{index}` and `{run_dir}` are filled in a value as in `command`. |
 | `group` | string | the user's primary group | The group the instances run as. |
 | `instances` | integer | `1` | How many copies of the command run. |
+| `on_idle` | string | `"run"` | For a project's service, whether it runs on while the application's host is stopped for idleness (`run`) or stops with it and starts when a request wakes it (`stop`). `run`: It runs on. `stop`: It stops with the host and starts when a request wakes it. |
 | `readiness` | table, {ref}`[service.NAME.readiness] <config-deployment-service-name-readiness>` |  | How an instance is known to be up. |
 | `reload_signal` | string |  | The signal `muructl service signal NAME reload` sends. |
+| `required` | boolean | `false` | For a project's service under `muructl serve`: the container is not ready while the service is not running, and muructl exits when it has failed. |
 | `restart` | table, {ref}`[service.NAME.restart] <config-deployment-service-name-restart>` |  | What happens when an instance exits. |
 | `stop_group` | boolean | `false` | Send the stop signal to the instance's whole process group, not its leader alone. The kill after `stop_timeout` always goes to the group. |
 | `stop_signal` | string | `"TERM"` | The signal that asks an instance to stop: TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. |
 | `stop_timeout` | string | `"10s"` | How long an instance asked to stop has before it is killed. |
+| `switch` | string | `"stop-first"` | For a project's service, what happens when another release takes over: `stop-first` stops the old release's instances before the new release's are started, and `start-first` starts the new and stops the old once the new are ready. `stop-first`: The old release's instances stop before the new release's start. `start-first`: The new release's instances are ready before the old ones stop. |
 | `umask` | string | the daemon's | The umask of the instances, in octal. |
 | `user` | string | the service user | The user the instances run as, when the daemon runs as root. |
 

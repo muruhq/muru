@@ -693,6 +693,11 @@ pub struct ReleaseSpec {
     /// Section 9.12: the commands the application declares, by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<CommandSpec>,
+    /// Section 9.17: the services the application declares, by name, as
+    /// their tables, checked: they run beside the release while it is
+    /// its application's serving release.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, muru_config::Service>,
     /// Section 9.14: what the deploy recorded of where the code came
     /// from, as checked against the limits; never in the environment.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

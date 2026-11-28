@@ -2728,6 +2728,7 @@ pub(crate) mod tests {
             build: crate::model::BuildSpec::default(),
             bytecode: crate::model::BytecodeSpec::default(),
             commands: Vec::new(),
+            services: std::collections::BTreeMap::new(),
         }
     }
 

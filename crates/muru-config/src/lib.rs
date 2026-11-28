@@ -179,6 +179,8 @@ words!(ServerProfile {
     Generic => "generic",
 });
 words!(ServerBind { Unix => "unix", Port => "port" });
+words!(ServiceSwitch { StopFirst => "stop-first", StartFirst => "start-first" });
+words!(ServiceIdle { Run => "run", Stop => "stop" });
 words!(RestartMode {
     Always => "always",
     OnFailure => "on-failure",
@@ -1280,6 +1282,11 @@ pub struct Release {
     /// with the release on request, with inputs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub commands: BTreeMap<String, CommandTable>,
+    /// Services the application declares (section 9.17), by name:
+    /// commands kept running beside the release while it serves, in
+    /// place of the source's own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, Service>,
     /// What the deploy recorded about where the release's code came from
     /// (section 9.14): string keys to string values, `commit`, `ref`,
     /// `url`, `description` and `dirty` among them, which the release
@@ -5299,6 +5306,96 @@ pub struct Service {
     /// The signal `muructl service signal NAME reload` sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reload_signal: Option<String>,
+    /// For a project's service, what happens when another release takes
+    /// over: `stop-first` stops the old release's instances before the
+    /// new release's are started, and `start-first` starts the new and
+    /// stops the old once the new are ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "stop-first"))]
+    pub switch: Option<ServiceSwitch>,
+    /// For a project's service, whether it runs on while the
+    /// application's host is stopped for idleness (`run`) or stops with
+    /// it and starts when a request wakes it (`stop`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "run"))]
+    pub on_idle: Option<ServiceIdle>,
+    /// For a project's service under `muructl serve`: the container is
+    /// not ready while the service is not running, and muructl exits
+    /// when it has failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = false))]
+    pub required: Option<bool>,
+}
+
+/// How a project's service changes over when another release takes over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceSwitch {
+    /// The old release's instances stop before the new release's start.
+    #[default]
+    StopFirst,
+    /// The new release's instances are ready before the old ones stop.
+    StartFirst,
+}
+
+/// What a project's service does while its application's host is stopped
+/// for idleness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceIdle {
+    /// It runs on.
+    #[default]
+    Run,
+    /// It stops with the host and starts when a request wakes it.
+    Stop,
+}
+
+/// Check a node's `[service.NAME]` table: as [`check_service`], and none
+/// of the keys that are for a project's service.
+pub fn check_node_service(table: &Service) -> Result<(), String> {
+    for (key, set) in [
+        ("switch", table.switch.is_some()),
+        ("on_idle", table.on_idle.is_some()),
+        ("required", table.required.is_some()),
+    ] {
+        if set {
+            return Err(format!(
+                "{key} is for a service a project declares, which follows its releases"
+            ));
+        }
+    }
+
+    check_service(table)
+}
+
+/// Check a project's service, `[tool.muru.services.NAME]` or a declared
+/// release's: as [`check_service`], with no user of its own, since it
+/// runs as its application does, and a `cwd` inside the release's source.
+pub fn check_project_service(table: &Service) -> Result<(), String> {
+    for (key, set) in [
+        ("user", table.user.is_some()),
+        ("group", table.group.is_some()),
+        ("umask", table.umask.is_some()),
+    ] {
+        if set {
+            return Err(format!(
+                "{key} is not set on a project's service, which runs as its application does"
+            ));
+        }
+    }
+
+    if let Some(cwd) = &table.cwd
+        && (Path::new(cwd).is_absolute()
+            || Path::new(cwd)
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir)))
+    {
+        return Err(format!(
+            "cwd {cwd:?} must be a path inside the release's source directory"
+        ));
+    }
+
+    check_service(table)
 }
 
 /// The `readiness` table of a service: how an instance is known to be
@@ -7529,6 +7626,10 @@ pub struct ToolMuru {
     /// with the release on request, with inputs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub commands: BTreeMap<String, CommandTable>,
+    /// Services the application declares (section 9.17), by name:
+    /// commands kept running beside the release while it serves.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, Service>,
 }
 
 /// A command an application declares, the `[tool.muru.commands.NAME]` or
@@ -9894,6 +9995,59 @@ mod service_tests {
             .starts_with("readiness.interval is for a form that probes")
         );
         assert!(toml::from_str::<Service>("command = ['x']\nports = 1").is_err());
+    }
+
+    #[test]
+    fn a_projects_service_and_a_nodes_take_the_keys_that_are_theirs() {
+        use super::{
+            ServiceIdle, ServiceSwitch, ToolMuru, check_node_service, check_project_service,
+        };
+
+        let project: ToolMuru = toml::from_str(
+            "entrypoint = 'shop.wsgi:application'\n\
+             [services.worker]\ncommand = ['celery', '-A', 'shop', 'worker']\n\
+             instances = 4\nswitch = 'start-first'\non_idle = 'stop'\ncwd = 'tasks'\n\
+             [services.litestream]\ncommand = ['litestream', 'replicate']\nrequired = true\n",
+        )
+        .unwrap();
+        let worker = &project.services["worker"];
+        assert_eq!(worker.switch, Some(ServiceSwitch::StartFirst));
+        assert_eq!(worker.on_idle, Some(ServiceIdle::Stop));
+        assert_eq!(check_project_service(worker), Ok(()));
+        assert_eq!(
+            check_project_service(&project.services["litestream"]),
+            Ok(())
+        );
+
+        // A node's service follows no release.
+
+        assert_eq!(
+            check_node_service(worker).unwrap_err(),
+            "switch is for a service a project declares, which follows its releases"
+        );
+        assert!(
+            check_node_service(&project.services["litestream"])
+                .unwrap_err()
+                .starts_with("required is for a service a project declares")
+        );
+
+        // A project's service runs as its application, inside its source.
+
+        assert_eq!(
+            check_project_service(&service("command = ['x']\nuser = 'redis'")).unwrap_err(),
+            "user is not set on a project's service, which runs as its application does"
+        );
+
+        for cwd in ["/srv/other", "../other"] {
+            let table = service(&format!("command = ['x']\ncwd = '{cwd}'"));
+            assert!(
+                check_project_service(&table)
+                    .unwrap_err()
+                    .ends_with("must be a path inside the release's source directory")
+            );
+        }
+
+        assert!(toml::from_str::<Service>("command = ['x']\nswitch = 'both'").is_err());
     }
 
     #[test]

@@ -2026,6 +2026,13 @@
           },
           "type": "array"
         },
+        "services": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Service"
+          },
+          "description": "Services the application declares, by name: commands kept running beside the release while it serves, in place of the source's own.",
+          "type": "object"
+        },
         "source": {
           "description": "The source directory. A relative path is taken from the file's directory. Required by `muructl apply` for a `workers` release.",
           "type": "string"
@@ -2726,6 +2733,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "on_idle": {
+          "$ref": "#/$defs/ServiceIdle",
+          "default": "run",
+          "description": "For a project's service, whether it runs on while the application's host is stopped for idleness (`run`) or stops with it and starts when a request wakes it (`stop`)."
+        },
         "readiness": {
           "$ref": "#/$defs/ServiceReadiness",
           "description": "How an instance is known to be up."
@@ -2733,6 +2745,11 @@
         "reload_signal": {
           "description": "The signal `muructl service signal NAME reload` sends.",
           "type": "string"
+        },
+        "required": {
+          "default": false,
+          "description": "For a project's service under `muructl serve`: the container is not ready while the service is not running, and muructl exits when it has failed.",
+          "type": "boolean"
         },
         "restart": {
           "$ref": "#/$defs/Restart",
@@ -2753,6 +2770,11 @@
           "description": "How long an instance asked to stop has before it is killed.",
           "type": "string"
         },
+        "switch": {
+          "$ref": "#/$defs/ServiceSwitch",
+          "default": "stop-first",
+          "description": "For a project's service, what happens when another release takes over: `stop-first` stops the old release's instances before the new release's are started, and `start-first` starts the new and stops the old once the new are ready."
+        },
         "umask": {
           "description": "The umask of the instances, in octal.",
           "type": "string",
@@ -2765,6 +2787,21 @@
         }
       },
       "type": "object"
+    },
+    "ServiceIdle": {
+      "description": "What a project's service does while its application's host is stopped for idleness.",
+      "oneOf": [
+        {
+          "const": "run",
+          "description": "It runs on.",
+          "type": "string"
+        },
+        {
+          "const": "stop",
+          "description": "It stops with the host and starts when a request wakes it.",
+          "type": "string"
+        }
+      ]
     },
     "ServiceReadiness": {
       "additionalProperties": false,
@@ -2805,6 +2842,21 @@
         }
       },
       "type": "object"
+    },
+    "ServiceSwitch": {
+      "description": "How a project's service changes over when another release takes over.",
+      "oneOf": [
+        {
+          "const": "stop-first",
+          "description": "The old release's instances stop before the new release's start.",
+          "type": "string"
+        },
+        {
+          "const": "start-first",
+          "description": "The new release's instances are ready before the old ones stop.",
+          "type": "string"
+        }
+      ]
     },
     "StaticDir": {
       "additionalProperties": false,

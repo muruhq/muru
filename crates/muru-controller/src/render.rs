@@ -452,6 +452,7 @@ fn workers(
     writer.whole("error_override", table.error_override.is_some());
     writer.whole("maintenance", table.maintenance.is_some());
     writer.whole("commands", !table.commands.is_empty());
+    writer.whole("services", !table.services.is_empty());
     writer.whole("instrumentation", !table.instrumentation.is_empty());
     writer.whole("preload_modules", !table.preload_modules.is_empty());
     writer.whole("lazy_imports", table.lazy_imports.is_some());
@@ -579,6 +580,7 @@ fn workers(
         error_override: table.error_override,
         maintenance: table.maintenance,
         commands: table.commands,
+        services: table.services,
     }
 }
 

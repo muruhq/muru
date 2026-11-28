@@ -2729,7 +2729,7 @@ fn plan_services(store: &Store, document: &Document, plan: &mut Plan) {
             continue;
         }
 
-        if let Err(error) = muru_config::check_service(service) {
+        if let Err(error) = muru_config::check_node_service(service) {
             plan.errors.push(format!("service {name}: {error}"));
             continue;
         }
@@ -3663,6 +3663,8 @@ pub struct Tables<'a> {
     pub maintenance: Option<&'a muru_config::Maintenance>,
     /// Commands (section 9.12).
     pub commands: Option<&'a BTreeMap<String, muru_config::CommandTable>>,
+    /// The release's services, which replace the source's own.
+    pub services: Option<&'a BTreeMap<String, muru_config::Service>>,
     /// Instrumentation modules (section 6.15).
     pub instrumentation: Option<&'a [muru_config::Instrumentation]>,
     /// The modules the host imports after the entrypoint (section 6.1).
@@ -4074,6 +4076,7 @@ pub fn resolve_declared(
         error_override: table.error_override.as_ref(),
         maintenance: table.maintenance.as_ref(),
         commands: (!table.commands.is_empty()).then_some(&table.commands),
+        services: (!table.services.is_empty()).then_some(&table.services),
         instrumentation: table.instrumentation.as_deref(),
         preload_modules: table.preload_modules.as_deref(),
         lazy_imports: table.lazy_imports,
@@ -4677,6 +4680,7 @@ fn resolve_settings(
     // table.
 
     let commands = resolve_commands(tables.commands.unwrap_or(&table.commands))?;
+    let services = resolve_services(tables.services.unwrap_or(&table.services))?;
 
     // Section 6.15: the instrumentation list is a table, so it comes from
     // the declaration, else the source, never the release before.
@@ -4825,7 +4829,25 @@ fn resolve_settings(
         build,
         bytecode,
         commands,
+        services,
     })
+}
+
+/// Section 9.17: a release's services from their tables, checked as a
+/// project's are, so that what is fixed with the release can be run.
+pub fn resolve_services(
+    tables: &BTreeMap<String, muru_config::Service>,
+) -> Result<BTreeMap<String, muru_config::Service>, String> {
+    for (name, table) in tables {
+        if !valid_name(name) {
+            return Err(format!("services.{name}: {name:?} is not a valid name"));
+        }
+
+        muru_config::check_project_service(table)
+            .map_err(|error| format!("services.{name}: {error}"))?;
+    }
+
+    Ok(tables.clone())
 }
 
 /// Section 9.12: a release's commands from their tables, checked: a
@@ -6261,6 +6283,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         error_override: None,
         maintenance: None,
         commands: BTreeMap::new(),
+        services: BTreeMap::new(),
     })
 }
 
@@ -6392,6 +6415,7 @@ fn resolve_http_spec(
         build: crate::model::BuildSpec::default(),
         bytecode: crate::model::BytecodeSpec::default(),
         commands: Vec::new(),
+        services: resolve_services(tables.services.unwrap_or(&BTreeMap::new()))?,
     })
 }
 
@@ -7150,6 +7174,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         error_override: spec.error_override.clone(),
         maintenance: spec.maintenance.clone(),
         commands: commands_table_from(&spec.commands),
+        services: spec.services.clone(),
     }
 }
 
@@ -7337,6 +7362,11 @@ fn differences(declared: &ReleaseSpec, recorded: &ReleaseSpec) -> Vec<String> {
         "commands",
         serde_json::to_string(&declared.commands).unwrap_or_default(),
         serde_json::to_string(&recorded.commands).unwrap_or_default(),
+    );
+    compare(
+        "services",
+        serde_json::to_string(&declared.services).unwrap_or_default(),
+        serde_json::to_string(&recorded.services).unwrap_or_default(),
     );
     compare(
         "reflection",
@@ -9668,6 +9698,32 @@ mod tests {
             ]
         );
         assert!(plan.errors.is_empty());
+    }
+
+    #[test]
+    fn a_releases_services_are_checked_and_fixed_with_it() {
+        let table = |text: &str| -> BTreeMap<String, muru_config::Service> {
+            toml::from_str(text).unwrap()
+        };
+        let declared = table(
+            "[worker]\ncommand = ['celery', 'worker']\ninstances = 2\nswitch = 'start-first'\n\
+             [beat]\ncommand = ['celery', 'beat']\n",
+        );
+        assert_eq!(resolve_services(&declared).unwrap(), declared);
+        assert_eq!(
+            resolve_services(&table("[Worker]\ncommand = ['x']\n")).unwrap_err(),
+            "services.Worker: \"Worker\" is not a valid name"
+        );
+        assert_eq!(
+            resolve_services(&table("[worker]\ncommand = ['x']\nuser = 'root'\n")).unwrap_err(),
+            "services.worker: user is not set on a project's service, which runs as its \
+             application does"
+        );
+        assert!(
+            resolve_services(&table("[worker]\ninstances = 2\n"))
+                .unwrap_err()
+                .starts_with("services.worker: command: ")
+        );
     }
 
     #[test]
