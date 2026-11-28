@@ -359,6 +359,8 @@ pub struct NodeData {
     /// Rollouts, those under way first, then the latest ended ones
     /// (section 9.3).
     pub rollouts: Vec<RolloutRow>,
+    /// The services the daemon keeps running (section 9.13).
+    pub services: Vec<ServiceRow>,
     /// Recent requests, newest first.
     pub requests: Vec<NodeRequestRow>,
     /// The WebSockets open now.
@@ -464,6 +466,26 @@ pub struct ScalingRow {
     pub advice: String,
     /// The last decision and how long ago, or empty.
     pub last_decision: String,
+}
+
+/// One service.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ServiceRow {
+    /// Its name.
+    pub name: String,
+    /// The least healthy of its instances' states.
+    pub state: String,
+    /// The instances running over those declared, as `3/4`.
+    pub up: String,
+    /// The pid of a service of one instance; empty otherwise.
+    pub pid: String,
+    /// When it came to be in its state, in the full UTC form, shown as
+    /// the viewer's local clock.
+    pub since: String,
+    /// The starts that followed an exit the program made.
+    pub restarts: u64,
+    /// Its command.
+    pub command: String,
 }
 
 /// One rollout.
@@ -1220,6 +1242,7 @@ async fn respond_node(
         "/v1/routes" => json(&data.routes),
         "/v1/scaling" => json(&data.scaling),
         "/v1/rollouts" => json(&data.rollouts),
+        "/v1/services" => json(&data.services),
         "/v1/events" => json(&data.events),
         "/v1/requests" => json(&data.requests),
         "/v1/websockets" => json(&data.websockets),

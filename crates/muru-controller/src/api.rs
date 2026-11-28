@@ -469,7 +469,19 @@ impl Admin for Service {
             (described, view.budget.memory, from.to_owned())
         };
 
+        let services = info
+            .services
+            .lock()
+            .expect("services poisoned")
+            .iter()
+            .map(|status| pb::ServiceBrief {
+                name: status.name.clone(),
+                state: status.state.to_owned(),
+            })
+            .collect();
+
         Ok(Response::new(pb::Status {
+            services,
             budget_memory,
             budget_memory_from,
             version: env!("CARGO_PKG_VERSION").to_owned(),

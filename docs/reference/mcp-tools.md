@@ -30,6 +30,8 @@ it out.
 | `command_run` | reads | `muructl command status`, or with `output` `muructl command logs --lines`, as an array of lines | `run`, `output` (how many of the last lines) |
 | `events` | reads | `muructl events` | `after` (a sequence number) |
 | `logs` | reads | `muructl logs`, the lines returned as an array | `target`, `lines` (default 100, at most 1000), `access` |
+| `services` | reads | `muructl service list`, or with `name` `muructl service status` | `name` |
+| `service_logs` | reads | `muructl service logs`, the lines returned as an array | `name`, `lines` (default 100, at most 1000) |
 | `cache` | reads | `muructl cache list` | none |
 | `log_files` | reads | `muructl logs list` | none |
 | `debug` | reads | `muructl debug status`, `stacks`, `tasks`, `memory` or `inspect`, never with `--env`; or `debug request`, a development run's record of one request | `what` (status, stacks, tasks, memory, inspect, request), `target`, `worker`, `request_id` (for request) |
@@ -57,6 +59,7 @@ it out.
 | `stop_command_run` | changes | `muructl command stop` | `run` |
 | `detour_traffic` | changes | `muructl detour traffic` | `detour`, `traffic` (preview, all, share=N, class=NAME), `for` (a duration, after which the detour takes preview again), `paths` (the client URL paths it takes requests under alone), `all_paths` (every path again) |
 | `restart` | changes | `muructl restart`: one worker, or with `all` or `group` every worker in turn, and `cancel` ends such a restart | `target`, `worker`, `all`, `group`, `cancel`, `no_wait`, `force` |
+| `service` | changes | `muructl service start`, `stop` or `restart`, for a service that is already defined | `action`, `name`, `index`, `rolling` |
 | `overlay` | changes | `muructl overlay activate`, `end` or `promote` | `action`, `name`, `for` |
 | `maintenance` | changes | `muructl maintenance on` or `off` | `app` or `host`, `on` |
 | `apply` | changes | `muructl apply` | `file`, `dry_run`, `hold`, `wait` (default true) |

@@ -188,6 +188,7 @@ A token lasts twelve hours, or until the daemon restarts.
 | `/v1/apps/APP/releases` | one application's releases |
 | `/v1/hosts`, `/v1/routes` | virtual hosts and routes |
 | `/v1/rollouts` | rollouts, those under way first, then the latest ten |
+| `/v1/services` | the [services](services.md), each with its state, the instances running over those declared, its restarts and its command |
 | `/v1/scaling` | each running release's worker groups, as `muructl scale status` shows them |
 | `/v1/requests` | recent requests, newest first |
 | `/v1/websockets` | the WebSockets open: `open`, `endpoints` counted by path pattern, and `sockets`, the longest open first |

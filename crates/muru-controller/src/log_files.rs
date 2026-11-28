@@ -22,6 +22,8 @@ pub struct Existing {
     apps: HashSet<String>,
     /// The runs the store keeps, by id (issue 692).
     runs: HashSet<u64>,
+    /// The services, each of which has a log of its own (section 9.13).
+    services: HashSet<String>,
 }
 
 impl Existing {
@@ -34,6 +36,7 @@ impl Existing {
                 .contains(&(log.app.clone(), log.release.clone())),
             Kind::Host => !self.hosts.contains_key(&log.name),
             Kind::Commands => !self.apps.contains(&log.app),
+            Kind::Service => !self.services.contains(&log.release),
             _ => false,
         }
     }
@@ -69,6 +72,11 @@ impl Existing {
             hosts,
             apps: store.apps()?.into_iter().map(|app| app.name).collect(),
             runs: store.run_ids()?,
+            services: store
+                .services()?
+                .into_iter()
+                .map(|stored| stored.name)
+                .collect(),
         })
     }
 }
@@ -107,6 +115,9 @@ pub enum Kind {
     /// The files of a command's runs, one for each run the daemon keeps
     /// (issue 692), listed as the log's archives.
     Commands,
+    /// A service's output (section 9.13); the log's `release` is the
+    /// service's name.
+    Service,
 }
 
 impl Kind {
@@ -119,6 +130,7 @@ impl Kind {
             Kind::Host => "host",
             Kind::Release => "release",
             Kind::Commands => "commands",
+            Kind::Service => "service",
         }
     }
 }
@@ -184,6 +196,13 @@ pub fn list(directory: &Path, existing: Option<&Existing>) -> io::Result<Vec<Log
 
     for (name, metadata) in regular_files(directory)? {
         add(&mut logs, &name, &metadata, existing, root_log);
+    }
+
+    // Section 9.13: each service's log, in `services`.
+
+    for (name, metadata) in regular_files(&directory.join("services"))? {
+        let qualified = format!("services/{name}");
+        add(&mut logs, &qualified, &metadata, existing, service_log);
     }
 
     let apps = directory.join("apps");
@@ -342,6 +361,20 @@ fn release_log(app: &str, base: &str, existing: Option<&Existing>) -> Option<Cla
                 .releases
                 .contains(&(app.to_owned(), release.to_owned()))
         }),
+    })
+}
+
+/// A file in `services`: a service's log, orphaned when the store has no
+/// such service.
+fn service_log(base: &str, existing: Option<&Existing>) -> Option<Classified> {
+    let service = base.strip_suffix(".log")?;
+
+    Some(Classified {
+        kind: Kind::Service,
+        app: String::new(),
+        release: service.to_owned(),
+        hosts: Vec::new(),
+        orphaned: existing.is_some_and(|existing| !existing.services.contains(service)),
     })
 }
 
@@ -992,7 +1025,47 @@ mod tests {
             hosts: HashMap::from([("own.log".to_owned(), vec!["shop.example".to_owned()])]),
             apps: HashSet::from(["shop".to_owned()]),
             runs: HashSet::from([41, 42]),
+            services: HashSet::from(["redis".to_owned()]),
         }
+    }
+
+    #[test]
+    fn a_services_log_is_listed_with_its_archives_and_orphaned_without_its_service() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+
+        write(directory, "services/redis.log", 6);
+        write(directory, "services/redis.log.1", 3);
+        write(directory, "services/old-agent.log", 4);
+        write(directory, "services/notes.txt", 1);
+
+        let logs = list(directory, Some(&existing())).unwrap();
+        let found: Vec<(&str, Kind, &str, bool, usize)> = logs
+            .iter()
+            .map(|log| {
+                (
+                    log.name.as_str(),
+                    log.kind,
+                    log.release.as_str(),
+                    log.orphaned,
+                    log.archives.len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    "services/old-agent.log",
+                    Kind::Service,
+                    "old-agent",
+                    true,
+                    0
+                ),
+                ("services/redis.log", Kind::Service, "redis", false, 1),
+            ]
+        );
+        assert_eq!(Kind::Service.as_str(), "service");
     }
 
     #[test]

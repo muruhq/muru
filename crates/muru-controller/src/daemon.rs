@@ -4711,6 +4711,34 @@ impl Daemon {
             routes,
             scaling,
             rollouts,
+            services: self
+                .services
+                .values()
+                .filter(|service| !service.removing())
+                .map(|service| {
+                    let status = service.status();
+                    let running = status
+                        .instances
+                        .iter()
+                        .filter(|instance| instance.state == "running")
+                        .count();
+
+                    muru_dashboard::ServiceRow {
+                        name: status.name.clone(),
+                        state: status.state.to_owned(),
+                        up: format!("{running}/{}", status.instances.len()),
+                        pid: match status.instances.as_slice() {
+                            [only] if only.pid != 0 => only.pid.to_string(),
+                            _ => String::new(),
+                        },
+                        since: muru_common::log::full(
+                            std::time::UNIX_EPOCH + Duration::from_millis(status.since_unix_ms),
+                        ),
+                        restarts: status.restarts,
+                        command: status.table.command.join(" "),
+                    }
+                })
+                .collect(),
             requests,
             websockets: crate::dashboard::websockets_view(websockets),
             events,
@@ -6490,6 +6518,54 @@ impl Daemon {
                         *count as f64,
                     ));
                 }
+            }
+        }
+
+        // Section 9.13: the services, each by its name.
+
+        for (name, service) in &self.services {
+            let status = service.status();
+            let label = [("service", name.as_str())];
+            let mut states: BTreeMap<&str, u32> = BTreeMap::new();
+
+            for instance in &status.instances {
+                *states.entry(instance.state).or_default() += 1;
+
+                if instance.started_unix_ms != 0 {
+                    let index = instance.index.to_string();
+                    samples.push(muru_edge::metrics::Sample::new(
+                        "muru_service_start_time_seconds",
+                        &[("service", name.as_str()), ("instance", index.as_str())],
+                        instance.started_unix_ms as f64 / 1000.0,
+                    ));
+                }
+            }
+
+            for (state, count) in states {
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_service_instances",
+                    &[("service", name.as_str()), ("state", state)],
+                    f64::from(count),
+                ));
+            }
+
+            samples.push(muru_edge::metrics::Sample::new(
+                "muru_service_up",
+                &label,
+                f64::from(u8::from(status.state == "running")),
+            ));
+            samples.push(muru_edge::metrics::Sample::new(
+                "muru_service_restarts_total",
+                &label,
+                status.restarts as f64,
+            ));
+
+            for (outcome, count) in service.exits() {
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_service_exits_total",
+                    &[("service", name.as_str()), ("outcome", outcome)],
+                    count as f64,
+                ));
             }
         }
 
@@ -15574,6 +15650,48 @@ impl Daemon {
                     }
                 }
                 Backend::Dormant => {}
+            }
+        }
+
+        // Section 9.13: each service's instances, each under the relay
+        // that carries its output.
+
+        for (name, service) in &self.services {
+            let shown = service
+                .log()
+                .strip_prefix(&self.locations.logs.path)
+                .unwrap_or(service.log())
+                .display()
+                .to_string();
+            let program =
+                crate::processes::program_of(&service.table().command).unwrap_or_default();
+
+            for instance in service.record().instances {
+                if instance.pid == 0 {
+                    continue;
+                }
+
+                let parent = if instance.relay_pid == 0 {
+                    daemon
+                } else {
+                    known.push(Known {
+                        pid: instance.relay_pid,
+                        parent: daemon,
+                        role: "relay",
+                        what: format!("service {name} output to {shown}"),
+                        ..Known::default()
+                    });
+                    instance.relay_pid
+                };
+
+                known.push(Known {
+                    pid: instance.pid,
+                    parent,
+                    role: "service",
+                    what: format!("service {name} instance {}: {program}", instance.index),
+                    index: Some(instance.index),
+                    ..Known::default()
+                });
             }
         }
 

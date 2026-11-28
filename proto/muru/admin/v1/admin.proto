@@ -482,6 +482,13 @@ message Status {
   uint64 snapshot_version = 28;     // the version of the routing the daemon last gave its edge, which the edge's own status repeats once it has applied it (issue 950); 0 for a run
   optional uint64 budget_memory = 29; // the memory limit of the node's budget in bytes; absent when the node has none
   string budget_memory_from = 30;   // where that limit comes from: file (the daemon's configuration file) or cgroup (the daemon's own cgroup); empty with none
+  repeated ServiceBrief services = 31; // the services the daemon keeps running, each with its state; empty for a run
+}
+
+// A service's name and state, for the status.
+message ServiceBrief {
+  string name = 1;
+  string state = 2;                 // failed, backoff, starting, stopping, exited, stopped or running
 }
 
 message ListWebSocketsRequest {
@@ -1977,7 +1984,7 @@ message LogArchive {
 
 message LogInfo {
   string name = 1;                  // its path relative to the log directory
-  string kind = 2;                  // access, edge, daemon, host, release, or commands for a command's runs' files
+  string kind = 2;                  // access, edge, daemon, host, release, service (with the service's name as release), or commands for a command's runs' files
   string app = 3;                   // the application of a release's log or a command's runs
   string release = 4;               // the release of a release's log; the command, for a command's runs
   repeated string hosts = 5;        // the virtual hosts that name this file

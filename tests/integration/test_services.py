@@ -124,6 +124,32 @@ def test_a_service_is_applied_run_and_managed_by_hand(daemon: Daemon, tmp_path: 
     assert "stop         TERM, killed after 5s" in shown
     assert f"instance 1   running, pid {pids(daemon, 'worker')[1]}, up " in shown
 
+    # The services are in the daemon's status, its process tree, its
+    # metrics and its list of logs.
+
+    assert "services 1 running, 1 stopped" in daemon.muructl("status").stdout
+    tree = daemon.muructl("status", "--processes").stdout
+    assert "service worker instance 0: sh" in tree and "service worker output to" in tree
+    metrics = daemon.muructl("metrics").stdout
+    assert 'muru_service_up{service="worker"} 1' in metrics
+    assert 'muru_service_up{service="spare"} 0' in metrics
+    assert 'muru_service_instances{service="worker",state="running"} 2' in metrics
+    assert 'muru_service_restarts_total{service="worker"} 0' in metrics
+    assert 'muru_service_start_time_seconds{service="worker",instance="1"} ' in metrics
+    logs = json.loads(daemon.muructl("logs", "list", "--json").stdout)["logs"]
+    kinds = {log["name"]: (log["kind"], log["orphaned"]) for log in logs}
+    assert kinds["services/worker.log"] == ("service", False)
+
+    # A rotation of the log is followed: what is written next is in the
+    # new file.
+
+    daemon.muructl("logs", "rotate", "--all")
+    daemon.muructl("service", "signal", "worker", "HUP", "--index", "0")
+    current = daemon.base / "logs" / "services" / "worker.log"
+    wait_for(lambda: "reloaded" in current.read_text())
+    assert "worker 0 of copy 0" not in current.read_text()
+    assert len(list(current.parent.glob("worker.log.*"))) == 1
+
     # Status says by its exit status whether the services run.
 
     assert daemon.muructl("service", "status", "worker", check=False).returncode == 0
@@ -142,7 +168,7 @@ def test_a_service_is_applied_run_and_managed_by_hand(daemon: Daemon, tmp_path: 
         f"muru: sent its reload signal to worker instance 0 (pid {first})",
         f"muru: sent its reload signal to worker instance 1 (pid {second})",
     ]
-    wait_for(lambda: daemon.muructl("service", "logs", "worker").stdout.count("reloaded") == 2)
+    wait_for(lambda: daemon.muructl("service", "logs", "worker").stdout.count("reloaded") == 3)
     refused = daemon.muructl("service", "signal", "worker", "KILL", check=False)
     assert refused.returncode != 0 and "muructl service stop --kill" in refused.stderr
     refused = daemon.muructl("service", "signal", "spare", "reload", check=False)

@@ -4595,6 +4595,11 @@ pub async fn show_status(
         "apps     {} ({} releases)",
         status.app_count, status.release_count
     );
+
+    if !status.services.is_empty() {
+        println!("services {}", services_line(&status.services));
+    }
+
     println!("websockets {} open", status.websockets);
 
     if !status.no_host.is_empty() {
@@ -9008,6 +9013,36 @@ fn finish_removal(answer: &pb::RemoveReleasesResponse, json: bool) -> anyhow::Re
     } else {
         anyhow::bail!(failures.join("; "))
     }
+}
+
+/// The services as one line of the status: how many are in each state,
+/// healthiest first, with the names of those that are not running or
+/// stopped, since those are the ones to look at.
+fn services_line(services: &[pb::ServiceBrief]) -> String {
+    let order = [
+        "running", "starting", "stopping", "backoff", "failed", "exited", "stopped",
+    ];
+
+    order
+        .iter()
+        .filter_map(|state| {
+            let names: Vec<&str> = services
+                .iter()
+                .filter(|service| service.state == *state)
+                .map(|service| service.name.as_str())
+                .collect();
+
+            if names.is_empty() {
+                return None;
+            }
+
+            Some(match *state {
+                "running" | "stopped" => format!("{} {state}", names.len()),
+                _ => format!("{} {state} ({})", names.len(), names.join(", ")),
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Where a managed server's instance stands, for `release show`: its
@@ -14034,6 +14069,24 @@ tls = { ca = "ca.pem" }
             ..server
         };
         assert_eq!(super::workers_column(&running), "1 (2 gunicorn)");
+    }
+
+    #[test]
+    fn the_status_counts_the_services_and_names_those_in_trouble() {
+        let brief = |name: &str, state: &str| pb::ServiceBrief {
+            name: name.to_owned(),
+            state: state.to_owned(),
+        };
+        assert_eq!(
+            super::services_line(&[
+                brief("exporter", "running"),
+                brief("pgbouncer-debug", "stopped"),
+                brief("redis", "running"),
+                brief("beat", "failed"),
+                brief("thumbnailer", "backoff"),
+            ]),
+            "2 running, 1 backoff (thumbnailer), 1 failed (beat), 1 stopped"
+        );
     }
 
     #[test]

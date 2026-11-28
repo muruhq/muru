@@ -1656,6 +1656,7 @@ impl Admin for Service {
     ) -> Result<Response<pb::Status>, Status> {
         let state = &self.state;
         Ok(Response::new(pb::Status {
+            services: Vec::new(),
             budget_memory: None,
             budget_memory_from: String::new(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
