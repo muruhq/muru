@@ -63,7 +63,7 @@ const DAEMON_TABLES: [&str; 10] = [
 /// stands for every key under it. Any other setting is shown as set,
 /// without its value, so a setting added later is left out until it is
 /// listed here.
-const SHOWN_SETTINGS: [&str; 42] = [
+const SHOWN_SETTINGS: [&str; 44] = [
     "interface",
     "factory",
     "preload",
@@ -73,6 +73,8 @@ const SHOWN_SETTINGS: [&str; 42] = [
     "concurrency",
     "max_requests",
     "max_lifetime",
+    "max_surge",
+    "max_unavailable",
     "build.",
     "bytecode",
     "python",

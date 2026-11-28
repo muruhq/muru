@@ -387,6 +387,18 @@ app = "legacy"
         "deploy", "legacy", str(SHOP), "--python", sys.executable, "--hold"
     ).stdout.strip()
     assert held == "muru: release legacy@r2 is ready and held: not serving"
+
+    # Section 9.16: a server's instances are not scaled, so the two
+    # cannot share capacity; an ordinary canary runs each at its own size.
+
+    refused = daemon.muructl(
+        "rollout", "canary", "legacy@r2", "--steps", "50", "--capacity", "shared", check=False
+    )
+    assert refused.returncode != 0
+    assert (
+        "legacy@r1 runs a managed HTTP server, whose instances are not scaled, "
+        "so it cannot share capacity"
+    ) in refused.stderr, refused.stderr
     daemon.muructl(
         "rollout", "canary", "legacy@r2", "--steps", "50", "--hold", "2s", "--min-requests", "20"
     )
@@ -419,10 +431,12 @@ app = "legacy"
 
     # Drained for good, the instance is stopped and its socket removed.
 
+    sockets = daemon.host_sockets("legacy@r1")
+    assert sockets.is_dir()
     daemon.muructl("drain", "legacy@r1")
     wait_for(lambda: states().get("legacy@r1") == ("stopped", ""), 30)
     wait_for(lambda: not alive(pid))
-    assert not list((daemon.run_dir / "apps" / "legacy" / "r1").glob("**/server-*.sock"))
+    assert not sockets.exists()
 
 
 def test_a_gunicorn_deployment_cuts_over_to_native_workers_under_load(
@@ -524,7 +538,7 @@ app = 'legacy'
     daemon.muructl("apply", "-f", str(config))
     assert report(daemon, host="legacy.test")["env"]["LEGACY_SETTING"] == "declared"
 
-    exported = daemon.muructl("config", "export").stdout
+    exported = daemon.muructl("deployment", "export").stdout
     assert "kind = 'http'" in exported.replace('"', "'")
     assert "profile = 'generic'" in exported.replace('"', "'")
     assert "stop_signal = 'TERM'" in exported.replace('"', "'")
@@ -833,7 +847,7 @@ def test_a_recorded_pid_that_another_process_has_is_not_adopted(tmp_path: Path) 
         os.kill(pid, signal.SIGKILL)
         wait_for(lambda: not alive(pid))
         bystander = subprocess.Popen(["/bin/sleep", "600"])
-        record = first.run_dir / "apps" / "legacy" / "r1" / "servers.toml"
+        record = first.files_dir / "h" / "1" / "servers.toml"
         text = record.read_text()
         assert f"pid = {pid}\n" in text
         assert "start_time = " in text and "start_time = 0\n" not in text

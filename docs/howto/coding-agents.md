@@ -40,7 +40,7 @@ server's log, one line when it starts, naming what it serves and how
 many tools it offers, and a warning for each call it refuses:
 
 ```
-muru: MCP server for the daemon at /run/user/501/muru/admin.sock: 30 tools (15 with --read-only)
+muru: MCP server for the daemon at /run/user/501/muru/admin.sock: 32 tools (16 with --read-only)
 muru: warning: refused a call to deploy: the server is read-only
 ```
 
@@ -65,7 +65,7 @@ the developer deploy it the same way (see
 [declaring applications in files](daemon.md#declaring-applications-in-files)):
 
 ```toml
-# muru.daemon.toml
+# muru.deploy.toml
 [app.shop.release.r1]
 source = "."
 entrypoint = "shop.wsgi:application"
@@ -74,10 +74,11 @@ processes = 2
 threads = 4
 ```
 
-The file is named `muru.daemon.toml` because `muru.toml` beside the code
+The file is named `muru.deploy.toml` because `muru.toml` beside the code
 is the project's own settings file. What the table leaves out comes from
 that file, or from `[tool.muru]` in `pyproject.toml`. `muructl render
-shop . > muru.daemon.toml` writes the file from those settings.
+shop . --release r1 > muru.deploy.toml` writes the file from those
+settings.
 
 Then the agent, through the tools:
 
@@ -195,7 +196,7 @@ taken from the line the run prints:
 ```console
 $ muructl run --port 18631 > run.log 2>&1 &
 $ grep 'pid' run.log
-muru: pid 4211, written to /run/user/1000/muru/run-7f3a9c2e/pid
+muru: pid 4211, written to /home/dev/.local/state/muru/run/run-7f3a9c2e/pid
 $ kill -INT 4211
 ```
 

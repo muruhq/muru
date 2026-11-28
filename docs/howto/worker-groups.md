@@ -108,7 +108,15 @@ threads = 1
 timeouts = { soft_timeout = "120s", hard_timeout = "300s" }
 memory = { hard_limit = "2GB" }
 max_requests = 200
+max_surge = 0
+max_unavailable = 1
 ```
+
+`max_surge` and `max_unavailable` say
+[how many of the group's workers are replaced at once, and in which
+order](recycling.md#how-many-at-once-and-in-which-order): here each
+worker of the group stops before its replacement starts, so the group
+never holds a third large worker.
 
 A group's `timeouts` table also takes the request timeouts the edge
 enforces, `queue_timeout`, `request_deadline`, `body_idle_timeout` and
@@ -117,12 +125,13 @@ requests its workers serve, as [timeouts](timeouts.md#with-the-application)
 describes.
 
 Each key a group leaves out is the release's: its `timeouts` and
-`memory` tables and its `max_requests` and `max_lifetime`, or the
-`--timeout`, `--memory`, `--max-requests` and `--max-lifetime` settings
-given on the command line. `shutdown_timeout`, `websocket_drain_grace` and `exit_grace` belong to
+`memory` tables and its `max_requests`, `max_lifetime`, `max_surge` and
+`max_unavailable`, or the `--timeout`, `--memory`, `--max-requests`,
+`--max-lifetime`, `--max-surge` and `--max-unavailable` settings given
+on the command line. `shutdown_timeout`, `websocket_drain_grace` and `exit_grace` belong to
 the release, since they bound how long every worker gets to stop, and a
 group may not set them. A group's hard timeout must exceed its soft
-timeout by at least five seconds, as the release's must. `muructl config
+timeout by at least five seconds, as the release's must. `muructl deployment
 export` writes a group's memory policy with every key spelled out and
 its timeouts as it set them.
 
@@ -201,7 +210,7 @@ takes them from the release's `groups` tables when present. A release is
 ready when every worker of every required group listens, and `muructl
 events` counts the workers listening. Groups are part of the release, so a declared release
 whose groups differ from what is recorded is refused like any other
-changed setting; `muructl config export` writes each group with every size
+changed setting; `muructl deployment export` writes each group with every size
 spelled out, and a restarted daemon takes every group's workers back.
 `muructl release show` lists a release's groups with their paths and
 sizes.

@@ -57,6 +57,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | SetScale | POST /v1/apps/{app}/releases/{release}:scale | sizes, bounds, temporary floors |
 | GetScaleStatus | GET /v1/apps/{app}/releases/{release}/scale | signals, decisions, churn |
 | SetMaintenance | POST /v1/apps/{app}:maintenance | maintenance mode |
+| RestartRelease, CancelRestart | POST /v1/apps/{app}/releases/{release}:restart, :cancelRestart | replace every worker of a release, or of one group, in turn under the group's `max_surge` and `max_unavailable`, returning at once or waiting; cancel leaves the workers not yet replaced (10.14) |
 | RunCommand | POST /v1/apps/{app}/releases/{release}:exec | a declared command by name with its inputs (secret ones optionally as STORE/KEY), or a one-off command, run with the release (9.12), output streamed and the exit status last; with `detach`, started under its own log relay and answered with its run's id at once |
 | ListCommands | GET /v1/apps/{app}/releases/{release}/commands | the release's declared commands, their inputs and each one's last run |
 | ListCommandRuns | GET /v1/apps/{app}/runs | the runs the daemon keeps of the application's commands, or of one by `name`, those under way first (9.12) |
@@ -82,6 +83,7 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | ApplicationUrls | GET /v1/apps/{app}:urls | every URL the application can be reached at, best first, worked out from the routing: each route to it, on each virtual host the route belongs to, under each of the host's names but wildcards, on each listener the host uses; the default route (shortest path) first, a canonical name before the others, HTTPS before HTTP, ties by the listeners' and hosts' order; each with its scheme, name, port, path, route, host, listener, bound address, whether the name is canonical and how it was chosen (issue 815). A development run answers that it needs the daemon, since its URLs come from its registry record |
 | ReloadDaemonConfig | POST /v1/daemon:reload | re-read the daemon configuration |
 | UpgradeDaemon | POST /v1/daemon:upgrade | re-exec and replace edges |
+| RestartDaemon | POST /v1/daemon:restart | re-exec from the running binary, edges kept |
 | Backup, Restore | POST /v1/daemon:backup, :restore | state store |
 | ActivateOverlay, EndOverlay, PromoteOverlay | POST /v1/overlays/{overlay}:activate, :end, :promote | overlay control |
 | PreviewOverlay | GET /v1/overlays/{overlay}:preview | effective changes if activated |
@@ -95,6 +97,6 @@ gRPC service muru.admin.v1 on the admin socket, optionally over TCP with mTLS, p
 | OpenDetour | none | open a detour of an application on the run's Unix socket and hold it while the stream is open; the first message names the release, the application's host names and data directory, later ones carry traffic changes |
 | ListDetours | none | the open detours, never a secret |
 | SetDetourTraffic | none | preview, all, share=N or class=NAME, with until_unix_ms for a choice that goes back to preview then |
-| PreviewDetour | none | mint one-time entry links for the application's addresses, or give the Muru-Preview header value |
+| PreviewRelease | none | mint one-time entry links to the preview of a release, a detour or any release the edge routes to, for the application's addresses, valid for valid_for_ms (a minute by default, at most an hour), and give the Muru-Preview header value, RELEASE.SECRET; new_secret changes the release's preview secret first; with no release named, the application's open detour or its one held release |
 
 Message shapes are defined in proto/muru/admin/v1 during phase 2, and an OpenAPI description of the JSON gateway is generated from them and published with the documentation. This appendix fixes the surface so that every capability in the spec is reachable.

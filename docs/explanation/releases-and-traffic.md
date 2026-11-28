@@ -97,9 +97,11 @@ to the application's serving release. A route with one decides in this
 order, and the first that applies wins:
 
 1. **A preview.** A `Muru-Preview` header or `muru_preview` cookie
-   naming a release the edge has for the application sends the request
-   there. This is how a held release, or one with a share of 0, is
-   checked before clients reach it.
+   carrying a release's ID and its preview secret sends the request to
+   that release, when the edge has it for the application. This is how a
+   held release, or one with a share of 0, is checked before clients
+   reach it. The secret is what `muructl preview` gives out, so a
+   release's ID alone previews nothing.
 
 2. **A client class.** When the request's [client
    class](../howto/client-classes.md) is given a release in the policy's
@@ -107,7 +109,8 @@ order, and the first that applies wins:
    class.
 
 3. **A sticky cookie.** With `sticky = true`, a `muru_release` cookie
-   naming a release the route still has sends the client back to it.
+   naming the serving release, a release the policy names or one in its
+   sticky grace sends the client back to it.
 
 4. **The split.** The client's key, the anonymous id cookie the edge
    issues unless the policy names a header, a cookie or the client's
@@ -177,7 +180,7 @@ workers for looking at. It is kept beside the retained release a rollback
 goes to, so a failed canary does not cost the instant rollback.
 
 While a rollout runs, its share is live state the daemon changes. It is
-not part of the configuration `muructl config export` writes, and while
+not part of the configuration `muructl deployment export` writes, and while
 an overlay pins or splits the route's traffic, the rollout waits.
 
 ## How overlays layer
@@ -189,7 +192,7 @@ the overlay ends the routes are as they would have been without it,
 including any change made to them in the meantime. Two overlays may not
 set the same field unless they have different priorities, and then the
 higher one's value stands while both are active; capacity is the
-exception, where the highest floor and ceiling apply. `muructl config
+exception, where the highest floor and ceiling apply. `muructl deployment
 show --effective` shows the configuration with the active overlays
 applied and says which overlay set what.
 
@@ -199,13 +202,13 @@ a rollout under way holds its step. Rolling back is never frozen.
 
 ## Declared and live state
 
-What `muructl apply` reads and `muructl config export` writes is the
+What `muructl apply` reads and `muructl deployment export` writes is the
 declared state: applications, their releases, routes with their traffic
 policies, client classes and overlays. A rollout's current share, a pin
 set with `muructl scale`, and a temporary floor or cap from `scale --min`
 or `scale --cap` are
 live state, kept by the daemon and left out of the export, so applying
-a file does not undo a rollout in progress. `config export
+a file does not undo a rollout in progress. `deployment export
 --resolve-rollouts` writes a rollout as it stands, as a candidate
 declared beside the serving release with the routes splitting between
 them, for a file in version control.

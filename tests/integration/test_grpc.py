@@ -449,7 +449,7 @@ upstream = 'grpcio'
         stub = service.rpc.GreeterStub(grpc.insecure_channel(f"127.0.0.1:{daemon.port}"))
         assert stub.SayHello(service.pb.Hello(name="daemon"), timeout=10).message == "Hello daemon"
 
-        exported = daemon.muructl("config", "export").stdout
+        exported = daemon.muructl("deployment", "export").stdout
         assert "reflection = true" in exported
         assert 'interface = "grpc"' in exported
 

@@ -27,6 +27,32 @@ $ muructl events --follow --after 43
 sequence number, so a watcher that reconnects misses nothing. Events are
 kept in the state store, the last ten thousand of them.
 
+A release's host raises the events about its workers, and it goes on
+serving and replacing workers while the daemon is stopped, restarting or
+being upgraded. It holds the events it raises meanwhile, the last 256,
+and sends them to the daemon that takes it over, which records each with
+the time it happened and counts it in the [metrics](metrics.md) and for
+a rollout's gates, and delivers it to the sinks. Such an event takes the
+next sequence number when it is recorded, so in a listing its time is
+earlier than that of the events above it:
+
+```
+$ muructl events
+    57 12:31:10 info     daemon.started       daemon                   serving on http://0.0.0.0:8000, admin socket /run/muru/admin.sock
+    58 12:31:10 info     release.adopted      shop@r3                  re-adopted the host (pid 4810)
+    59 12:31:07 info     worker.started       shop@r3                  worker 1 started as pid 5120
+    60 12:31:07 info     worker.ready         shop@r3                  worker 1 (pid 5120) is ready
+```
+
+A host holds each event until the daemon has told it the event is
+recorded, so one raised in the moment a daemon stops is sent to the
+daemon that follows, and every event is recorded once.
+
+When a host raises more than 256 events with no daemon, the oldest are
+dropped: its log says when that begins, and a `host.events_dropped`
+warning, recorded ahead of the events it kept, says how many. The
+release's log has a line for every event either way.
+
 A [development run](run-settings.md) and `muructl serve` answer `muructl
 events` too, for the events their hosts raise: workers started,
 recycled, replaced or exited, requests past a timeout or the deadline,

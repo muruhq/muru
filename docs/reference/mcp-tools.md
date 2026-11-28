@@ -19,6 +19,7 @@ it out.
 | `status` | reads | `muructl status` | none |
 | `processes` | reads | `muructl status --processes` | `app` (an application, or `app@release`), `all` |
 | `instances` | reads | `muructl instance list`, on this machine rather than the instance the server reaches | `orphans`, `label` |
+| `doctor` | reads | `muructl doctor`, `doctor store` or `doctor timeline`, on the files of the daemon the server reaches: Muru itself checked, with nothing changed | `part` (installation, store, timeline), `limit` |
 | `urls` | reads | `muructl open --list`: every URL the application can be reached at, best first, opening nothing | `app` |
 | `list` | reads | `muructl app list`, `release list`, `host list`, `route list`, `upstream list`, `rollout status` or `overlay list` | `what` (apps, releases, hosts, routes, upstreams, rollouts, overlays), `app` |
 | `release` | reads | `muructl release show` | `release` (app@release) |
@@ -34,15 +35,17 @@ it out.
 | `debug` | reads | `muructl debug status`, `stacks`, `tasks`, `memory` or `inspect`, never with `--env`; or `debug request`, a development run's record of one request | `what` (status, stacks, tasks, memory, inspect, request), `target`, `worker`, `request_id` (for request) |
 | `imports` | reads | `muructl debug imports`: the import report of a release's load, with its advice and the modules the workers loaded since the fork | `target`, `worker`, `load_target` (as `--target`), `top`, `min_ms`, `package`, `module`, `all` (as `--all`) |
 | `scale_status` | reads | `muructl scale status` | `target` |
-| `config` | reads | `muructl config show` or `config diff` | `action` (show, diff), `app`, `effective`, `file` |
+| `deployment` | reads | `muructl deployment show` or `deployment diff` | `action` (show, diff), `deployment`, `app`, `effective`, `file` |
+| `daemon_config` | reads | `muructl daemon config show` or `daemon config check`: the daemon's own configuration file | `action` (show, check), `full` |
 | `metrics` | reads | `muructl metrics`, the samples kept to those whose name starts with `prefix` | `prefix` |
 | `websockets` | reads | `muructl websockets` | `app`, `list` |
 | `requests` | reads | `muructl requests` | `app`, `list` |
 | `overlay_preview` | reads | `muructl overlay preview` | `name` |
-| `detours` | reads | `muructl detour list`, or with `link` `muructl detour preview --print`: a one-time entry link to a detour's preview, valid for a minute, for an address whose name reaches this machine, with the `Muru-Preview` header value, which is given when there is no link too, with why | `action` (list, link), `detour`, `host`, `name` |
+| `detours` | reads | `muructl detour list` | `action` (list) |
+| `preview` | reads | `muructl preview --print`: a one-time entry link to the preview of a release, a detour or any release the daemon routes to, valid for a minute or for `valid_for`, for an address whose name reaches this machine, with the `Muru-Preview` header value, which holds the release's preview secret and is given when there is no link too, with why | `target` (`APP@RELEASE`, an application or a detour), `host`, `name`, `valid_for` |
 | `skill_status` | reads | `muructl mcp skill status` | none |
 | `docs` | reads | The user guide embedded in `muructl`: the list of pages, or one page's Markdown | `page` |
-| `set_app_settings` | changes | `muructl app set` | `app`, `env`, `secrets`, `processes`, `threads`, `sync_threads`, `concurrency`, `max_requests`, `max_lifetime`, `timeouts`, `memory`, `replace` |
+| `set_app_settings` | changes | `muructl app set` | `app`, `env`, `secrets`, `processes`, `threads`, `sync_threads`, `concurrency`, `max_requests`, `max_lifetime`, `max_surge`, `max_unavailable`, `timeouts`, `memory`, `replace` |
 | `unset_app_settings` | changes | `muructl app unset` | `app`, `keys`, `all` |
 | `deploy` | changes | `muructl deploy` | `app`, `source`, `entrypoint`, `python`, `hold`, `wait` (default true), `dry_run` |
 | `promote` | changes | `muructl rollout bluegreen` | `release` |
@@ -53,7 +56,7 @@ it out.
 | `run_command` | changes | `muructl command run`, the output returned as an array of lines (the last 500) with `exit_code`, `ok` and `message`, as a tool error unless `ok`: the command exited with 0 and was not stopped; with `detach`, `muructl command run --detach`, answering with the `run` id at once | `target`, `name`, `inputs` (an object), `secret_inputs` (an object of STORE/KEY references), `detach` |
 | `stop_command_run` | changes | `muructl command stop` | `run` |
 | `detour_traffic` | changes | `muructl detour traffic` | `detour`, `traffic` (preview, all, share=N, class=NAME), `for` (a duration, after which the detour takes preview again), `paths` (the client URL paths it takes requests under alone), `all_paths` (every path again) |
-| `restart` | changes | `muructl restart` | `target`, `worker`, `all`, `force` |
+| `restart` | changes | `muructl restart`: one worker, or with `all` or `group` every worker in turn, and `cancel` ends such a restart | `target`, `worker`, `all`, `group`, `cancel`, `no_wait`, `force` |
 | `overlay` | changes | `muructl overlay activate`, `end` or `promote` | `action`, `name`, `for` |
 | `maintenance` | changes | `muructl maintenance on` or `off` | `app` or `host`, `on` |
 | `apply` | changes | `muructl apply` | `file`, `dry_run`, `hold`, `wait` (default true) |
@@ -61,7 +64,7 @@ it out.
 | `access_log` | changes | `muructl logging access` | `mode`, `app`, `paths`, `for`, `reset` |
 | `reopen_logs` | changes | `muructl logs reopen` | `workers` |
 | `prune_releases` | changes | `muructl release prune`, refused unless `yes` is true or `dry_run` asked for | `app`, `keep`, `force`, `keep_logs`, `dry_run`, `yes` |
-| `remove_release` | changes | `muructl release remove`, refused unless `yes` is true or `dry_run` asked for | `release` (app@release), `keep_logs`, `dry_run`, `yes` |
+| `remove_release` | changes | `muructl release remove`, refused unless `yes` is true or `dry_run` asked for | `release` (app@release), `keep_logs`, `force`, `dry_run`, `yes` |
 | `remove_app` | changes | `muructl app remove`, refused unless `yes` is true or `dry_run` asked for | `app`, `dry_run`, `yes` |
 | `prune_cache` | changes | `muructl cache prune`, refused unless `yes` is true or `dry_run` asked for | `area`, `version`, `tag`, `dry_run`, `yes` |
 | `clear_cache` | changes | `muructl cache clear`, refused unless `yes` is true or `dry_run` asked for | `area`, `certs`, `dry_run`, `yes` |
@@ -69,11 +72,14 @@ it out.
 | `rotate_logs` | changes | `muructl logs rotate` | `target` (app@release), `access`, `host`, `all` |
 | `truncate_logs` | changes | `muructl logs truncate`, refused unless `yes` is true | `target` (app@release), `access`, `host`, `all`, `keep`, `yes` |
 | `reload_config` | changes | `muructl daemon reload` | none |
+| `set_daemon_config` | changes | `muructl daemon config set`, or `daemon config unset` when no `value` is given: one key of the daemon's own configuration file, checked, written and reloaded; with `restart`, the daemon restarted in place when the change needs it | `key`, `value`, `restart` |
 
 Every tool is annotated for the client as reading or changing things, and
 none reaches beyond the daemon. Stopping, shutting down and upgrading the
 daemon, `muructl exec`, and `debug exec` and `debug attach`, are not
-offered: `run_command` runs only what an application declares.
+offered: `run_command` runs only what an application declares. Of the
+commands that change the daemon's own file, `edit` and `replace` are not
+offered either: a tool changes one key at a time.
 `run_command` refuses a secret input given in `inputs`, so a secret's
 value never passes through the agent; give it in `secret_inputs` as an
 entry of one of the daemon's [secret stores](../howto/secrets.md).

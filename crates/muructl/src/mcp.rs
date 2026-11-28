@@ -403,7 +403,7 @@ hold starts the release without moving traffic.
 release; drain takes a release out of traffic and stops it.
 - rollout canary shifts traffic to a release step by step, each step judged \
 by gates against the release that serves.
-- apply makes a declarative file (muru.daemon.toml) the desired state; deploy adds \
+- apply makes a declarative file (muru.deploy.toml) the desired state; deploy adds \
 one release. apply with hold starts the releases it adds without moving \
 traffic. The muructl render command writes such a file for a release from \
 a source directory and deploy's settings, without the daemon.
@@ -462,6 +462,16 @@ impl ServerHandler for Server {
                 Ok(command) => self.local_command(command).await,
                 Err(message) => failure(message),
             },
+            "doctor" => match (spec.command)(&arguments) {
+                // Doctor reads the daemon's files, which it finds from
+                // the daemon's locations and not from a socket, and a
+                // failed check is an answer with exit status 1.
+                Ok(mut command) => {
+                    command.extend(locations_of(&self.connect_for(&arguments)));
+                    self.local_command(command).await
+                }
+                Err(message) => failure(message),
+            },
             _ => match (spec.command)(&arguments) {
                 Ok(command) => {
                     let result = self.command(command, &self.connect_for(&arguments)).await;
@@ -472,6 +482,23 @@ impl ServerHandler for Server {
         };
 
         Ok(result.into())
+    }
+}
+
+/// The options that find a daemon's files, from those that reach its
+/// admin socket: a socket is in its daemon's run directory, which is
+/// what `--socket` becomes, and a daemon that runs says where the rest
+/// of its files are.
+fn locations_of(connect: &[String]) -> Vec<String> {
+    match connect {
+        [option, socket] if option == "--socket" => {
+            let run_dir = std::path::Path::new(socket)
+                .parent()
+                .map(|directory| directory.display().to_string())
+                .unwrap_or_default();
+            vec!["--run-dir".to_owned(), run_dir]
+        }
+        other => other.to_vec(),
     }
 }
 
@@ -843,6 +870,30 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
+            name: "doctor",
+            description: "Check Muru itself, not the application: every socket and file of the daemon's installation with what it is for, who owns it and its condition, and checks of one part against another (the registry, locks, paths, store, releases, edge, versions and disk), each failure with the command that puts it right. With part store, the state store's integrity, schema version, table counts and rules; with part timeline, the last events, daemon log lines and process starts in order. Changes nothing and works with no daemon running. Run it before reporting a problem with Muru.",
+            changes: false,
+            properties: json!({
+                "part": {"type": "string", "enum": ["installation", "store", "timeline"], "description": "What to check; the installation when left out"},
+                "limit": {"type": "integer", "description": "For timeline: how many entries, the latest (default 50)"},
+            }),
+            required: &[],
+            command: |arguments| match text(arguments, "part").as_deref() {
+                None | Some("installation") => Ok(words(&["doctor"])),
+                Some("store") => Ok(words(&["doctor", "store"])),
+                Some("timeline") => {
+                    let mut command = words(&["doctor", "timeline"]);
+
+                    if let Some(limit) = arguments.get("limit").and_then(Value::as_u64) {
+                        command.extend(["--limit".to_owned(), limit.to_string()]);
+                    }
+
+                    Ok(command)
+                }
+                Some(other) => Err(format!("no doctor part {other}")),
+            },
+        },
+        Spec {
             name: "urls",
             description: "Every URL the application can be reached at, best first, each with how it was chosen: a development run's from its listeners and --host names, an application on a daemon's from its routes, virtual hosts and listeners, leaving out names that reach another machine. Opens nothing.",
             changes: false,
@@ -1115,11 +1166,12 @@ fn specs() -> Vec<Spec> {
             },
         },
         Spec {
-            name: "config",
-            description: "The desired state as TOML (show, with effective for what active overlays change), or compare a file or directory of TOML files with it (diff).",
+            name: "deployment",
+            description: "What the daemon serves, its desired state, as TOML (show, with effective for what active overlays change), or compare a file or directory of TOML files with it (diff).",
             changes: false,
             properties: json!({
                 "action": {"type": "string", "enum": ["show", "diff"]},
+                "deployment": {"type": "string", "description": "For show: one deployment only, as its files would state it"},
                 "app": {"type": "string", "description": "For show: one application only"},
                 "effective": {"type": "boolean", "description": "For show: as the active overlays leave it"},
                 "file": {"type": "string", "description": "For diff: the file or directory"},
@@ -1127,8 +1179,12 @@ fn specs() -> Vec<Spec> {
             required: &["action"],
             command: |arguments| match needed(arguments, "action")?.as_str() {
                 "show" => {
-                    let mut command = words(&["config", "show"]);
-                    command.extend(text(arguments, "app"));
+                    let mut command = words(&["deployment", "show"]);
+                    command.extend(text(arguments, "deployment"));
+
+                    if let Some(app) = text(arguments, "app") {
+                        command.extend(["--app".to_owned(), app]);
+                    }
 
                     if flag(arguments, "effective") {
                         command.push("--effective".to_owned());
@@ -1137,11 +1193,11 @@ fn specs() -> Vec<Spec> {
                     Ok(command)
                 }
                 "diff" => Ok([
-                    words(&["config", "diff", "--file"]),
+                    words(&["deployment", "diff", "--file"]),
                     vec![needed(arguments, "file")?],
                 ]
                 .concat()),
-                other => Err(format!("no config action {other}")),
+                other => Err(format!("no deployment action {other}")),
             },
         },
         Spec {
@@ -1194,35 +1250,48 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "detours",
-            description: "The daemon's detours, development runs it routes to as releases of an application while they run: list them, or give a one-time entry link to one's preview (link), valid for a minute, which a browser follows to get the preview cookie, with the Muru-Preview header value (header) for a client that sends headers instead.",
+            description: "The daemon's detours, development runs it routes to as releases of an application while they run: list them. The preview tool gives a link to one's preview.",
             changes: false,
             properties: json!({
-                "action": {"type": "string", "enum": ["list", "link"]},
-                "detour": {"type": "string", "description": "For link: the detour, by its release, application, label, tag or the start of its ID; the project's application's, or the one open, when left out"},
-                "host": {"type": "string", "description": "For link: one of the application's hosts, in place of its best address"},
-                "name": {"type": "string", "description": "For link: the name to build the link from, one of the names or patterns of a host that routes the application, as for a host whose names are all wildcards"},
+                "action": {"type": "string", "enum": ["list"]},
             }),
             required: &["action"],
             command: |arguments| match needed(arguments, "action")?.as_str() {
                 "list" => Ok(words(&["detour", "list"])),
-                "link" => {
-                    let mut command = words(&["detour", "preview", "--print"]);
+                other => Err(format!("{other:?} is not list")),
+            },
+        },
+        Spec {
+            name: "preview",
+            description: "Preview a release before it takes traffic, a detour or any release the daemon routes to (the serving one, one a traffic policy names, one deployed with --hold): a one-time entry link, valid for a minute unless valid_for says longer, which a browser follows to get the preview cookie, with the Muru-Preview header value (header) for a client that sends headers instead. The header value holds the release's preview secret: give it only to what should see the release.",
+            changes: false,
+            properties: json!({
+                "target": {"type": "string", "description": "The release as APP@RELEASE, an application (its open detour, else its one held release), or a detour by its release, label, tag or the start of its ID; the project's application, or the one detour open, when left out"},
+                "host": {"type": "string", "description": "One of the application's hosts, in place of its best address"},
+                "name": {"type": "string", "description": "The name to build the link from, one of the names or patterns of a host that routes the application, as for a host whose names are all wildcards"},
+                "valid_for": {"type": "string", "description": "How long the link can be used for, once, such as 10m; at most 1h"},
+            }),
+            required: &[],
+            command: |arguments| {
+                let mut command = words(&["preview", "--print"]);
 
-                    if let Some(detour) = text(arguments, "detour") {
-                        command.push(detour);
-                    }
-
-                    if let Some(host) = text(arguments, "host") {
-                        command.extend(["--host".to_owned(), host]);
-                    }
-
-                    if let Some(name) = text(arguments, "name") {
-                        command.extend(["--name".to_owned(), name]);
-                    }
-
-                    Ok(command)
+                if let Some(target) = text(arguments, "target") {
+                    command.push(target);
                 }
-                other => Err(format!("{other:?} is not list or link")),
+
+                if let Some(host) = text(arguments, "host") {
+                    command.extend(["--host".to_owned(), host]);
+                }
+
+                if let Some(name) = text(arguments, "name") {
+                    command.extend(["--name".to_owned(), name]);
+                }
+
+                if let Some(valid_for) = text(arguments, "valid_for") {
+                    command.extend(["--valid-for".to_owned(), valid_for]);
+                }
+
+                Ok(command)
             },
         },
         Spec {
@@ -1331,7 +1400,7 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "set_app_settings",
-            description: "Set release settings on an application, which every release deployed from now takes over the source's [tool.muru] and under a deploy's own flags: env (variables), secrets (NAME to STORE:KEY, or STORE:KEY:file), processes, threads, sync_threads, concurrency, max_requests, max_lifetime, timeouts (NAME to a duration: soft, hard, hard_drain_grace, shutdown, websocket_drain_grace, exit_grace, loop_stall, gil_stall) and memory (KEY to a value). replace removes the others first. No running release changes; the application is created when it does not exist.",
+            description: "Set release settings on an application, which every release deployed from now takes over the source's [tool.muru] and under a deploy's own flags: env (variables), secrets (NAME to STORE:KEY, or STORE:KEY:file), processes, threads, sync_threads, concurrency, max_requests, max_lifetime, max_surge, max_unavailable, timeouts (NAME to a duration: soft, hard, hard_drain_grace, shutdown, websocket_drain_grace, exit_grace, loop_stall, gil_stall) and memory (KEY to a value). replace removes the others first. No running release changes; the application is created when it does not exist.",
             changes: true,
             properties: json!({
                 "app": {"type": "string"},
@@ -1343,6 +1412,8 @@ fn specs() -> Vec<Spec> {
                 "concurrency": {"type": "integer"},
                 "max_requests": {"type": "integer"},
                 "max_lifetime": {"type": "string", "description": "A duration such as 1h"},
+                "max_surge": {"type": "integer", "description": "Workers a group may run over its count while workers are swapped"},
+                "max_unavailable": {"type": "integer", "description": "Workers a group may run under its count while workers are swapped"},
                 "timeouts": {"type": "object", "additionalProperties": {"type": "string"}},
                 "memory": {"type": "object", "additionalProperties": {"type": "string"}},
                 "replace": {"type": "boolean"},
@@ -1359,6 +1430,8 @@ fn specs() -> Vec<Spec> {
                     ("concurrency", "--concurrency"),
                     ("max_requests", "--max-requests"),
                     ("max_lifetime", "--max-lifetime"),
+                    ("max_surge", "--max-surge"),
+                    ("max_unavailable", "--max-unavailable"),
                 ] {
                     command.extend(option(arguments, key, name));
                 }
@@ -1384,7 +1457,7 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "unset_app_settings",
-            description: "Remove release settings from an application by key (processes, threads, sync_threads, concurrency, max_requests, max_lifetime, timeouts.KEY, memory.KEY, env.NAME, or env for every variable), or every one with all. No running release changes.",
+            description: "Remove release settings from an application by key (processes, threads, sync_threads, concurrency, max_requests, max_lifetime, max_surge, max_unavailable, timeouts.KEY, memory.KEY, env.NAME, or env for every variable), or every one with all. No running release changes.",
             changes: true,
             properties: json!({
                 "app": {"type": "string"},
@@ -1553,12 +1626,15 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "restart",
-            description: "Replace a release's worker (by its index within its group, as GROUP/N outside the default group) with a fresh one, gracefully or at once with force; or every worker in turn with all.",
+            description: "Replace a release's worker (by its index within its group, as GROUP/N outside the default group) with a fresh one, gracefully or at once with force; or every worker in turn with all, or every worker of one worker group with group, which the release's host carries out under the group's max_surge and max_unavailable and which waits until it has finished unless no_wait is given; cancel ends such a restart, leaving the workers not yet replaced.",
             changes: true,
             properties: json!({
                 "target": {"type": "string", "description": "app, or app@release"},
                 "worker": {"type": "string", "description": "Its index within its group, as GROUP/N outside the default group"},
                 "all": {"type": "boolean"},
+                "group": {"type": "string", "description": "Every worker of this worker group"},
+                "cancel": {"type": "boolean", "description": "End a restart of every worker that is under way"},
+                "no_wait": {"type": "boolean"},
                 "force": {"type": "boolean"},
             }),
             required: &["target"],
@@ -1566,8 +1642,14 @@ fn specs() -> Vec<Spec> {
                 let mut command =
                     [words(&["restart"]), vec![needed(arguments, "target")?]].concat();
                 command.extend(option(arguments, "worker", "--worker"));
+                command.extend(option(arguments, "group", "--group"));
 
-                for (key, name) in [("all", "--all"), ("force", "--force")] {
+                for (key, name) in [
+                    ("all", "--all"),
+                    ("cancel", "--cancel"),
+                    ("no_wait", "--no-wait"),
+                    ("force", "--force"),
+                ] {
                     if flag(arguments, key) {
                         command.push(name.to_owned());
                     }
@@ -1831,11 +1913,12 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "remove_release",
-            description: "Remove one release, as app@release, with its environment, bytecode and logs. Refused for the serving or rollback release, a running one or one a route or rollout uses. dry_run says what would go; anything else is refused unless yes is true.",
+            description: "Remove one release, as app@release, with its environment, bytecode and logs. Refused for the serving or rollback release, a running one or one a route or rollout uses, and for one applied files declare unless force is true. dry_run says what would go; anything else is refused unless yes is true.",
             changes: true,
             properties: json!({
                 "release": {"type": "string", "description": "The release, as app@release"},
                 "keep_logs": {"type": "boolean", "description": "Leave its log and archives"},
+                "force": {"type": "boolean", "description": "Remove it although applied files declare it; the next apply of those files creates it again"},
                 "dry_run": {"type": "boolean"},
                 "yes": {"type": "boolean", "description": "Confirm the removal; without it only dry_run succeeds"},
             }),
@@ -1851,6 +1934,7 @@ fn specs() -> Vec<Spec> {
 
                 for (key, name) in [
                     ("keep_logs", "--keep-logs"),
+                    ("force", "--force"),
                     ("dry_run", "--dry-run"),
                     ("yes", "--yes"),
                 ] {
@@ -1979,6 +2063,70 @@ fn specs() -> Vec<Spec> {
             required: &[],
             command: |_| Ok(words(&["daemon", "reload"])),
         },
+        Spec {
+            name: "daemon_config",
+            description: "The daemon's own configuration file, the node's settings such as listeners and limits, which is not what it serves: show it as written (full for every setting with its default and where each value came from), or check it as the daemon checks it at a start or reload.",
+            changes: false,
+            properties: json!({
+                "action": {"type": "string", "enum": ["show", "check"]},
+                "full": {"type": "boolean", "description": "For show: every setting, with the default of each the file leaves out"},
+            }),
+            required: &["action"],
+            command: |arguments| match needed(arguments, "action")?.as_str() {
+                "show" => {
+                    let mut command = words(&["daemon", "config", "show"]);
+
+                    if flag(arguments, "full") {
+                        command.push("--full".to_owned());
+                    }
+
+                    Ok(command)
+                }
+                "check" => Ok(words(&["daemon", "config", "check"])),
+                other => Err(format!("no daemon_config action {other}")),
+            },
+        },
+        Spec {
+            name: "set_daemon_config",
+            description: "Set one key of the daemon's own configuration file by its dotted path, such as limits.max_body_size or daemon.detours, or take the key out when no value is given. The result is checked before the file is written, and the daemon reloads it. A setting read only at start (the answer's stale lists them) takes effect at a restart, which restart asks for: the daemon re-executes in place, and what it serves keeps serving.",
+            changes: true,
+            properties: json!({
+                "key": {"type": "string", "description": "TABLE.KEY"},
+                "value": {"description": "The value: a string, number, boolean or array. Leave out to take the key out of the file."},
+                "restart": {"type": "boolean", "description": "Restart the daemon in place when the change needs it"},
+            }),
+            required: &["key"],
+            command: |arguments| {
+                let key = needed(arguments, "key")?;
+
+                let mut command = match arguments.get("value") {
+                    None | Some(Value::Null) => {
+                        vec![
+                            "daemon".to_owned(),
+                            "config".to_owned(),
+                            "unset".to_owned(),
+                            key,
+                        ]
+                    }
+                    Some(Value::String(value)) => [
+                        words(&["daemon", "config", "set"]),
+                        vec![key, value.clone()],
+                    ]
+                    .concat(),
+                    Some(value) => [
+                        words(&["daemon", "config", "set"]),
+                        vec![key, value.to_string()],
+                    ]
+                    .concat(),
+                };
+
+                if flag(arguments, "restart") {
+                    command.push("--restart".to_owned());
+                }
+
+                Ok(command)
+            },
+        },
     ]
 }
 
@@ -1996,6 +2144,54 @@ mod tests {
     }
 
     #[test]
+    fn the_daemons_file_is_read_and_changed_one_key_at_a_time() {
+        // Issue 941: show and check read; a value sets the key, in TOML
+        // whatever its JSON type, and none takes the key out.
+
+        let words = |text: &str| -> Result<Vec<String>, String> {
+            Ok(text.split(' ').map(str::to_owned).collect())
+        };
+
+        assert_eq!(
+            command("daemon_config", json!({"action": "show", "full": true})),
+            words("daemon config show --full")
+        );
+        assert_eq!(
+            command("daemon_config", json!({"action": "check"})),
+            words("daemon config check")
+        );
+        assert_eq!(
+            command(
+                "set_daemon_config",
+                json!({"key": "daemon.detours", "value": true, "restart": true})
+            ),
+            words("daemon config set daemon.detours true --restart")
+        );
+        assert_eq!(
+            command(
+                "set_daemon_config",
+                json!({"key": "limits.max_body_size", "value": "50MB"})
+            ),
+            words("daemon config set limits.max_body_size 50MB")
+        );
+        assert_eq!(
+            command(
+                "set_daemon_config",
+                json!({"key": "proxy.trusted", "value": ["10.0.0.0/8"]})
+            ),
+            words("daemon config set proxy.trusted [\"10.0.0.0/8\"]")
+        );
+        assert_eq!(
+            command("set_daemon_config", json!({"key": "limits.max_body_size"})),
+            words("daemon config unset limits.max_body_size")
+        );
+
+        let specs = specs();
+        let changes = |name: &str| specs.iter().find(|spec| spec.name == name).unwrap().changes;
+        assert!(!changes("daemon_config") && changes("set_daemon_config"));
+    }
+
+    #[test]
     fn tools_become_the_muructl_commands_they_name() {
         assert_eq!(
             command("list", json!({"what": "releases", "app": "shop"})),
@@ -2007,17 +2203,22 @@ mod tests {
         );
         assert_eq!(
             command(
-                "detours",
-                json!({"action": "link", "detour": "feature-x", "host": "shop.localhost"})
+                "preview",
+                json!({"target": "shop@r2", "host": "shop.localhost", "valid_for": "10m"})
             ),
             Ok(vec![
-                "detour".into(),
                 "preview".into(),
                 "--print".into(),
-                "feature-x".into(),
+                "shop@r2".into(),
                 "--host".into(),
-                "shop.localhost".into()
+                "shop.localhost".into(),
+                "--valid-for".into(),
+                "10m".into()
             ])
+        );
+        assert_eq!(
+            command("preview", json!({})),
+            Ok(vec!["preview".into(), "--print".into()])
         );
         assert_eq!(
             command("detour_traffic", json!({"traffic": "all"})),

@@ -6,6 +6,7 @@ import contextlib
 import fcntl
 import http.client
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -113,7 +114,13 @@ def temporary_log(prefix: str) -> Path:
     """Return a new file for a server's output, kept after the server
     stops for the test to read and removed when the session ends."""
 
-    log = Path(tempfile.mkstemp(prefix=prefix, suffix=".log")[1])
+    # mkstemp opens the file it makes, and only its path is wanted here:
+    # left open, the descriptor is held to the end of the session, one
+    # for every server started (issue 979).
+
+    descriptor, path = tempfile.mkstemp(prefix=prefix, suffix=".log")
+    os.close(descriptor)
+    log = Path(path)
     _temporary_files.append(log)
     return log
 
@@ -133,14 +140,30 @@ def tail(path: Path) -> str:
 
 def user_registry() -> Path:
     """The user's instance registry (design specification section 13.8),
-    in the default runtime location whatever MURU_RUN_DIR says."""
+    in the account's state location, which depends on the user alone: the
+    home directory is the password database's, whatever HOME,
+    XDG_STATE_HOME or MURU_STATE_DIR says. Root's is in the system
+    runtime location."""
 
     if os.geteuid() == 0:
         return Path("/run/muru/registry")
 
-    runtime = os.environ.get("XDG_RUNTIME_DIR") if sys.platform.startswith("linux") else None
-    base = Path(runtime) / "muru" if runtime else Path(f"/tmp/muru-{os.getuid()}")
-    return base / "registry"
+    try:
+        home: Path | None = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except KeyError:
+        home = None
+
+    # A user with no home directory keeps it in the runtime location.
+
+    if home is None or not home.is_dir():
+        runtime = os.environ.get("XDG_RUNTIME_DIR") if sys.platform.startswith("linux") else None
+        base = Path(runtime) / "muru" if runtime else Path(f"/tmp/muru-{os.getuid()}")
+        return base / "registry"
+
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "muru" / "registry"
+
+    return home / ".local" / "state" / "muru" / "registry"
 
 
 def still_running(pids: set[int]) -> set[int]:

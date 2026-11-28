@@ -14,8 +14,9 @@ use anyhow::Context as _;
 use muru_common::log::{Gathered, Stream, Traceback};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+use crate::locations::HostDirs;
 use crate::logs::Logs;
 
 /// What a host says over its control connection (section 5.9).
@@ -78,6 +79,15 @@ pub enum HostMessage {
         /// the requests it names (issue 706), which only a development
         /// run keeps.
         evidence: Option<muru_edge::recorder::Evidence>,
+        /// When it happened, in Unix milliseconds, for an event the host
+        /// held while no supervisor was connected (section 11.5); none
+        /// for one sent as it happened.
+        time_unix_ms: Option<u64>,
+        /// Which of the host's events this is (issue 982), for the
+        /// supervisor to acknowledge once it is recorded and to tell one
+        /// sent again from one it has; none from a host that numbers
+        /// none.
+        number: Option<EventNumber>,
     },
     /// Evidence for request records that is no event of its own (issue
     /// 706): that a request past its deadline has since ended.
@@ -92,6 +102,21 @@ pub enum HostMessage {
         /// The workers being replaced for memory, which the memory guard
         /// counts as its one at a time (section 13.9, issue 662).
         memory_replacements: Vec<MemoryReplacement>,
+        /// The voluntary swaps waiting their turn, by group (section
+        /// 7.8).
+        swaps_waiting: std::collections::BTreeMap<String, u32>,
+    },
+    /// How far a restart of every worker has got (section 10.14), sent
+    /// when it changes and to a supervisor that connects during one.
+    Restart {
+        /// The workers marked.
+        total: u32,
+        /// Those not yet replaced; 0 once it has finished.
+        left: u32,
+        /// When it began, in Unix milliseconds.
+        started_unix_ms: u64,
+        /// The one group it restarts; every group when empty.
+        group: String,
     },
     /// The workers' answers to a request (section 11.7).
     Response {
@@ -390,6 +415,11 @@ impl HostMessage {
                 group: value["group"].as_str().unwrap_or_default().to_owned(),
                 reason: value["reason"].as_str().unwrap_or_default().to_owned(),
                 evidence: value.get("evidence").map(|_| evidence(&value)),
+                time_unix_ms: value["time_unix_ms"].as_u64(),
+                number: value["seq"].as_u64().map(|seq| EventNumber {
+                    stream: value["stream"].as_u64().unwrap_or(0),
+                    seq,
+                }),
             }),
             "capture" => Some(Self::Capture(evidence(&value))),
             "loaded" => Some(Self::Loaded {
@@ -405,6 +435,12 @@ impl HostMessage {
                 part: value["part"].as_u64().unwrap_or(0) as usize,
                 parts: value["parts"].as_u64().unwrap_or(1) as usize,
                 data: value["data"].as_str().unwrap_or_default().to_owned(),
+            }),
+            "restart" => Some(Self::Restart {
+                total: value["total"].as_u64().unwrap_or(0) as u32,
+                left: value["left"].as_u64().unwrap_or(0) as u32,
+                started_unix_ms: value["started_unix_ms"].as_u64().unwrap_or(0),
+                group: value["group"].as_str().unwrap_or_default().to_owned(),
             }),
             "response" => Some(Self::Response {
                 id: value["id"].as_u64().unwrap_or(0),
@@ -493,6 +529,17 @@ impl HostMessage {
                             .collect()
                     })
                     .unwrap_or_default(),
+                swaps_waiting: value["swaps_waiting"]
+                    .as_object()
+                    .map(|groups| {
+                        groups
+                            .iter()
+                            .map(|(group, count)| {
+                                (group.clone(), count.as_u64().unwrap_or(0) as u32)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             _ => None,
         }
@@ -532,6 +579,42 @@ pub fn loaded_message(outcome: &str, ms: u64, imports: Option<&serde_json::Value
     message
 }
 
+/// Which of a host's events one is (section 11.5, issue 982): the host
+/// numbers the events it raises from 1 and names itself by a number
+/// made when it started, so the events of the host that replaces it are
+/// not taken for ones already recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventNumber {
+    /// The host that raised the event.
+    pub stream: u64,
+    /// The event's number among that host's, from 1.
+    pub seq: u64,
+}
+
+/// The last of a host's events a supervisor that keeps its events in
+/// memory has recorded, by which it tells an event sent again.
+#[derive(Debug, Default)]
+pub struct Recorded {
+    last: Option<EventNumber>,
+}
+
+impl Recorded {
+    /// Take an event's number, and say whether the event is new: not
+    /// when one of the same host with this number or a later one has
+    /// been taken.
+    pub fn take(&mut self, number: EventNumber) -> bool {
+        let seen = self
+            .last
+            .is_some_and(|last| last.stream == number.stream && last.seq >= number.seq);
+
+        if !seen {
+            self.last = Some(number);
+        }
+
+        !seen
+    }
+}
+
 /// The import report a host sends in parts (section 6.18), put back
 /// together as they arrive.
 #[derive(Debug, Default)]
@@ -561,6 +644,22 @@ impl ImportsParts {
 
         Some(std::mem::take(&mut self.parts).concat())
     }
+}
+
+/// How long a host that is taken over is given to say what its workers
+/// are, once its control socket has been connected to.
+const ANNOUNCE_WAIT: Duration = Duration::from_secs(5);
+
+/// What a running host said when a supervisor connected to it: the
+/// sockets the edge should route to, and every message up to and
+/// including the one that said so.
+pub struct Announced {
+    /// The default group's sockets.
+    pub sockets: Vec<PathBuf>,
+    /// Each named group's sockets.
+    pub groups: Vec<(String, Vec<PathBuf>)>,
+    /// The messages the host sent, in order, the announcement last.
+    pub sent: Vec<HostMessage>,
 }
 
 /// The supervisor's side of a host's control connection: what the host
@@ -621,12 +720,77 @@ impl HostControl {
         ))
     }
 
+    /// Connect to the control socket of a host that is already running
+    /// and wait for it to say which sockets its workers listen on, which
+    /// it tells every supervisor that connects first of all (issue 981).
+    /// Returns the connection, the default group's sockets, each named
+    /// group's, and what the host has sent so far, the announcement
+    /// included, for whoever acts on a host's messages.
+    pub async fn connect_announced(
+        path: &Path,
+    ) -> anyhow::Result<(Self, mpsc::Receiver<HostMessage>, Announced)> {
+        let (control, mut messages) = Self::connect(path).await?;
+        let mut sent = Vec::new();
+
+        let wait = async {
+            while let Some(message) = messages.recv().await {
+                let found = match &message {
+                    HostMessage::Workers {
+                        sockets, groups, ..
+                    } => Some((sockets.clone(), groups.clone())),
+                    _ => None,
+                };
+
+                sent.push(message);
+
+                if found.is_some() {
+                    return found;
+                }
+            }
+
+            None
+        };
+
+        let Some((sockets, groups)) = tokio::time::timeout(ANNOUNCE_WAIT, wait)
+            .await
+            .with_context(|| {
+                format!(
+                    "the host did not say what its workers are on {}",
+                    path.display()
+                )
+            })?
+        else {
+            anyhow::bail!(
+                "the host closed {} before it said what its workers are",
+                path.display()
+            );
+        };
+
+        Ok((
+            control,
+            messages,
+            Announced {
+                sockets,
+                groups,
+                sent,
+            },
+        ))
+    }
+
     /// Tell the host the edge routes by the sockets it announced at
     /// this version.
     pub fn acknowledge(&self, version: u64) {
         let _ = self
             .outgoing
             .send(format!("{{\"type\":\"applied\",\"version\":{version}}}\n"));
+    }
+
+    /// Tell the host that its events up to this number are recorded
+    /// (section 11.5, issue 982), so it holds them no longer.
+    pub fn recorded(&self, seq: u64) {
+        let _ = self
+            .outgoing
+            .send(format!("{{\"type\":\"recorded\",\"seq\":{seq}}}\n"));
     }
 
     /// Ask the host's workers something (section 11.7), one of them when
@@ -648,6 +812,123 @@ impl HostControl {
             "args": args,
         });
         let _ = self.outgoing.send(format!("{message}\n"));
+    }
+}
+
+/// How long a supervisor waits before it tries a host's control socket
+/// again, when the host is still there and a connection could not be made.
+const CONTROL_RETRY: Duration = Duration::from_secs(1);
+
+/// What `keep_control` tells the supervisor that keeps a control
+/// connection to a host.
+pub enum ControlEvent {
+    /// A connection was made; `again` when it replaces one that ended.
+    Attached {
+        /// The connection, for acknowledgements and requests.
+        control: HostControl,
+        /// Whether an earlier connection to this host ended.
+        again: bool,
+    },
+    /// The host said something.
+    Message(Box<HostMessage>),
+    /// The connection ended, or none could be made. Answered with
+    /// whether the host is still the one to be connected to, in which
+    /// case the connection is made again.
+    Ended {
+        /// Why no connection could be made, when that is what happened.
+        failed: Option<anyhow::Error>,
+        /// Whether an earlier connection to this host had ended before.
+        again: bool,
+        /// Where to say whether to connect again.
+        answer: oneshot::Sender<bool>,
+    },
+}
+
+/// Keep a control connection to a host for as long as its supervisor
+/// wants one (section 5.9, issues 983 and 988): connect, hand the
+/// connection over, pass on what the host says, and when the connection
+/// ends ask whether the host is still the one to be connected to,
+/// connecting again if so. A host closes the connection when a send to
+/// its supervisor fails or does not complete, which a supervisor that
+/// was stalled causes; the host sends its state and the events it holds
+/// to whoever connects next. Everything goes to `inbox` as what `wrap`
+/// makes of it, so the daemon takes it as commands and a run as the
+/// events themselves, and the task ends when the inbox is closed or the
+/// answer is no. `made` is a connection already up, with what the host
+/// has said on it so far.
+pub async fn keep_control<T>(
+    inbox: mpsc::Sender<T>,
+    path: PathBuf,
+    made: Option<(Vec<HostMessage>, mpsc::Receiver<HostMessage>)>,
+    wrap: impl Fn(ControlEvent) -> T,
+) {
+    let mut made = made;
+    let mut again = false;
+
+    loop {
+        let (connected, failed) = match made.take() {
+            Some(made) => (Some(made), None),
+            None => match HostControl::connect(&path).await {
+                Ok((control, messages)) => {
+                    let attached = inbox
+                        .send(wrap(ControlEvent::Attached { control, again }))
+                        .await;
+
+                    if attached.is_err() {
+                        return;
+                    }
+
+                    (Some((Vec::new(), messages)), None)
+                }
+                Err(error) => (None, Some(error)),
+            },
+        };
+
+        let retry = failed.is_some();
+
+        if let Some((sent, mut messages)) = connected {
+            for message in sent {
+                if inbox
+                    .send(wrap(ControlEvent::Message(Box::new(message))))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            while let Some(message) = messages.recv().await {
+                if inbox
+                    .send(wrap(ControlEvent::Message(Box::new(message))))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        // The connection ended, or none could be made. The supervisor
+        // says whether the host is still the one it wants.
+
+        let (answer, answered) = oneshot::channel();
+        let asked = inbox
+            .send(wrap(ControlEvent::Ended {
+                failed,
+                again,
+                answer,
+            }))
+            .await;
+
+        if asked.is_err() || !answered.await.unwrap_or(false) {
+            return;
+        }
+
+        again = true;
+
+        if retry {
+            tokio::time::sleep(CONTROL_RETRY).await;
+        }
     }
 }
 
@@ -738,6 +1019,12 @@ pub struct HostSpec {
     pub max_requests: Option<u64>,
     /// How long a worker lives before it is replaced (section 7.7).
     pub max_lifetime: Option<Duration>,
+    /// How many workers a group may run over its count while workers are
+    /// swapped (section 7.8).
+    pub max_surge: u32,
+    /// How many workers a group may run under its count while workers
+    /// are swapped.
+    pub max_unavailable: u32,
     /// How long a request may run before it is interrupted (section
     /// 7.6); off when absent.
     pub soft_timeout: Option<Duration>,
@@ -840,9 +1127,9 @@ fn sendfile_argument(spec: &HostSpec) -> String {
 impl HostSpec {
     /// The release as app@release, as the host names itself: the
     /// application's name, else the top-level module of its entrypoint,
-    /// and the release's id, else the name of its run directory (`r1`,
-    /// `r2` in development).
-    pub fn label(&self, run_dir: &Path) -> String {
+    /// and the release's id, else `r` and the number of the host among
+    /// those its starter has started (`r1`, `r2` in development).
+    pub fn label(&self, release: u32) -> String {
         let name = self.name.clone().unwrap_or_else(|| {
             let module = self.app.split(':').next().unwrap_or_default();
             let top = module.split('.').next().unwrap_or_default();
@@ -854,12 +1141,10 @@ impl HostSpec {
             }
         });
 
-        let release = self.release.clone().unwrap_or_else(|| {
-            run_dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        });
+        let release = self
+            .release
+            .clone()
+            .unwrap_or_else(|| format!("r{release}"));
 
         format!("{name}@{release}")
     }
@@ -968,6 +1253,68 @@ impl Identity {
             .collect()
     }
 
+    /// The home directory the password database gives the user `uid`,
+    /// whatever `HOME` says.
+    pub fn account_home(uid: u32) -> Option<PathBuf> {
+        let identity = Self {
+            uid,
+            gid: 0,
+            umask: None,
+        };
+
+        identity
+            .account()
+            .into_iter()
+            .find(|(variable, _)| variable == "HOME")
+            .map(|(_, home)| PathBuf::from(home))
+    }
+
+    /// The home directory of every account the password database lists,
+    /// for a command that reads what each user keeps under theirs.
+    pub fn account_homes() -> Vec<PathBuf> {
+        static LISTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        // getpwent keeps its place in storage the whole process shares,
+        // so one listing is made at a time.
+
+        let _one_at_a_time = LISTING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut homes = Vec::new();
+
+        // SAFETY: setpwent, getpwent and endpwent take no arguments; the
+        // lock above keeps this the only walk of the database, and each
+        // entry's strings are copied before the next call replaces them.
+
+        unsafe {
+            libc::setpwent();
+
+            loop {
+                let entry = libc::getpwent();
+
+                if entry.is_null() {
+                    break;
+                }
+
+                let home = (*entry).pw_dir;
+
+                if !home.is_null() {
+                    let home = std::ffi::CStr::from_ptr(home).to_string_lossy();
+
+                    if !home.is_empty() {
+                        homes.push(PathBuf::from(home.into_owned()));
+                    }
+                }
+            }
+
+            libc::endpwent();
+        }
+
+        homes.sort();
+        homes.dedup();
+        homes
+    }
+
     /// Whether this process may switch to another user.
     pub fn can_switch() -> bool {
         // SAFETY: geteuid has no preconditions.
@@ -1041,6 +1388,12 @@ pub struct HostGroup {
     /// How long a worker lives before it is replaced, resolved over the
     /// release's.
     pub max_lifetime: Option<Duration>,
+    /// How many workers the group may run over its count while workers
+    /// are swapped, resolved over the release's (section 7.8).
+    pub max_surge: u32,
+    /// How many workers the group may run under its count while workers
+    /// are swapped, resolved over the release's.
+    pub max_unavailable: u32,
     /// Whether the release is ready without the group's workers (ADR
     /// 0033).
     pub optional: bool,
@@ -1060,7 +1413,7 @@ pub struct HostProcess {
     pub group_sockets: Vec<(String, Vec<PathBuf>)>,
     /// The groups the release is ready without (ADR 0033).
     optional: Vec<String>,
-    run_dir: PathBuf,
+    dirs: HostDirs,
     /// The release number within this run, from 1.
     pub release: u32,
     /// The tasks relaying its log relay's output to this process's
@@ -1088,20 +1441,26 @@ enum Process {
 }
 
 impl HostProcess {
-    /// Start the host for release number `release` under the run directory,
-    /// with a log relay beside it (section 11.3). Without `detach_to` what
+    /// Start the host for release number `release` in `dirs`, its sockets
+    /// in one directory and its files in the other (section 13.8), with a
+    /// log relay beside it (section 11.3). Without `detach_to` what
     /// the relay writes comes to this process's own streams and is kept in
     /// `logs` for the dashboard; `watcher` hears what the relay reports.
     pub fn start(
         spec: &HostSpec,
-        run_dir: &Path,
+        dirs: &HostDirs,
         release: u32,
         logs: &Logs,
         watcher: RelayWatcher,
     ) -> anyhow::Result<Self> {
-        let run_dir = run_dir.join(format!("r{release}"));
-        std::fs::create_dir_all(&run_dir)
-            .with_context(|| format!("creating {}", run_dir.display()))?;
+        let dirs = dirs.clone();
+        dirs.create().with_context(|| {
+            format!(
+                "creating {} and {}",
+                dirs.sockets.display(),
+                dirs.files.display()
+            )
+        })?;
         let mut command = Command::new(&spec.python);
         command
             .arg("-m")
@@ -1109,7 +1468,9 @@ impl HostProcess {
             .arg("--app")
             .arg(&spec.app)
             .arg("--socket-dir")
-            .arg(&run_dir)
+            .arg(&dirs.sockets)
+            .arg("--files-dir")
+            .arg(&dirs.files)
             .args(
                 spec.name
                     .iter()
@@ -1173,7 +1534,7 @@ impl HostProcess {
             );
             command
                 .arg("--output-socket")
-                .arg(run_dir.join(crate::relay::OUTPUT_SOCKET))
+                .arg(dirs.sockets.join(crate::relay::OUTPUT_SOCKET))
                 .arg("--output-fd")
                 .arg(crate::relay::HOST_OUTPUT_FD.to_string());
         }
@@ -1329,6 +1690,10 @@ impl HostProcess {
                     |lifetime| lifetime.as_secs_f64().to_string()
                 ),
             ));
+            command.arg("--group-swap").arg(format!(
+                "{}={},{}",
+                group.name, group.max_surge, group.max_unavailable
+            ));
         }
 
         if let Some(level) = spec.logging.level {
@@ -1372,7 +1737,7 @@ impl HostProcess {
 
         command
             .arg("--control")
-            .arg(run_dir.join("control.sock"))
+            .arg(dirs.sockets.join("control.sock"))
             .arg("--hard-drain-grace")
             .arg(spec.hard_drain_grace.as_secs_f64().to_string())
             .arg("--shutdown-timeout")
@@ -1385,6 +1750,12 @@ impl HostProcess {
             .arg(spec.loop_stall_timeout.as_secs_f64().to_string())
             .arg("--gil-stall-timeout")
             .arg(spec.gil_stall_timeout.as_secs_f64().to_string());
+
+        command
+            .arg("--max-surge")
+            .arg(spec.max_surge.to_string())
+            .arg("--max-unavailable")
+            .arg(spec.max_unavailable.to_string());
 
         if let Some(count) = spec.max_requests {
             command.arg("--max-requests").arg(count.to_string());
@@ -1523,7 +1894,7 @@ impl HostProcess {
 
         // The relay first, so that the host's first line has a reader.
 
-        let launch = RelayLaunch::new(spec, &run_dir)?;
+        let launch = RelayLaunch::new(spec, &dirs, release)?;
         let relays: SharedRelays = Arc::default();
         let first = launch
             .spawn(Some(output_read.as_raw_fd()), logs, &relays)
@@ -1552,12 +1923,15 @@ impl HostProcess {
         );
 
         // Sockets are numbered across every group in the order the host
-        // forks them: the default group first, then each named group.
+        // forks them: the default group first, then each named group. A
+        // named group's sockets carry its place among the named groups,
+        // from 1, and never its name, so that no socket's path grows
+        // with a name (section 13.8).
 
-        let socket = |group: Option<&str>, index: usize, position: usize| match base_port {
+        let socket = |group: Option<usize>, index: usize, position: usize| match base_port {
             None => match group {
-                None => run_dir.join(format!("worker-{index}.sock")),
-                Some(name) => run_dir.join(format!("worker-{name}-{index}.sock")),
+                None => dirs.sockets.join(format!("worker-{index}.sock")),
+                Some(group) => dirs.sockets.join(format!("worker-{group}-{index}.sock")),
             },
             Some(base) => {
                 let port = base.wrapping_add(u16::try_from(position).unwrap_or(0));
@@ -1569,11 +1943,11 @@ impl HostProcess {
             .collect();
         let mut group_sockets = Vec::new();
 
-        for group in &spec.groups {
+        for (place, group) in spec.groups.iter().enumerate() {
             let mut these = Vec::new();
 
             for index in 0..group.processes {
-                let path = socket(Some(&group.name), index, sockets.len());
+                let path = socket(Some(place + 1), index, sockets.len());
                 sockets.push(path.clone());
                 these.push(path);
             }
@@ -1592,7 +1966,7 @@ impl HostProcess {
                 .filter(|group| group.optional)
                 .map(|group| group.name.clone())
                 .collect(),
-            run_dir,
+            dirs,
             release,
             relays,
             relay,
@@ -1600,8 +1974,10 @@ impl HostProcess {
     }
 
     /// Take over a host a previous daemon started: it is checked to be
-    /// alive and its workers to be listening, and is stopped with signals
-    /// rather than waited for, since it is not this process's child. Its
+    /// alive, and is stopped with signals rather than waited for, since
+    /// it is not this process's child. The sockets are those the host
+    /// itself announced on its control connection (issue 981), since it
+    /// replaces workers while no daemon is there to keep its record. Its
     /// relay is adopted with it when `relay_pid` names one still there;
     /// otherwise a new one is started and given the host's pipes.
     #[allow(clippy::too_many_arguments)]
@@ -1610,7 +1986,7 @@ impl HostProcess {
         sockets: Vec<PathBuf>,
         group_sockets: Vec<(String, Vec<PathBuf>)>,
         optional: Vec<String>,
-        run_dir: PathBuf,
+        dirs: HostDirs,
         release: u32,
         launch: RelayLaunch,
         relay_pid: Option<u32>,
@@ -1626,25 +2002,18 @@ impl HostProcess {
 
         let relay =
             RelaySupervisor::start(launch, running, None, &Logs::default(), &relays, watcher);
-        let host = Self {
+
+        Ok(Self {
             process: Process::Adopted(pid),
             stdin: None,
             sockets,
             group_sockets,
             optional,
-            run_dir,
+            dirs,
             release,
             relays,
             relay,
-        };
-        anyhow::ensure!(
-            host.required_sockets()
-                .iter()
-                .all(|socket| listening(socket)),
-            "the workers of process {pid} are not listening"
-        );
-
-        Ok(host)
+        })
     }
 
     /// The sockets the release is not ready without: every group's but
@@ -1715,24 +2084,24 @@ impl HostProcess {
         unsafe { libc::kill(pid as libc::pid_t, signal) == 0 }
     }
 
-    /// The release run directory.
-    pub fn run_dir(&self) -> &Path {
-        &self.run_dir
+    /// The host's directories.
+    pub fn dirs(&self) -> &HostDirs {
+        &self.dirs
     }
 
     /// Where the host serves its control connection (section 5.9): the
     /// worker sockets as they change, and events about its workers.
     pub fn control_path(&self) -> PathBuf {
-        self.run_dir.join("control.sock")
+        self.dirs.sockets.join("control.sock")
     }
 
     /// Wait for a host started with `hold_before_fork` to have preloaded
     /// and to wait for its gates, which it says by writing the file
-    /// `gates` in its run directory; or for it to exit first, or the time
+    /// `gates` among its files; or for it to exit first, or the time
     /// to be up.
     pub async fn wait_held(&mut self, timeout: Duration) -> anyhow::Result<()> {
         let started = Instant::now();
-        let held = self.run_dir.join("gates");
+        let held = self.dirs.files.join("gates");
 
         loop {
             if held.is_file() {
@@ -1890,7 +2259,7 @@ impl HostProcess {
         self.relay.finish().await;
         relayed_to_the_end(&self.relays).await;
 
-        let _ = std::fs::remove_dir_all(&self.run_dir);
+        self.dirs.remove();
     }
 
     /// Write when the workers must be gone where the host looks for it, by
@@ -1899,7 +2268,7 @@ impl HostProcess {
     /// own budget and is killed at the shutdown's deadline.
     fn tell_stop_by(&self, workers_by: Instant) {
         let at = SystemTime::now() + workers_by.saturating_duration_since(Instant::now());
-        let path = self.run_dir.join(STOP_BY_FILE);
+        let path = self.dirs.files.join(STOP_BY_FILE);
         let Ok(since_epoch) = at.duration_since(SystemTime::UNIX_EPOCH) else {
             return;
         };
@@ -1934,7 +2303,7 @@ impl HostProcess {
             return true;
         }
 
-        let control = self.run_dir.join(crate::relay::CONTROL_SOCKET);
+        let control = self.dirs.sockets.join(crate::relay::CONTROL_SOCKET);
 
         let flushed = tokio::time::timeout(OUTPUT_FLUSH, async {
             // What the relay could not flush is still read here.
@@ -2660,8 +3029,8 @@ pub type RelayWatcher = Arc<dyn Fn(RelayNews) + Send + Sync>;
 pub struct RelayLaunch {
     /// The executable, this program.
     executable: PathBuf,
-    /// The directory the host's and relay's sockets are in.
-    run_dir: PathBuf,
+    /// The directories the host's and relay's sockets and files are in.
+    dirs: HostDirs,
     /// The release log, or none to write to this process.
     log_file: Option<PathBuf>,
     settings: RelaySettings,
@@ -2674,13 +3043,13 @@ pub struct RelayLaunch {
 
 impl RelayLaunch {
     /// How to start the relay of a host started with `spec`.
-    fn new(spec: &HostSpec, run_dir: &Path) -> anyhow::Result<Self> {
+    fn new(spec: &HostSpec, dirs: &HostDirs, release: u32) -> anyhow::Result<Self> {
         let launch = Self::for_release(
-            run_dir.to_owned(),
+            dirs.clone(),
             spec.detach_to.clone(),
             spec.relay,
             spec.identity,
-            spec.label(run_dir),
+            spec.label(release),
         )?;
 
         Ok(Self {
@@ -2689,10 +3058,10 @@ impl RelayLaunch {
         })
     }
 
-    /// How to start the relay of a release whose sockets are in
-    /// `run_dir`, writing `log_file` or else to this process.
+    /// How to start the relay of a release whose sockets and files are
+    /// in `dirs`, writing `log_file` or else to this process.
     pub fn for_release(
-        run_dir: PathBuf,
+        dirs: HostDirs,
         log_file: Option<PathBuf>,
         settings: RelaySettings,
         identity: Option<Identity>,
@@ -2701,7 +3070,7 @@ impl RelayLaunch {
         Ok(Self {
             executable: crate::daemon::running_executable()
                 .context("finding the executable to start the relay from")?,
-            run_dir,
+            dirs,
             log_file,
             settings,
             identity,
@@ -2711,11 +3080,11 @@ impl RelayLaunch {
     }
 
     fn output_socket(&self) -> PathBuf {
-        self.run_dir.join(crate::relay::OUTPUT_SOCKET)
+        self.dirs.sockets.join(crate::relay::OUTPUT_SOCKET)
     }
 
     fn control_socket(&self) -> PathBuf {
-        self.run_dir.join(crate::relay::CONTROL_SOCKET)
+        self.dirs.sockets.join(crate::relay::CONTROL_SOCKET)
     }
 
     /// Start a relay, handing it the read end of the host's output when
@@ -2794,7 +3163,7 @@ impl RelayLaunch {
     /// record is written whole, as the relay writes its own, since a
     /// daemon may read it while a replacement relay is recorded.
     fn record(&self, pid: u32) {
-        let path = self.run_dir.join(crate::relay::RECORD);
+        let path = self.dirs.files.join(crate::relay::RECORD);
 
         if let Err(error) = muru_common::files::write_whole(&path, format!("pid = {pid}\n")) {
             tracing::warn!(%error, "could not record the release's log relay");
@@ -3128,6 +3497,40 @@ mod tests {
     }
 
     #[test]
+    fn a_restarts_progress_is_read() {
+        let parsed = HostMessage::parse(
+            r#"{"type":"restart","total":4,"left":3,"started_unix_ms":1700000000000,"group":"reports"}"#,
+        );
+        assert!(matches!(
+            parsed,
+            Some(HostMessage::Restart { total: 4, left: 3, started_unix_ms: 1_700_000_000_000, ref group })
+                if group == "reports"
+        ));
+    }
+
+    #[test]
+    fn a_status_carries_the_swaps_waiting_in_each_group() {
+        let parsed = HostMessage::parse(
+            r#"{"type":"status","host":{},"workers":[],"memory_replacements":[],
+                "swaps_waiting":{"default":2,"reports":0}}"#,
+        );
+        let Some(HostMessage::Status { swaps_waiting, .. }) = parsed else {
+            panic!("not a status");
+        };
+
+        assert_eq!(swaps_waiting.get("default"), Some(&2));
+        assert_eq!(swaps_waiting.get("reports"), Some(&0));
+
+        // A host from before the queue says nothing of it.
+
+        let old = HostMessage::parse(r#"{"type":"status","host":{},"workers":[]}"#);
+        assert!(matches!(
+            old,
+            Some(HostMessage::Status { swaps_waiting, .. }) if swaps_waiting.is_empty()
+        ));
+    }
+
+    #[test]
     fn a_hosts_load_is_an_event_with_the_import_reports_figures() {
         let parsed = HostMessage::parse(
             r#"{"type":"loaded","outcome":"fork","ms":519.6,"first":true,
@@ -3210,7 +3613,24 @@ mod tests {
         let plain = HostMessage::parse(r#"{"type":"event","kind":"worker.exited","message":"x"}"#);
         assert!(matches!(
             plain,
-            Some(HostMessage::Event { evidence: None, .. })
+            Some(HostMessage::Event {
+                evidence: None,
+                time_unix_ms: None,
+                ..
+            })
+        ));
+
+        // Section 11.5: an event the host held carries when it happened.
+
+        let held = HostMessage::parse(
+            r#"{"type":"event","kind":"worker.recycled","message":"x","time_unix_ms":1700000000000}"#,
+        );
+        assert!(matches!(
+            held,
+            Some(HostMessage::Event {
+                time_unix_ms: Some(1_700_000_000_000),
+                ..
+            })
         ));
 
         let ended = HostMessage::parse(
@@ -3222,6 +3642,76 @@ mod tests {
         assert_eq!(
             (ended.kind.as_str(), ended.requests.len()),
             ("request.ended", 1)
+        );
+    }
+
+    // Issue 981: a host that is taken over says which sockets its
+    // workers listen on, and what it said is kept for the daemon's inbox.
+
+    #[tokio::test]
+    async fn a_host_taken_over_is_asked_for_its_sockets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let host = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let lines = concat!(
+                r#"{"type":"loaded","outcome":"preloaded","ms":3}"#,
+                "\n",
+                r#"{"type":"workers","version":4,"sockets":["/r/worker-0-g2.sock"],"#,
+                r#""groups":[{"name":"jobs","sockets":["/r/worker-1-0.sock"]}]}"#,
+                "\n",
+                r#"{"type":"event","kind":"worker.recycled","message":"later"}"#,
+                "\n",
+            );
+            stream.write_all(lines.as_bytes()).await.unwrap();
+            stream
+        });
+
+        let (_control, mut messages, announced) =
+            HostControl::connect_announced(&path).await.unwrap();
+        assert_eq!(
+            announced.sockets,
+            vec![PathBuf::from("/r/worker-0-g2.sock")]
+        );
+        assert_eq!(
+            announced.groups,
+            vec![("jobs".to_owned(), vec![PathBuf::from("/r/worker-1-0.sock")])]
+        );
+
+        // Everything up to the announcement is handed over in order, and
+        // what follows is still on the connection.
+
+        assert!(matches!(
+            announced.sent.as_slice(),
+            [
+                HostMessage::Loaded { .. },
+                HostMessage::Workers { version: 4, .. }
+            ]
+        ));
+        assert!(matches!(
+            messages.recv().await,
+            Some(HostMessage::Event { .. })
+        ));
+        drop(host.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_host_that_closes_before_it_announces_is_not_taken_over() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let refused = HostControl::connect_announced(&path).await;
+        assert!(
+            refused
+                .err()
+                .is_some_and(|error| error.to_string().contains("before it said"))
         );
     }
 }

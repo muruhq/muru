@@ -166,12 +166,12 @@ release's, so the more specific ones take precedence.
 
 The daemon's table is read when a host starts. After `muructl daemon
 reload`, each application takes the new defaults at its next restart or
-deploy. `muructl config show --effective` lists each key in force for
+deploy. `muructl deployment show --effective` lists each key in force for
 each release with where it comes from: `daemon configuration`,
 `[tool.muru]` or `the release table`:
 
 ```console
-$ muructl config show shop --effective
+$ muructl deployment show --app shop --effective
 ...
 #   shop@r3: logging.python.format = json (daemon configuration)
 #   shop@r3: logging.python.level = INFO ([tool.muru])

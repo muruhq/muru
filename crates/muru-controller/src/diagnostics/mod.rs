@@ -128,7 +128,7 @@ pub struct WorkerFacts {
 }
 
 /// One effective setting of a release, with the layer it came from, as
-/// `muructl config show --effective` reports it.
+/// `muructl deployment show --effective` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Setting {
     /// What it is a setting of: `app@id`, or `app@id group NAME` and
@@ -143,7 +143,7 @@ pub struct Setting {
 }
 
 impl Setting {
-    /// A setting from a line of `config show --effective`, which reads
+    /// A setting from a line of `deployment show --effective`, which reads
     /// `SCOPE: KEY = VALUE (SOURCE)`; none for a line of another shape,
     /// such as the one a release with no layers recorded has.
     pub fn parse(line: &str) -> Option<Self> {

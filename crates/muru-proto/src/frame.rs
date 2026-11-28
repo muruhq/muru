@@ -55,6 +55,12 @@ pub mod kind {
     /// `WorkerRecord`), worker to edge, after the response's end when the
     /// request head asked for it (section 11.7).
     pub const RECORD: u8 = 13;
+    /// The worker is stopping and takes no more requests on the
+    /// connection, which it closes (empty payload), worker to edge. A
+    /// request the edge wrote that has had no frame of a response
+    /// before this one was not started, so the edge may send it to
+    /// another connection (section 5.3, issue 986).
+    pub const STOPPING: u8 = 14;
     // Kind 10 is reserved for INFORMATIONAL (design specification
     // section 5.2).
 }

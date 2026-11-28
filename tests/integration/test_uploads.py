@@ -522,7 +522,7 @@ def test_the_route_list_and_the_export_show_the_upload_keys(site: Site) -> None:
     assert "[uploads multipart, precheck]" in listed
     assert "[max body 20MB]" in listed
 
-    exported = site.daemon.muructl("config", "export").stdout
+    exported = site.daemon.muructl("deployment", "export").stdout
     assert 'upload = "raw"' in exported
     assert "precheck = true" in exported
     assert 'spool_quota = "64KB"' in exported

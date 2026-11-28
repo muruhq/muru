@@ -313,7 +313,8 @@ cleared`, and `muructl overlay list` shows a skip with no end as
 
 `preconditions.probe` is a path that release must answer with a 2xx or
 3xx response as well, asked through the edge as a preview of the release,
-at the host of the first route the overlay changes:
+which the daemon sends with the release's preview secret, at the host of
+the first route the overlay changes:
 
 ```toml
 preconditions = { release_ready = 'r43', probe = '/healthz' }
@@ -337,14 +338,15 @@ muructl overlay promote cutover-r43
 
 `list` shows each overlay's state, its trigger and what it changes.
 `preview` shows what activating it now would change, field by field.
-`muructl config show --effective`, for every application or one, writes
+`muructl deployment show --effective`, for every application or with
+`--app` for one, writes
 the configuration with the active overlays' changes in the routes,
 headed by what each active overlay sets that is in force, and then by
 where each release setting came from (see the
 [daemon guide](daemon.md#declaring-applications-in-files)):
 
 ```console
-$ muructl config show shop --effective
+$ muructl deployment show --app shop --effective
 # Muru effective state: muructl 0.1.0 on web1, 2026-11-02T02:10:00Z, state version 812.
 # The active overlays set, and the routes below include:
 #   route shop-root: methods.deny = POST, PUT, PATCH, DELETE (overlay nightly-backup)

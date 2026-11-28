@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import time
 from collections.abc import Callable
 
@@ -110,7 +111,10 @@ def test_force_recovers_a_frozen_worker(daemon: Daemon) -> None:
             pass
 
 
-def test_all_restarts_every_worker_in_turn(daemon: Daemon) -> None:
+def test_all_restarts_every_worker_in_turn_by_one_call(daemon: Daemon) -> None:
+    """Section 10.14: the release's host takes the turns, and the call
+    waits, returns at once or is cancelled."""
+
     before = deploy_shop(daemon)
 
     with Load(daemon.port) as load:
@@ -120,4 +124,72 @@ def test_all_restarts_every_worker_in_turn(daemon: Daemon) -> None:
     load.check("a rolling restart")
     after = workers(daemon)
     assert after[0] != before[0] and after[1] != before[1], (before, after)
-    assert output.count("is served by pid") == 2, output
+    assert output.splitlines() == [
+        "muru: 2 workers of shop@r1 marked to be replaced, each in its turn",
+        "muru: the restart of shop@r1 has finished",
+    ]
+
+    events = daemon.muructl("events").stdout
+    assert events.count("worker.restarted") == 2, events
+    started, finished = events.index("restart.started"), events.index("restart.finished")
+    assert started < events.index("worker.restarted") < finished, events
+    assert "worker.swap_waiting" not in events, events
+
+    # It returns at once when asked to, the release says how far it has
+    # got, and a cancel leaves the worker not yet replaced as it was.
+
+    asked = daemon.muructl("restart", "shop", "--all", "--no-wait", "--json").stdout
+    answer = json.loads(asked)
+    assert [worker["pid"] for worker in answer["workers"]] == [after[0], after[1]], answer
+    assert answer["restart"]["total"] == 2, answer
+    shown = daemon.muructl("release", "show", "shop@r1").stdout
+    assert "of 2 workers still to be replaced, each in its turn" in shown, shown
+
+    cancelled = daemon.muructl("restart", "shop", "--cancel").stdout
+    assert cancelled == "muru: the restart of shop@r1 is cancelled: 1 worker left as it was\n"
+    wait_for(lambda: "restart  " not in daemon.muructl("release", "show", "shop@r1").stdout)
+    final = workers(daemon)
+    assert final[0] != after[0] and final[1] == after[1], (after, final)
+    assert "cancelled: 1 of the 2 marked workers" in daemon.muructl("events").stdout
+
+    # With nothing under way a cancel says so, a group is one the
+    # release has, and the restart is no debug operation.
+
+    for arguments, expected in [
+        (["restart", "shop", "--cancel"], "no restart is under way"),
+        (["restart", "shop", "--group", "nosuch"], "no worker group nosuch"),
+        (["restart", "shop", "--all", "--force"], "'--all' cannot be used with '--force'"),
+    ]:
+        refused = daemon.muructl(*arguments, check=False)
+        assert refused.returncode != 0 and expected in refused.stderr, refused.stderr
+
+
+def test_a_control_connection_that_ends_is_made_again(daemon: Daemon) -> None:
+    """Issue 983: the daemon connects again to a host that closed its
+    control connection, and is the host's supervisor as before."""
+
+    before = deploy_shop(daemon)
+
+    # A host has one supervisor, so another connection to its control
+    # socket has it close the daemon's, as it does when a send to a
+    # daemon that has stalled does not complete.
+
+    other = socket.socket(socket.AF_UNIX)
+    other.connect(str(daemon.host_sockets("shop@r1") / "control.sock"))
+    daemon.wait_for_log("release shop@r1: the host control connection ended and was made again")
+    other.close()
+
+    # The daemon hears the host again: a restart of every worker is
+    # carried out and waited for, its events arrive, and the edge is
+    # given the new workers' sockets.
+
+    output = daemon.muructl("restart", "shop", "--all").stdout
+    assert output.splitlines()[-1] == "muru: the restart of shop@r1 has finished", output
+    after = workers(daemon)
+    assert after[0] != before[0] and after[1] != before[1], (before, after)
+    events = daemon.muructl("events").stdout
+    assert events.count("worker.restarted") == 2, events
+    assert "restart  " not in daemon.muructl("release", "show", "shop@r1").stdout
+
+    for _ in range(8):
+        assert daemon.get("/").status == 200

@@ -29,6 +29,8 @@ Recipes for specific tasks, assuming you already know the basics. The
 ## Deploying
 
 - [The daemon](daemon.md): starting it and deploying applications.
+- [Commands and files](commands-and-files.md): running a node by
+  command, from files kept in version control, or both.
 - [Running under systemd](systemd.md): the daemon as a system service.
 - [Per-application users](users.md): the edge and each application as a
   user of its own.
@@ -60,6 +62,12 @@ Recipes for specific tasks, assuming you already know the basics. The
   and previewing.
 - [Rollouts](rollouts.md): canaries and blue/green switches judged by
   gates.
+- [Upgrading in place on a host with limited memory](upgrading-in-place.md):
+  a canary by hand, with the releases sized at each step, on a node
+  that cannot hold two full copies.
+- [A worker that needs a resource to itself](exclusive-workers.md): one
+  worker stopped before its replacement starts, and a deploy that stops
+  the old release first.
 - [Overlays](overlays.md): configuration laid over the routes by hand or
   on a schedule.
 - [Conditions](conditions.md): when something holds over Muru's own
@@ -120,6 +128,9 @@ Recipes for specific tasks, assuming you already know the basics. The
 - [Inspecting workers](debugging.md): stacks, profiles, memory and a
   debugger in running workers, a report to attach to a bug report, and
   a bundle of a whole system for triage.
+- [Check Muru itself](doctor.md): every socket and file of an
+  installation with its owner and condition, checks of one part against
+  another, and the state store read on its own.
 - [Inspecting requests in development](toolbar.md): the debug toolbar
   on each page, timings in the browser, and a record of each request a
   development run serves.
@@ -159,6 +170,7 @@ mounts
 handoff
 grpc
 daemon
+commands-and-files
 systemd
 users
 secrets
@@ -173,6 +185,8 @@ instances
 named-instances
 traffic
 rollouts
+upgrading-in-place
+exclusive-workers
 overlays
 conditions
 client-classes
@@ -199,6 +213,7 @@ metrics
 events
 dashboard
 debugging
+doctor
 toolbar
 panels
 instrumentation

@@ -68,7 +68,7 @@ fallback](#mixing-files-and-an-application).
 Under the daemon a directory in the source is read from the release's
 own source, so the release the request was routed to serves its own
 files: a canary answers with its own assets, and a rollback brings the
-old ones back with the old code. `muructl config export` writes such a
+old ones back with the old code. `muructl deployment export` writes such a
 directory as `source:SUBDIR`, so the exported release names its own
 source's directory rather than one path on one node. `muructl run`
 prints each entry at start-up and refuses a directory that does not

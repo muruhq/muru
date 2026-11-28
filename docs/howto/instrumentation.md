@@ -46,7 +46,7 @@ and `[instrumentation.settings]`.
   entry drops it.
 
 - **Checking.** `muructl run --print-config`, `muructl serve
-  --print-config`, `muructl deploy --dry-run` and `muructl config
+  --print-config`, `muructl deploy --dry-run` and `muructl deployment
   export` show the list.
 
 A module may be listed once. `module` is a dotted Python module name.

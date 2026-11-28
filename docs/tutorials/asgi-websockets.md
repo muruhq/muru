@@ -59,7 +59,7 @@ muru.host[4242]: worker 0 (pid 4243) is ready
 muru: serving chat:application on http://127.0.0.1:8080 with 1 worker of concurrency 1000
 muru: development mode: error pages show tracebacks, no releases are kept, the run reloads on change and only loopback is served; production runs under the daemon (muructl daemon start)
 muru: dashboard on http://127.0.0.1:8081/
-muru: pid 4240, written to /run/user/1000/muru/run-7f3a9c2e/pid
+muru: pid 4240, written to /home/dev/.local/state/muru/run/run-7f3a9c2e/pid
 muru: admin socket /run/user/1000/muru/run-7f3a9c2e/admin.sock
 muru: watching /home/dev/chat for changes to **/*.py
 ```

@@ -87,8 +87,8 @@ pub struct Spec {
 pub struct RelaySpec {
     /// The executable to run `relay run` from: this program.
     pub executable: PathBuf,
-    /// The directory each relay's control socket and record are in.
-    pub run_dir: PathBuf,
+    /// The directories each relay's control socket and record are in.
+    pub dirs: crate::locations::HostDirs,
     /// What each relay queues and does when full.
     pub settings: crate::host::RelaySettings,
     /// The release, as app@release, for the relay's process title.
@@ -107,7 +107,7 @@ impl fmt::Debug for RelaySpec {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RelaySpec")
-            .field("run_dir", &self.run_dir)
+            .field("dirs", &self.dirs)
             .field("release", &self.release)
             .finish_non_exhaustive()
     }
@@ -116,12 +116,12 @@ impl fmt::Debug for RelaySpec {
 impl RelaySpec {
     /// The control socket of the relay of the instance with `index`.
     fn control(&self, index: u32) -> PathBuf {
-        self.run_dir.join(format!("relay-{index}.sock"))
+        self.dirs.sockets.join(format!("relay-{index}.sock"))
     }
 
     /// The record the relay of the instance with `index` keeps.
     fn record(&self, index: u32) -> PathBuf {
-        self.run_dir.join(format!("relay-{index}.toml"))
+        self.dirs.files.join(format!("relay-{index}.toml"))
     }
 }
 

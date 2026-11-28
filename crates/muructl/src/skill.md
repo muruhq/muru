@@ -45,15 +45,15 @@ command or tool reaches that instance.
 | Roll back | `rollback` | `rollback APP` | Returns to the previous release, which is kept warm for a while after a deploy |
 | Drain | `drain` | `drain APP@RELEASE` | Leaves the release; its workers stop once their requests finish |
 | Canary | `rollout` with `canary` | `rollout canary APP@RELEASE --steps 10,50` | Shifts in steps; each step's gates (error rate, latency, worker faults) promote or roll back on their own |
-| Apply | `apply` | `apply --file muru.daemon.toml` | Whatever the file declares: a new release in it deploys as `deploy` does |
-| Apply held | `apply` with `hold` | `apply --file muru.daemon.toml --hold` | Stays where it is; every release the apply adds runs beside what serves |
+| Apply | `apply` | `apply --file muru.deploy.toml` | Whatever the file declares: a new release in it deploys as `deploy` does |
+| Apply held | `apply` with `hold` | `apply --file muru.deploy.toml --hold` | Stays where it is; every release the apply adds runs beside what serves |
 | Plan a deploy | `deploy` with `dry_run` | `deploy APP SOURCE --dry-run` | None; reports the release a deploy would make, each setting with where it would come from, and what would refuse it |
 | Run a command | `run_command` | `command run APP NAME --input K=V` | None; runs a command the release declares (a migration, a data fix, a check) with the release's interpreter and settings |
 
 `deploy` adds one release; `apply` makes a declarative file the whole
-desired state. Use `apply` when the project has a `muru.daemon.toml`, `deploy`
+desired state. Use `apply` when the project has a `muru.deploy.toml`, `deploy`
 for a quick release of the working tree. `muructl render APP SOURCE
---release ID` writes a `muru.daemon.toml` for one release from a source
+--release ID` writes a `muru.deploy.toml` for one release from a source
 directory and `deploy`'s settings, without the daemon.
 
 ## The development loop
@@ -62,7 +62,7 @@ directory and `deploy`'s settings, without the daemon.
    the MCP server was started with `--up`, which has done it.
 
 2. Deploy the working tree: `deploy` with `app` and `source` set to the
-   project directory, or `apply` with the project's `muru.daemon.toml`. Wait for
+   project directory, or `apply` with the project's `muru.deploy.toml`. Wait for
    the result: it is the release, with its `state` (`ready` or `failed`)
    and a `message` saying why it failed.
 
@@ -148,5 +148,26 @@ directory and `deploy`'s settings, without the daemon.
   Check it before starting a run, and after stopping one, to see what
   was left running.
 
+- `doctor` checks Muru itself and changes nothing: every socket and
+  file of the daemon with its owner and condition, and checks of one
+  part against another, each failure naming the command that puts it
+  right. When something looks wrong with Muru and not with the
+  application (an instance that runs and is not listed, a release the
+  daemon says is ready that nothing answers for, a command that cannot
+  reach the daemon), run it first, with `store` for the state store and
+  `timeline` for what happened last, and include what it says when
+  reporting the problem. Do not run the command it names without being
+  asked when that command stops or removes something.
+
+- The daemon's own configuration file holds the node's settings, such
+  as listeners, limits and `[daemon] detours`, and nothing of what it
+  serves. `daemon_config` shows it (`full` for every setting with its
+  default) or checks it. `set_daemon_config` sets one key by its dotted
+  path, or takes it out when given no value; the file is checked before
+  it is written, and the daemon reloads it. A setting the answer lists
+  under `stale` is read only when the daemon starts: give `restart`, and
+  the daemon restarts in place with everything it serves still serving.
+
 - Do not stop, upgrade or reconfigure the daemon unless asked: other
-  applications may share it.
+  applications may share it. When asked to change a setting, change
+  that one key and leave the rest of the file as it is.

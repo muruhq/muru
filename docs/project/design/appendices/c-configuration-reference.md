@@ -75,7 +75,8 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | min_workers = 0 (scale to zero), host_idle_timeout | group; host_idle_timeout in the release's own scaling table | none, off | 7.4 |
 | priority (the order in which the node's budget admits scale-ups, highest first) | application | 0 | 7.4 |
 | serving (the release that serves the application's traffic; the others an apply adds are held) | application | the last release in id order an apply adds, else the one that serves | 10.4 |
-| max_requests, max_lifetime, max_surge | group | off, off, 1 | 7.7 |
+| max_requests, max_lifetime | release, group | off, off | 7.7 |
+| max_surge, max_unavailable (how many workers a group may run over and under its count while workers are swapped) | release, group | 1, 0 | 7.8 |
 | memory.measure, soft_limit, soft_for, reclaim_first, hard_limit, check_interval, malloc_arena_max, allocator | group | uss, off, 2m, true, off, 5s, unset, system | 7.7 |
 | timeouts (soft_timeout, hard_timeout, hard_drain_grace, shutdown_timeout, websocket_drain_grace, exit_grace, loop_stall_timeout, gil_stall_timeout, idle_timeout) | release, group, except shutdown_timeout, websocket_drain_grace and exit_grace, which are the release's | off, off, 10s, 5s, 0s, 2s, 10s, 30s, 60s | 7.6 |
 | timeouts (queue_timeout, request_deadline, body_idle_timeout, response_idle_timeout) | host, release, group, route | 5s, 300s, 60s, 60s, from `[limits]` | 4.6 |
@@ -143,10 +144,10 @@ This is the initial key list. The generated reference (section 18.3) becomes aut
 | Category | Types (prefix dev.muru.) |
 | --- | --- |
 | Configuration | config.applied, config.apply_failed, route.changed, traffic_policy.changed, maintenance.changed, access_log.changed, access_log.reverted |
-| Releases | release.created, release.building, release.built, release.build_failed, release.loaded, release.state_changed, release.removed, rollout.started, rollout.step, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden, release.idle, release.woken |
-| Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.oom_killed, worker.recycled, worker.timeout_killed, worker.loop_stalled, worker.gil_stalled, worker.restarted, server.started, server.ready, server.exited, server.failed |
+| Releases | release.created, release.building, release.built, release.build_failed, release.loaded, release.state_changed, release.removed, rollout.started, rollout.step, rollout.capacity, rollout.gate_failed, rollout.completed, rollout.rolled_back, deploy.freeze_overridden, release.idle, release.woken |
+| Processes | host.started, host.exited, worker.started, worker.ready, worker.exited, worker.oom_killed, worker.recycled, worker.timeout_killed, worker.loop_stalled, worker.gil_stalled, worker.restarted, worker.swap_waiting, restart.started, restart.finished, host.events_dropped, server.started, server.ready, server.exited, server.failed |
 | Capacity | scaling.decision, scaling.denied_by_budget, churn_budget.exhausted, schedule.activated, schedule.expired, schedule.end_refused, schedule.over_budget |
-| Platform | daemon.started, daemon.upgraded, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, logs.rotated, logs.truncated, logs.pruned, clock.unsynchronised, clock.synchronised |
+| Platform | daemon.started, daemon.upgraded, daemon.restarted, edge.replaced, snapshot.applied, snapshot.rejected, certificate.renewed, certificate.expiring, logs.reopened, logs.rotated, logs.truncated, logs.pruned, clock.unsynchronised, clock.synchronised |
 | Warnings | preload.unsafe_import, preload.fell_back, release.import_failed, memory.leak_suspected, upload_spool.full, upstream.unhealthy, upstream.unusable, output.dropping, output.held, output.failing, output.caught_up, output.relay_restarting |
 | Overlays | overlay.activated, overlay.ended, overlay.skipped, overlay.would_activate, overlay.warming, overlay.promoted, overlay.end_refused |
 | Clients | ratelimit.enforcing, client_class.list_reloaded |

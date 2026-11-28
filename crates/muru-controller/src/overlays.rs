@@ -1150,7 +1150,7 @@ pub fn preview(overlay: &Overlay, routes: &[Route], maintenance: &BTreeSet<Strin
 }
 
 /// Section 9.10: what the active overlays set that is in force, one line
-/// per field, for `config show --effective`. They apply in order, so a
+/// per field, for `deployment show --effective`. They apply in order, so a
 /// later overlay's setting of a field replaces an earlier one's.
 pub fn attribute(
     routes: &[Route],

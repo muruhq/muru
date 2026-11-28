@@ -297,8 +297,9 @@ setting over it.
 
 `--interface`, `--factory`, `--sync-threads`, `--concurrency`,
 `--preload`, `--hooks`, `--timeout`, `--max-body-size`, `--max-requests`,
-`--max-lifetime`, `--memory`, the connection limits, `--static` and
-`--no-compression` work as they do for [`muructl run`](run-settings.md).
+`--max-lifetime`, `--max-surge`, `--max-unavailable`, `--memory`, the
+connection limits, `--static` and `--no-compression` work as they do
+for [`muructl run`](run-settings.md).
 
 ## The application's name
 

@@ -137,7 +137,7 @@ app = "echo"
     assert "[max body 1KB] [queue_timeout 2s, request_deadline 1s]" in hosts, hosts
     routes = daemon.muructl("route", "list").stdout
     assert "[max body 1MB]" in routes and "[request_deadline 20s]" in routes, routes
-    effective = daemon.muructl("config", "show", "--effective").stdout
+    effective = daemon.muructl("deployment", "show", "--effective").stdout
 
     for line in [
         "route api /: max_body_size = 1KB (host api)",

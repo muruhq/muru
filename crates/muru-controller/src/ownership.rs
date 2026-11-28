@@ -1,32 +1,41 @@
 //! A daemon owns its state directory and its run directory for as long as
 //! it runs (design specification section 13.3, issue 804).
 //!
-//! The daemon takes an exclusive `flock` on `STATE/daemon.lock` and
-//! `RUN/daemon.lock` as the first thing it does once its locations are
-//! resolved, before it re-adopts an edge or a host, writes its pid file,
-//! or removes and binds its admin socket. A second daemon on either
-//! directory cannot take the lock and is refused before it touches
-//! anything, so it can never take over a running daemon's socket and
-//! edge. The kernel releases the locks when the process ends, however it
-//! ends, so a daemon that died leaves nothing that stops the next.
+//! The daemon takes an exclusive `flock` on `STATE/daemon.lock` and on
+//! the run directory itself as the first thing it does once its
+//! locations are resolved, before it re-adopts an edge or a host, writes
+//! its pid file, or removes and binds its admin socket. A second daemon
+//! on either directory cannot take the lock and is refused before it
+//! touches anything, so it can never take over a running daemon's socket
+//! and edge. The kernel releases the locks when the process ends,
+//! however it ends, so a daemon that died leaves nothing that stops the
+//! next.
 //!
-//! Each lock file holds the owner's pid and admin socket, so a refusal
-//! names them whichever directory the two daemons share. The descriptors
-//! are close-on-exec, so no edge, host or command inherits them; an
-//! upgrade, which runs the daemon's binary again in the same process,
-//! clears the flag for that exec alone and names the descriptors on the
-//! new command line, so the locks are never released along the way.
+//! The run directory holds sockets and no regular file (section 13.8,
+//! issue 948), so its lock is on the directory, opened for reading, and
+//! not on a file in it: a lock file under `/tmp` is deleted by age on
+//! macOS while its daemon runs, after which a second daemon would find a
+//! new file of that name free.
+//!
+//! The state directory's lock file holds the owner's pid and admin
+//! socket, so a refusal names them; a refusal over the run directory
+//! names the admin socket, which is in it, and the pid when the instance
+//! registry has it. The descriptors are close-on-exec, so no edge, host
+//! or command inherits them; an upgrade, which runs the daemon's binary
+//! again in the same process, clears the flag for that exec alone and
+//! names the descriptors on the new command line, so the locks are never
+//! released along the way.
 
 use std::fs::File;
 use std::io::Write as _;
 use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::fdpass;
 use crate::locations::Locations;
 
-/// The lock file in each directory the daemon owns.
+/// The lock file in the state directory.
 pub const LOCK_FILE: &str = "daemon.lock";
 
 /// The directories a running daemon owns, held by their locks until it
@@ -47,7 +56,8 @@ const WHAT: [&str; 2] = ["state directory", "run directory"];
 
 impl Ownership {
     /// Take the locks on the state and run directories of `locations`,
-    /// creating the directories when they do not exist. `inherited` are
+    /// creating the directories when they do not exist: the state
+    /// directory's on its lock file, the run directory's on the directory. `inherited` are
     /// descriptors an upgraded daemon was started with, which already
     /// hold the locks and are used in place of new ones. The error says
     /// which directory another daemon uses, with its pid and socket.
@@ -58,26 +68,23 @@ impl Ownership {
             .filter_map(|fd| fdpass::adopt_inherited(*fd))
             .collect();
         let mut held = Vec::new();
-        let mut seen: Vec<PathBuf> = Vec::new();
 
         for (what, location) in WHAT.iter().zip([&locations.state, &locations.run]) {
             std::fs::create_dir_all(&location.path)
                 .map_err(|error| format!("creating {}: {error}", location.path.display()))?;
 
-            // One directory given as both is locked once, since a second
-            // open of its file would conflict with the first.
+            // One directory given as both is locked twice, on its lock
+            // file and on itself, which are two open files and do not
+            // conflict, so a daemon with another state directory is
+            // still refused the run directory.
 
-            let directory = location
-                .path
-                .canonicalize()
-                .unwrap_or_else(|_| location.path.clone());
+            let on_directory = *what == WHAT[1];
 
-            if seen.contains(&directory) {
-                continue;
-            }
-
-            seen.push(directory);
-            let path = location.path.join(LOCK_FILE);
+            let path = if on_directory {
+                location.path.clone()
+            } else {
+                location.path.join(LOCK_FILE)
+            };
 
             // An upgraded daemon's own descriptor for this file, when it
             // was given one, already holds the lock.
@@ -89,22 +96,33 @@ impl Ownership {
                 continue;
             }
 
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)
-                .map_err(|error| format!("opening {}: {error}", path.display()))?;
+            let file = if on_directory {
+                File::open(&path)
+            } else {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)
+            }
+            .map_err(|error| format!("opening {}: {error}", path.display()))?;
 
             let locked = fdpass::try_lock(file.as_raw_fd(), true)
                 .map_err(|error| format!("locking {}: {error}", path.display()))?;
+
+            if !locked && on_directory {
+                return Err(run_refusal(&location.path));
+            }
 
             if !locked {
                 return Err(refusal(what, &location.path, &path));
             }
 
-            write_owner(&file, &socket);
+            if !on_directory {
+                write_owner(&file, &socket);
+            }
+
             held.push(Held { file });
         }
 
@@ -195,6 +213,27 @@ fn refusal(what: &str, directory: &Path, path: &Path) -> String {
     }
 }
 
+/// What a daemon refused the lock on the run directory is told. The
+/// directory has no file to say who holds it, so the admin socket is the
+/// one in it, and the pid is the registry's for the daemon with that run
+/// directory, when it is there.
+fn run_refusal(directory: &Path) -> String {
+    let owner = crate::registry::live(&crate::registry::user_registry())
+        .into_iter()
+        .find(|record| record.kind == crate::registry::Kind::Daemon && record.run_dir == directory);
+
+    let who = match owner {
+        Some(record) => format!("another daemon (pid {})", record.pid),
+        None => "another daemon".to_owned(),
+    };
+
+    format!(
+        "{who} is using the run directory {}; its admin socket is {}",
+        directory.display(),
+        directory.join("admin.sock").display()
+    )
+}
+
 /// Whether `message` is a refusal from [`Ownership::take`], for `muructl
 /// daemon start` to report as itself.
 pub fn is_refusal(message: &str) -> bool {
@@ -228,8 +267,7 @@ mod tests {
         assert_eq!(
             refused,
             format!(
-                "another daemon (pid {}) is using the run directory {}; its admin socket is {}",
-                std::process::id(),
+                "another daemon is using the run directory {}; its admin socket is {}",
                 path.join("run").display(),
                 path.join("run/admin.sock").display()
             )
@@ -247,13 +285,19 @@ mod tests {
     }
 
     #[test]
-    fn the_locks_are_free_once_the_owner_lets_go_and_one_directory_is_locked_once() {
+    fn the_locks_are_free_once_the_owner_lets_go_and_one_directory_can_be_both() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("both");
         let both = locations(&path, &path);
 
         let held = Ownership::take(&both, &[]).expect("one directory as both");
-        assert_eq!(held.held.len(), 1);
+        assert_eq!(held.held.len(), 2);
+
+        // Another state directory with the same run directory is refused.
+
+        let other = locations(&directory.path().join("other"), &path);
+        let refused = Ownership::take(&other, &[]).expect_err("the run directory is owned");
+        assert!(refused.contains("is using the run directory"), "{refused}");
         drop(held);
 
         Ownership::take(&both, &[]).expect("free again once dropped");

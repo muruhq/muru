@@ -317,6 +317,11 @@ pub const FAMILIES: &[Family] = &[
         help: "Workers their host replaced, by reason: max_requests, max_lifetime, memory, hard_timeout, loop_stalled or gil_stalled.",
     },
     Family {
+        name: "muru_worker_swaps_waiting",
+        kind: Kind::Gauge,
+        help: "Replacements of a group's workers waiting their turn under its max_surge and max_unavailable.",
+    },
+    Family {
         name: "muru_worker_exits_total",
         kind: Kind::Counter,
         help: "Workers that exited, by reason: scaled_in, crashed or start_failed.",

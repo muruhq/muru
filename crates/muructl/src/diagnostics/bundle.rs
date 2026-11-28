@@ -298,6 +298,7 @@ impl<W: Write> Bundle<'_, W> {
         self.figures().await?;
         self.host().await?;
         self.failures()?;
+        self.doctor().await?;
         self.asked_for().await?;
 
         // What was noted while reaching the installation and collecting
@@ -319,6 +320,42 @@ impl<W: Write> Bundle<'_, W> {
             archive: self.archive,
             configuration_changed,
         })
+    }
+
+    /// What `muructl doctor` finds of a daemon's installation now (issue
+    /// 950): its sockets and files with their owners and conditions and
+    /// the checks of one part against another, and the checks of the
+    /// state store. `muructl doctor --bundle` prints them elsewhere. The
+    /// store itself is never taken, since it holds the releases'
+    /// environment values, which a bundle does not.
+    async fn doctor(&mut self) -> io::Result<()> {
+        let Some(mut locations) = self.installation.locations().cloned() else {
+            return Ok(());
+        };
+
+        // The daemon in reach says where its sockets are, which the
+        // locations of its files do not.
+
+        if let Some(status) = self.installation.status() {
+            locations.run = muru_controller::locations::Location {
+                path: PathBuf::from(&status.run_dir),
+                rule: "daemon",
+            };
+        }
+
+        let store = locations.state_store();
+
+        if self.asks(crate::doctor::BUNDLE_REPORT) {
+            let report = crate::doctor::examine(locations).await;
+            self.put(crate::doctor::BUNDLE_REPORT, Ok(report))?;
+        }
+
+        let checked = match store.is_file() {
+            true => crate::doctor::examine_store(&store).map_err(|error| format!("{error:#}")),
+            false => Err(format!("there is no state store at {}", store.display())),
+        };
+
+        self.put(crate::doctor::BUNDLE_STORE, checked)
     }
 
     /// Add a part as text, or record why there is none.
@@ -353,7 +390,7 @@ impl<W: Write> Bundle<'_, W> {
     /// `config/`: the configuration in force on the system. With the
     /// state store in reach, every release's effective settings and its
     /// specification, the whole effective configuration and what is in
-    /// force outside it; without, what `muructl config show --effective`
+    /// force outside it; without, what `muructl deployment show --effective`
     /// prints. Beside them the daemon's own file, what only the running
     /// daemon knows, and every change the window's events record.
     ///
@@ -569,7 +606,7 @@ impl<W: Write> Bundle<'_, W> {
         Ok(Some(changes > 0))
     }
 
-    /// The effective configuration as `muructl config show --effective`
+    /// The effective configuration as `muructl deployment show --effective`
     /// prints it, asked of what runs: what each overlay sets, each
     /// release's settings with where each came from, then the document,
     /// its variables masked as a worker's environment is.
@@ -582,6 +619,7 @@ impl<W: Write> Bundle<'_, W> {
             app: self.target.app.clone(),
             effective: true,
             resolve_rollouts: false,
+            ..pb::ExportConfigRequest::default()
         }))
         .await?;
         let mut text = String::new();

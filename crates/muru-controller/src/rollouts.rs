@@ -309,10 +309,11 @@ pub fn check_probe(url: &str) -> Result<(), String> {
     }
 }
 
-/// Request a probe URL from one release by preview: a 2xx or 3xx answer
+/// Request a probe URL from one release by preview, the release's
+/// preview value, `RELEASE.SECRET` (section 4.22): a 2xx or 3xx answer
 /// within the timeout passes, and anything else says how it failed.
-pub async fn probe(client: &ProbeClient, url: &str, release: &str) -> Result<(), String> {
-    probe_host(client, url, None, release).await
+pub async fn probe(client: &ProbeClient, url: &str, preview: &str) -> Result<(), String> {
+    probe_host(client, url, None, preview).await
 }
 
 /// `probe`, with the Host header given rather than the URL's, for a probe
@@ -321,7 +322,7 @@ pub async fn probe_host(
     client: &ProbeClient,
     url: &str,
     host: Option<&str>,
-    release: &str,
+    preview: &str,
 ) -> Result<(), String> {
     let mut request = http::Request::get(url);
 
@@ -330,7 +331,7 @@ pub async fn probe_host(
     }
 
     let request = request
-        .header(muru_edge::routing::PREVIEW_HEADER, release)
+        .header(muru_edge::routing::PREVIEW_HEADER, preview)
         .header(http::header::USER_AGENT, "muru-probe")
         .body(Empty::new())
         .map_err(|error| format!("{url}: {error}"))?;
@@ -587,6 +588,60 @@ mod tests {
         assert!(check_probe("ftp://example.com/").is_err());
     }
 
+    // Section 9.16: while a step's workers are put in place, the step
+    // before's share is in force.
+
+    #[test]
+    fn a_step_whose_workers_are_not_in_place_has_not_moved_the_traffic() {
+        let step = |percent| crate::model::RolloutStep {
+            percent,
+            hold_ms: 1000,
+        };
+        let mut rollout = Rollout {
+            app: "shop".to_owned(),
+            id: "1".to_owned(),
+            candidate: "r2".to_owned(),
+            baseline: "r1".to_owned(),
+            steps: vec![step(25), step(50)],
+            gates: gates(),
+            approve_each_step: false,
+            state: crate::model::RolloutState::Running,
+            step: 0,
+            step_started_unix_ms: 0,
+            message: String::new(),
+            created_unix_ms: 0,
+            updated_unix_ms: 0,
+            shared: Some(crate::model::SharedCapacity {
+                sizing: true,
+                ..Default::default()
+            }),
+        };
+
+        // Before the first step's traffic the candidate has none, and
+        // before the second's it has the first's, running or paused.
+
+        assert_eq!(rollout.percent(), 0);
+        rollout.step = 1;
+        assert_eq!(rollout.percent(), 25);
+        rollout.state = crate::model::RolloutState::Paused;
+        assert_eq!(rollout.percent(), 25);
+
+        // Once the workers are in place the step's own share is, and
+        // growing the candidate ahead of its promotion moves nothing.
+
+        let shared = rollout.shared.as_mut().unwrap();
+        shared.sizing = false;
+        shared.finishing = true;
+        assert_eq!(rollout.percent(), 50);
+
+        // It is kept with the rollout as it is written.
+
+        let kept: Rollout = toml::from_str(&toml::to_string(&rollout).unwrap()).unwrap();
+        assert_eq!(kept, rollout);
+        rollout.shared = None;
+        assert!(!toml::to_string(&rollout).unwrap().contains("shared"));
+    }
+
     #[test]
     fn a_promotion_by_hand_waits_for_the_rollout_under_way() {
         let rollout = Rollout {
@@ -603,6 +658,7 @@ mod tests {
             message: String::new(),
             created_unix_ms: 0,
             updated_unix_ms: 0,
+            shared: None,
         };
 
         assert_eq!(promotion_refused(None, "shop", "r3"), None);

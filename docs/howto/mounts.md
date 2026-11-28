@@ -194,6 +194,6 @@ globals need separate releases.
 `muructl deploy` takes the mounts from the source's table and `muructl
 apply` from the release's `mounts` tables when present. Mounts are part
 of the release, so a declared release whose mounts differ from what is
-recorded is refused, and `muructl config export` writes them with the
+recorded is refused, and `muructl deployment export` writes them with the
 release. `muructl release show` lists a release's mounts with their
 paths, entrypoints and interfaces, as declared or as detected.

@@ -159,7 +159,7 @@ and target modes need `max_workers`; `min_workers` defaults to 1, and 0
 [scales the group to zero](#scale-to-zero) when idle; `processes` must
 not be over `max_workers` and is raised to `min_workers` when below it.
 In static mode the table takes no other key, so a key that does nothing
-is never written by mistake. `muructl config export` writes the resolved
+is never written by mistake. `muructl deployment export` writes the resolved
 policy with every key.
 
 ## Scheduled capacity
@@ -231,7 +231,7 @@ $ muructl scale shop --group reports --min 2 --max 4 --until 2026-11-02T18:00 --
 This makes a temporary overlay, `shop:scale` or `shop:scale:reports`,
 which the next such command for the group replaces, `muructl overlay end`
 ends early, and which is forgotten once it ends. `muructl apply` leaves it
-alone and `muructl config export` does not write it.
+alone and `muructl deployment export` does not write it.
 
 ## Capacity on a condition
 
@@ -402,7 +402,9 @@ a container or under a systemd unit with `MemoryMax=` or `CPUQuota=`:
 `memory` to `memory.max` less a headroom of 10% (at least 128MB), and
 `cpu` to the quota of `cpu.max`. These are read at each decision, so a
 resize of the container applies to the next one, and a value in the
-file wins. `muructl daemon reload` picks up a change to the file. A
+file wins. A node with no memory limit from either has no memory
+budget at all, which [`muructl doctor`](doctor.md#a-node-with-no-memory-limit)
+warns of. `muructl daemon reload` picks up a change to the file. A
 worker counts at its group's `memory.hard_limit` when one is set, else
 at what its group's workers measure, its proportional set size and the
 CPU it uses, and before any has reported at the group's
@@ -439,6 +441,60 @@ for another scale-out window. Each new shortfall is a
 to make room for another application, a pin is not limited by the budget,
 and an advisory policy reports without it.
 
+### Room for replacing workers
+
+A worker is [replaced](recycling.md#how-many-at-once-and-in-which-order)
+by starting its replacement beside it, so a group runs one worker over
+its count for the length of each replacement, or as many as its
+`max_surge`. The budget holds that room: each group of each release
+that takes traffic is granted a surge allowance of its `max_surge`
+workers, or as many of them as the budget has room for, and what is
+granted counts as held, as `muructl daemon status` shows:
+
+```
+budget   3 of 3 workers, 1 worker held for swaps
+```
+
+Allowances are granted before scale-outs, the applications with a
+higher `priority` first, and are worked out again every second, so a
+changed limit, a resized container, a scale-out or a move of traffic
+changes them for the next replacement. A node with many groups holds a
+worker's worth of its budget for each of them; `max_surge = 0` on a
+group gives its share back, and its workers then stop before their
+replacements start.
+
+A group granted less than its `max_surge` replaces fewer workers at
+once. Granted none, a recycle stops the old worker first when the
+group's `max_unavailable` allows it, and otherwise waits for room,
+with a `worker.swap_waiting` event that names the limit:
+
+```
+worker.swap_waiting  shop@r1  worker 1 (pid 13027) waits to be replaced (served 1027 requests (max_requests 1000)): the node's worker budget has no room for another worker of the group default over its count
+```
+
+A worker that has to be replaced, one past its hard timeout or over
+its hard memory limit, is not held back: with no allowance it stops
+first and its replacement starts once it has exited.
+
+A release that takes no traffic, one held for a preview or kept warm
+for a rollback, is granted no allowance whatever its `max_surge`, and
+its workers stop before their replacements start whatever its
+`max_unavailable`. A held release with one worker does not answer a
+preview for the moment its worker is replaced. `muructl release show`
+says when a release or a group has less than its `max_surge`:
+
+```
+swaps        max_surge 1, max_unavailable 0 (the new worker starts first); no surge allowance now, since the node's worker budget has no room
+```
+
+On a node with no budget every group that takes traffic has its
+`max_surge`. A release's host keeps the allowances it was last given
+while the daemon is stopped or being upgraded. Under `muructl run` and
+`muructl serve` there is no budget for this, and a group has its
+`max_surge`.
+
+### Releases and the budget
+
 Before a release starts for a deploy, a rollout or a traffic policy, its
 memory is estimated from the application's serving release, else from
 its `memory.soft_limit`. When it fits only with the retained releases
@@ -452,6 +508,38 @@ takes the node over the workers limit stops retained releases, oldest
 first, until it is back under, and until then other releases' scale-out
 is refused. While the node is over its memory budget, retained releases
 are stopped, oldest first.
+
+A release can start with fewer workers than it is declared with:
+
+```console
+$ muructl deploy shop /srv/shop-2 --hold --initial-processes 1
+muru: release shop@r2 is ready and held: not serving
+```
+
+`--initial-processes N` is the count each worker group of the release
+starts with, and the count the deploy is checked against the budget at.
+`--initial-processes NAME=N` gives one [worker group](worker-groups.md)'s,
+over the release's; a group whose `processes` is lower than the
+release's count starts at its own. The count must be at least 1 and no
+more than the `processes` the group is declared with, which the release
+keeps as its own count: `muructl release show` gives both, as `4
+processes of 3 threads; 1 to start with and while it takes no traffic`.
+
+While the release takes no share of its application's traffic, each
+group stays at its initial count, whatever its `processes` or its
+scaling policy says. A [pin](#watching-and-overriding) moves a group
+meanwhile, and the group returns to its initial count when the pin is
+lifted. Once the release takes traffic, from a rollout's first step, a
+promotion or a deploy without `--hold`, each group is brought to its
+`processes`, or sized by its scaling policy from its `min_workers` up,
+and the workers that takes are admitted by the budget as any scale-out
+is. A release started again later, after a rollback to one that had
+stopped say, starts at its initial count again and grows the same way.
+The option is for a release of workers, and is refused with `--server`.
+
+When a new release at full size does not fit beside the one that
+serves, the application is upgraded a step at a time: see
+[upgrading in place on a host with limited memory](upgrading-in-place.md).
 
 A retained release counts against the budget with the workers it keeps.
 After a [rollout](rollouts.md) is rolled back or aborted, its candidate
@@ -481,8 +569,8 @@ reports      1            0/1        1.00    -             0/6        target 1-6
   diagnosis: idle
 ```
 
-`scale status` shows the application's serving release unless
-`--release` names another. When a route splits its traffic, by its own
+`scale status` shows the application's serving release, and another
+when it is named, as `muructl scale status shop@r43`. When a route splits its traffic, by its own
 policy or an [overlay](overlays.md)'s pin or split, a `traffic:` line
 below the release says its share of each such route, such as `traffic:
 none, shop-root sends 100% to r43 (overlay cutover-r43)` for a serving

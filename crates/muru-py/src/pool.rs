@@ -456,6 +456,26 @@ pub struct Shared {
     /// Set when the worker closes its open WebSockets on its way to
     /// stopping (section 5.6).
     draining: tokio::sync::watch::Sender<bool>,
+    /// Set when the worker is told to stop (section 5.3, issue 986): a
+    /// link connection takes no request from then on, and tells the
+    /// edge so. The flag is what a connection decides by, and the
+    /// channel wakes those waiting for a request.
+    link_stopping: AtomicBool,
+    link_stopped: tokio::sync::watch::Sender<bool>,
+    /// The link connections open, and those that have a request's first
+    /// bytes and have not yet finished with it.
+    link_open: AtomicU32,
+    link_busy: AtomicU32,
+}
+
+/// Counts a link connection as open, or as busy with a request, until it
+/// is dropped.
+pub struct LinkCount<'a>(&'a AtomicU32);
+
+impl Drop for LinkCount<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Shared {
@@ -492,7 +512,55 @@ impl Shared {
             sync_threads: [const { AtomicU32::new(0) }; SYNC_POOLS.len()],
             active: Mutex::new(HashMap::new()),
             draining: tokio::sync::watch::channel(false).0,
+            link_stopping: AtomicBool::new(false),
+            link_stopped: tokio::sync::watch::channel(false).0,
+            link_open: AtomicU32::new(0),
+            link_busy: AtomicU32::new(0),
         })
+    }
+
+    /// The worker is stopping: no link connection takes a request from
+    /// here on.
+    pub fn stop_link(&self) {
+        self.link_stopping.store(true, Ordering::SeqCst);
+        self.link_stopped.send_replace(true);
+    }
+
+    /// Whether the worker has been told to stop.
+    pub fn link_stopping(&self) -> bool {
+        self.link_stopping.load(Ordering::SeqCst)
+    }
+
+    /// Becomes true when the worker is told to stop, for a link
+    /// connection waiting for a request.
+    pub fn link_stopped(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.link_stopped.subscribe()
+    }
+
+    /// Count a link connection as open until the count is dropped.
+    pub fn link_opened(&self) -> LinkCount<'_> {
+        self.link_open.fetch_add(1, Ordering::SeqCst);
+        LinkCount(&self.link_open)
+    }
+
+    /// Count a link connection as busy with a request, from the
+    /// request's first bytes, until the count is dropped. The caller
+    /// looks at `link_stopping` after this and not before, so a worker
+    /// that stops sees the request counted or the connection sees the
+    /// stop.
+    pub fn link_busied(&self) -> LinkCount<'_> {
+        self.link_busy.fetch_add(1, Ordering::SeqCst);
+        LinkCount(&self.link_busy)
+    }
+
+    /// The link connections open.
+    pub fn link_open(&self) -> u32 {
+        self.link_open.load(Ordering::SeqCst)
+    }
+
+    /// The link connections that are busy with a request.
+    pub fn link_busy(&self) -> u32 {
+        self.link_busy.load(Ordering::SeqCst)
     }
 
     /// Whether the worker is closing its WebSockets to stop, for each

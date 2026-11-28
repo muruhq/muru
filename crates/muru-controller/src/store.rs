@@ -3,7 +3,7 @@
 //! 10.2). Every access goes through one connection behind a mutex; the
 //! store is small and the reconciler is the only writer.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS releases (
     resource_version INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (app, id)
 );
+CREATE TABLE IF NOT EXISTS release_numbers (last INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS hosts (
     name TEXT PRIMARY KEY,
     spec TEXT NOT NULL,
@@ -85,6 +86,13 @@ CREATE TABLE IF NOT EXISTS events (
     subject TEXT NOT NULL,
     level TEXT NOT NULL,
     message TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS host_events (
+    app TEXT NOT NULL,
+    release TEXT NOT NULL,
+    stream INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    PRIMARY KEY (app, release)
 );
 CREATE TABLE IF NOT EXISTS event_sinks (
     name TEXT PRIMARY KEY,
@@ -175,6 +183,12 @@ CREATE TABLE IF NOT EXISTS import_reports (
     report TEXT NOT NULL,
     PRIMARY KEY (app, release)
 );
+CREATE TABLE IF NOT EXISTS ownership (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    deployment TEXT NOT NULL,
+    PRIMARY KEY (kind, key)
+);
 CREATE TABLE IF NOT EXISTS log_periods (
     path TEXT PRIMARY KEY,
     period TEXT NOT NULL
@@ -190,7 +204,59 @@ CREATE TABLE IF NOT EXISTS log_files_seen (
 const EVENT_RETENTION: u64 = 10_000;
 
 /// The schema this build writes.
-const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 24;
+
+/// Insert an event that happened at `happened_unix_ms`, or now when none
+/// is given, and drop those past retention. A time ahead of the clock is
+/// taken as now.
+fn insert_event(
+    connection: &Connection,
+    kind: &str,
+    subject: &str,
+    level: &'static str,
+    message: &str,
+    happened_unix_ms: Option<u64>,
+) -> Result<Event, StoreError> {
+    let now = now_unix_ms();
+    let time_unix_ms = happened_unix_ms.map_or(now, |happened| happened.min(now));
+    connection.execute(
+        "INSERT INTO events (time_unix_ms, type, subject, level, message) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![time_unix_ms as i64, kind, subject, level, message],
+    )?;
+    let sequence = connection.last_insert_rowid() as u64;
+    connection.execute(
+        "DELETE FROM events WHERE sequence <= ?1",
+        [sequence.saturating_sub(EVENT_RETENTION) as i64],
+    )?;
+
+    Ok(Event {
+        sequence,
+        time_unix_ms,
+        kind: kind.to_owned(),
+        subject: subject.to_owned(),
+        level,
+        message: message.to_owned(),
+    })
+}
+
+/// An event a release's host raised and numbered (section 11.5).
+#[derive(Debug, Clone, Copy)]
+pub struct HostEvent<'a> {
+    /// The application.
+    pub app: &'a str,
+    /// The release.
+    pub release: &'a str,
+    /// Which of the host's events it is.
+    pub number: crate::host::EventNumber,
+    /// The event type.
+    pub kind: &'a str,
+    /// The level.
+    pub level: &'static str,
+    /// What happened.
+    pub message: &'a str,
+    /// When it happened, for one the host held; none for now.
+    pub happened_unix_ms: Option<u64>,
+}
 
 /// The store.
 pub struct Store {
@@ -206,6 +272,8 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(SCHEMA)?;
         add_identity_columns(&connection)?;
+        number_releases(&connection)?;
+        give_preview_secrets(&connection)?;
 
         // Version 1 had applications, releases and events; version 2
         // added hosts and routes and version 3 the event sink cursors,
@@ -231,7 +299,12 @@ impl Store {
         // overlays by their conditions (issue 689), version 20 the import
         // report of each release's load (issue 741), and version 21 where
         // the application's data directory and its parts are (issue 849),
-        // added to an older table here.
+        // added to an older table here, and version 22 the number of each
+        // release (issue 948), given here to the releases of an older
+        // store, and version 23 the preview secret of each release
+        // (issue 928), given here to the releases that have none, and
+        // version 24 the last event recorded from each release's host
+        // (issue 982).
 
         let version: Option<i64> = connection
             .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
@@ -285,11 +358,211 @@ impl Store {
         })
     }
 
+    /// What SQLite's own check of the database finds (issue 950): no
+    /// lines for a sound one, else what it says is wrong.
+    pub fn integrity(&self) -> Result<Vec<String>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare("PRAGMA integrity_check")?;
+            let lines = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(lines.into_iter().filter(|line| line != "ok").collect())
+        })
+    }
+
+    /// The rows that name a row their foreign key does not find, each as
+    /// its table and row id.
+    pub fn foreign_key_faults(&self) -> Result<Vec<String>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+            let rows = statement.query_map([], |row| {
+                let table: String = row.get(0)?;
+                let rowid: Option<i64> = row.get(1)?;
+                let parent: String = row.get(2)?;
+                Ok(match rowid {
+                    Some(rowid) => format!("{table} row {rowid} names no row of {parent}"),
+                    None => format!("a row of {table} names no row of {parent}"),
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// The schema version the store records, or none when it records
+    /// none, as a file that is not a store does not.
+    pub fn schema_version(&self) -> Result<Option<i64>, StoreError> {
+        self.with(|connection| {
+            connection
+                .query_row("SELECT version FROM schema LIMIT 1", [], |row| row.get(0))
+                .optional()
+                .map_err(StoreError::from)
+        })
+    }
+
+    /// Each table with how many rows it holds, by name.
+    pub fn table_counts(&self) -> Result<Vec<(String, u64)>, StoreError> {
+        self.with(|connection| {
+            let names: Vec<String> = {
+                let mut statement = connection.prepare(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table' \
+                     AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                )?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            let mut counts = Vec::new();
+
+            for name in names {
+                let quoted = name.replace('"', "\"\"");
+                let count: i64 = connection.query_row(
+                    &format!("SELECT COUNT(*) FROM \"{quoted}\""),
+                    [],
+                    |row| row.get(0),
+                )?;
+                counts.push((name, count as u64));
+            }
+
+            Ok(counts)
+        })
+    }
+
+    /// The schema as the SQL that would make it, one statement to a
+    /// paragraph, tables before indexes.
+    pub fn schema_sql(&self) -> Result<String, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
+                 ORDER BY type = 'table' DESC, name",
+            )?;
+            let statements = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(statements
+                .iter()
+                .map(|sql| format!("{sql};\n"))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        })
+    }
+
+    /// Write a copy of the store to `path`, which must not exist: one
+    /// consistent database with no log beside it, taken in one read
+    /// while a daemon goes on using the store.
+    pub fn copy_to(&self, path: &Path) -> Result<(), StoreError> {
+        self.with(|connection| {
+            connection.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
+            Ok(())
+        })?;
+
+        // Section 4.22: a copy is made to be looked at elsewhere, so it
+        // leaves out the releases' preview secrets, and is rebuilt so that
+        // no page of the file still holds one. A daemon started on a copy
+        // gives its releases new ones.
+
+        let copy = Connection::open(path)?;
+        let has_secrets = copy
+            .prepare("PRAGMA table_info(releases)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|column| column == "preview_secret");
+
+        if has_secrets {
+            copy.pragma_update(None, "journal_mode", "DELETE")?;
+            copy.pragma_update(None, "secure_delete", "ON")?;
+            copy.execute("UPDATE releases SET preview_secret = NULL", [])?;
+            copy.execute("VACUUM", [])?;
+        }
+
+        Ok(())
+    }
+
+    /// What the store holds that breaks a rule of Muru's own, each rule
+    /// by its name with the rows that break it; a rule nothing breaks
+    /// has none. The rules are those the daemon keeps whenever it
+    /// writes, so a break is a fault and never a state a command left.
+    pub fn rule_breaks(&self) -> Result<Vec<(&'static str, Vec<String>)>, StoreError> {
+        const RULES: [(&str, &str); 6] = [
+            (
+                "each release belongs to an application",
+                "SELECT 'release ' || app || '@' || id || ' has no application' FROM releases \
+                 WHERE app NOT IN (SELECT name FROM apps)",
+            ),
+            (
+                "each application's serving and previous release exist",
+                "SELECT 'application ' || name || ' serves ' || current_release || \
+                 ', which is no release' FROM apps WHERE current_release IS NOT NULL \
+                 AND NOT EXISTS (SELECT 1 FROM releases WHERE app = name AND id = current_release) \
+                 UNION ALL \
+                 SELECT 'application ' || name || ' would roll back to ' || previous_release || \
+                 ', which is no release' FROM apps WHERE previous_release IS NOT NULL \
+                 AND NOT EXISTS (SELECT 1 FROM releases WHERE app = name AND id = previous_release)",
+            ),
+            (
+                "scale pins, gates and import reports belong to a release",
+                "SELECT 'a scale pin names ' || app || '@' || release FROM scale_pins s \
+                 WHERE NOT EXISTS (SELECT 1 FROM releases r WHERE r.app = s.app AND r.id = s.release) \
+                 UNION ALL \
+                 SELECT 'a passed gate names ' || app || '@' || release FROM gates g \
+                 WHERE NOT EXISTS (SELECT 1 FROM releases r WHERE r.app = g.app AND r.id = g.release) \
+                 UNION ALL \
+                 SELECT 'an import report names ' || app || '@' || release FROM import_reports i \
+                 WHERE NOT EXISTS (SELECT 1 FROM releases r WHERE r.app = i.app AND r.id = i.release)",
+            ),
+            (
+                "rollouts, runs and maintenance belong to an application",
+                "SELECT 'rollout ' || id || ' names application ' || app FROM rollouts \
+                 WHERE app NOT IN (SELECT name FROM apps) \
+                 UNION ALL \
+                 SELECT 'run ' || id || ' names application ' || app FROM runs \
+                 WHERE app NOT IN (SELECT name FROM apps) \
+                 UNION ALL \
+                 SELECT 'maintenance names application ' || app FROM maintenance \
+                 WHERE app NOT IN (SELECT name FROM apps)",
+            ),
+            (
+                "each release has a number of its own, none past the count",
+                "SELECT 'release ' || app || '@' || id || ' has no number' FROM releases \
+                 WHERE number IS NULL \
+                 UNION ALL \
+                 SELECT 'the number ' || number || ' names ' || COUNT(*) || ' releases' \
+                 FROM releases WHERE number IS NOT NULL GROUP BY number HAVING COUNT(*) > 1 \
+                 UNION ALL \
+                 SELECT 'release ' || app || '@' || id || ' has the number ' || number || \
+                 ', past the count ' || (SELECT COALESCE(MAX(last), 0) FROM release_numbers) \
+                 FROM releases \
+                 WHERE number > (SELECT COALESCE(MAX(last), 0) FROM release_numbers)",
+            ),
+            (
+                "event sequence numbers have no gaps",
+                "SELECT 'the events run from ' || MIN(sequence) || ' to ' || MAX(sequence) || \
+                 ' and there are ' || COUNT(*) FROM events \
+                 HAVING COUNT(*) > 0 AND MAX(sequence) - MIN(sequence) + 1 <> COUNT(*)",
+            ),
+        ];
+
+        self.with(|connection| {
+            let mut found = Vec::new();
+
+            for (rule, query) in RULES {
+                let mut statement = connection.prepare(query)?;
+                let breaks = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                found.push((rule, breaks));
+            }
+
+            Ok(found)
+        })
+    }
+
     /// An in-memory store, for tests and for development runs.
     pub fn in_memory() -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
         connection.execute_batch(SCHEMA)?;
         add_identity_columns(&connection)?;
+        number_releases(&connection)?;
+        give_preview_secrets(&connection)?;
         connection.execute("INSERT INTO schema (version) VALUES (?1)", [SCHEMA_VERSION])?;
 
         Ok(Self {
@@ -327,7 +600,8 @@ impl Store {
         self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                 user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings FROM apps ORDER BY name",
+                 user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings, \
+                 serving_origin FROM apps ORDER BY name",
             )?;
             let rows = statement.query_map([], app_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()
@@ -341,7 +615,8 @@ impl Store {
             connection
                 .query_row(
                     "SELECT name, current_release, previous_release, created_unix_ms, resource_version, \
-                     user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings FROM apps WHERE name = ?1",
+                     user, grp, umask, priority, access_log, data_dir, media_dir, uploads_dir, settings, \
+                     serving_origin FROM apps WHERE name = ?1",
                     [name],
                     app_from_row,
                 )
@@ -436,6 +711,27 @@ impl Store {
         self.with(|connection| Writes { connection }.set_app_settings(name, settings))
     }
 
+    /// Whether applied files last wrote the application's settings, and
+    /// with `forget` no longer: a command is about to write them.
+    pub fn settings_applied(&self, name: &str, forget: bool) -> Result<bool, StoreError> {
+        self.with(|connection| {
+            let applied: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM ownership WHERE kind = 'settings' AND key = ?1",
+                [name],
+                |row| row.get(0),
+            )?;
+
+            if forget {
+                connection.execute(
+                    "DELETE FROM ownership WHERE kind = 'settings' AND key = ?1",
+                    [name],
+                )?;
+            }
+
+            Ok(applied > 0)
+        })
+    }
+
     /// Change the application's own release settings in one step under
     /// the store's lock, creating the application when it does not exist:
     /// `change` is given the settings as they are, and what it leaves is
@@ -493,11 +789,21 @@ impl Store {
         self.with(|connection| Writes { connection }.set_app_releases(name, current, previous))
     }
 
+    /// Record that applied files or a rollback set the serving release
+    /// just written.
+    pub fn set_serving_origin(
+        &self,
+        name: &str,
+        how: crate::model::ServingSetBy,
+    ) -> Result<(), StoreError> {
+        self.with(|connection| Writes { connection }.set_serving_origin(name, how))
+    }
+
     /// Releases of one application, or of every application, newest first.
     pub fn releases(&self, app: Option<&str>) -> Result<Vec<Release>, StoreError> {
         self.with(|connection| {
             let mut statement = connection.prepare(
-                "SELECT app, id, spec, state, message, created_unix_ms, resource_version \
+                "SELECT app, id, spec, state, message, created_unix_ms, resource_version, number \
                  FROM releases WHERE (?1 IS NULL OR app = ?1) ORDER BY created_unix_ms DESC, id DESC",
             )?;
             let rows = statement.query_map([app], release_from_row)?;
@@ -510,7 +816,7 @@ impl Store {
         self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT app, id, spec, state, message, created_unix_ms, resource_version \
+                    "SELECT app, id, spec, state, message, created_unix_ms, resource_version, number \
                      FROM releases WHERE app = ?1 AND id = ?2",
                     [app, id],
                     release_from_row,
@@ -529,14 +835,81 @@ impl Store {
     ) -> Result<Release, StoreError> {
         let encoded =
             toml::to_string(spec).map_err(|error| StoreError::Decode(error.to_string()))?;
+        let secret = new_preview_secret()?;
         self.with(|connection| {
+            // The release's number (section 13.8, issue 948): the next of
+            // a count that only goes up, so a number never names two
+            // releases of a store, whatever was removed in between. Its
+            // preview secret (section 4.22) is made with it and kept for
+            // as long as the record is.
+
+            connection.execute("UPDATE release_numbers SET last = last + 1", [])?;
             connection.execute(
-                "INSERT INTO releases (app, id, spec, state, created_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![app, id, encoded, ReleaseState::Pending.as_str(), now_unix_ms() as i64],
+                "INSERT INTO releases \
+                 (app, id, spec, state, created_unix_ms, number, preview_secret) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, (SELECT last FROM release_numbers), ?6)",
+                params![
+                    app,
+                    id,
+                    encoded,
+                    ReleaseState::Pending.as_str(),
+                    now_unix_ms() as i64,
+                    secret
+                ],
             )?;
             Ok(())
         })?;
         self.release(app, id)
+    }
+
+    /// A release's preview secret (section 4.22). It is kept apart from
+    /// the release's record, which commands print and bundles carry, so
+    /// that nothing shows it but a preview that was asked for.
+    pub fn preview_secret(&self, app: &str, id: &str) -> Result<String, StoreError> {
+        self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT preview_secret FROM releases WHERE app = ?1 AND id = ?2",
+                    [app, id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .ok_or_else(|| StoreError::NotFound(format!("release {app}@{id}")))
+        })
+    }
+
+    /// Every release's preview secret, by application and release, for
+    /// the snapshot.
+    pub fn preview_secrets(&self) -> Result<HashMap<(String, String), String>, StoreError> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT app, id, preview_secret FROM releases WHERE preview_secret IS NOT NULL",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(((row.get(0)?, row.get(1)?), row.get::<_, String>(2)?))
+            })?;
+            rows.collect::<Result<_, _>>().map_err(StoreError::from)
+        })
+    }
+
+    /// Give a release a new preview secret, so that every link, cookie
+    /// and header made with the old one stops previewing it.
+    pub fn renew_preview_secret(&self, app: &str, id: &str) -> Result<String, StoreError> {
+        let secret = new_preview_secret()?;
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE releases SET preview_secret = ?1 WHERE app = ?2 AND id = ?3",
+                params![secret, app, id],
+            )?;
+
+            if changed == 0 {
+                return Err(StoreError::NotFound(format!("release {app}@{id}")));
+            }
+
+            Ok(())
+        })?;
+        Ok(secret)
     }
 
     /// The next generated release id for an application: r1, r2, ...
@@ -566,6 +939,10 @@ impl Store {
             )?;
             connection.execute(
                 "DELETE FROM gates WHERE app = ?1 AND release = ?2",
+                params![app, id],
+            )?;
+            connection.execute(
+                "DELETE FROM host_events WHERE app = ?1 AND release = ?2",
                 params![app, id],
             )?;
             connection.execute(
@@ -619,6 +996,60 @@ impl Store {
         })
     }
 
+    /// The named deployment recorded for each object (ADR 0080), by kind
+    /// and name. An object with no record belongs to `default`, and a
+    /// record may outlive its object, which the caller passes over.
+    pub fn ownership(&self) -> Result<crate::deployments::Owners, StoreError> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT kind, key, deployment FROM ownership")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut owners = crate::deployments::Owners::new();
+
+            for row in rows {
+                let (kind, key, deployment) = row?;
+
+                if let Some(kind) = crate::deployments::Kind::parse(&kind) {
+                    owners.insert((kind, key), deployment);
+                }
+            }
+
+            Ok(owners)
+        })
+    }
+
+    /// Record who owns the objects an apply declared: a named deployment
+    /// for each of its own, and no record for one that is `default`'s.
+    pub fn set_owners(&self, owners: &crate::deployments::Owners) -> Result<(), StoreError> {
+        self.with(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+
+            for ((kind, key), deployment) in owners {
+                if deployment == crate::deployments::DEFAULT {
+                    transaction.execute(
+                        "DELETE FROM ownership WHERE kind = ?1 AND key = ?2",
+                        params![kind.as_str(), key],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "INSERT INTO ownership (kind, key, deployment) VALUES (?1, ?2, ?3) \
+                         ON CONFLICT(kind, key) DO UPDATE SET deployment = excluded.deployment",
+                        params![kind.as_str(), key, deployment],
+                    )?;
+                }
+            }
+
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
     /// Record the releases of an application that the files of an apply
     /// declare, in place of those an earlier apply declared.
     pub fn set_declared_releases(&self, app: &str, ids: &[String]) -> Result<(), StoreError> {
@@ -648,6 +1079,7 @@ impl Store {
             connection.execute("DELETE FROM maintenance WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM runs WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM gates WHERE app = ?1", [name])?;
+            connection.execute("DELETE FROM host_events WHERE app = ?1", [name])?;
             connection.execute("DELETE FROM apps WHERE name = ?1", [name])?;
             Ok(())
         })
@@ -1174,27 +1606,81 @@ impl Store {
         level: &'static str,
         message: &str,
     ) -> Result<Event, StoreError> {
-        let time_unix_ms = now_unix_ms();
-        self.with(|connection| {
-            connection.execute(
-                "INSERT INTO events (time_unix_ms, type, subject, level, message) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![time_unix_ms as i64, kind, subject, level, message],
-            )?;
-            let sequence = connection.last_insert_rowid() as u64;
-            connection.execute(
-                "DELETE FROM events WHERE sequence <= ?1",
-                [sequence.saturating_sub(EVENT_RETENTION) as i64],
-            )?;
+        self.append_event_at(kind, subject, level, message, None)
+    }
 
-            Ok(Event {
-                sequence,
-                time_unix_ms,
-                kind: kind.to_owned(),
-                subject: subject.to_owned(),
-                level,
-                message: message.to_owned(),
-            })
+    /// Append an event that happened at `happened_unix_ms`, or now when
+    /// none is given, and return it with its sequence number, which is
+    /// the next whatever its time: an event recorded late sits in the
+    /// order it was recorded in with the time it happened (section 11.5).
+    /// A time ahead of the clock is taken as now.
+    pub fn append_event_at(
+        &self,
+        kind: &str,
+        subject: &str,
+        level: &'static str,
+        message: &str,
+        happened_unix_ms: Option<u64>,
+    ) -> Result<Event, StoreError> {
+        self.with(|connection| {
+            insert_event(connection, kind, subject, level, message, happened_unix_ms)
         })
+    }
+
+    /// Append an event a release's host raised, unless it is recorded
+    /// already (section 11.5, issue 982): a host numbers its events and
+    /// sends again those nobody has told it are recorded, so the number
+    /// of the last one recorded from each release's host is kept, and
+    /// written with the event in one transaction. Returns the event, or
+    /// none for one recorded before. Another stream is another host of
+    /// the release, whose numbers start again.
+    pub fn append_host_event(&self, raised: &HostEvent<'_>) -> Result<Option<Event>, StoreError> {
+        let HostEvent {
+            app,
+            release,
+            number,
+            kind,
+            level,
+            message,
+            happened_unix_ms,
+        } = *raised;
+
+        let mut connection = self.connection.lock().expect("store poisoned");
+        let transaction = connection.transaction()?;
+        let last: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT stream, seq FROM host_events WHERE app = ?1 AND release = ?2",
+                params![app, release],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        if last
+            .is_some_and(|(stream, seq)| stream == number.stream as i64 && seq >= number.seq as i64)
+        {
+            return Ok(None);
+        }
+
+        let event = insert_event(
+            &transaction,
+            kind,
+            &format!("{app}@{release}"),
+            level,
+            message,
+            happened_unix_ms,
+        )?;
+
+        // A release that has been removed since has nothing to keep
+        // the number for.
+
+        transaction.execute(
+            "INSERT INTO host_events (app, release, stream, seq) \
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM releases WHERE app = ?1 AND id = ?2) \
+             ON CONFLICT (app, release) DO UPDATE SET stream = excluded.stream, seq = excluded.seq",
+            params![app, release, number.stream as i64, number.seq as i64],
+        )?;
+        transaction.commit()?;
+        Ok(Some(event))
     }
 
     /// The sequence of the latest event, or 0 before any.
@@ -1603,6 +2089,9 @@ fn app_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
         name: row.get(0)?,
         current: row.get(1)?,
         previous: row.get(2)?,
+        serving_origin: row
+            .get::<_, Option<String>>(14)?
+            .and_then(|text| crate::model::ServingOrigin::decode(&text)),
         created_unix_ms: row.get::<_, i64>(3)? as u64,
         resource_version: row.get::<_, i64>(4)? as u64,
         user: row.get(5)?,
@@ -1642,13 +2131,80 @@ fn add_identity_columns(connection: &Connection) -> Result<(), StoreError> {
             ("media_dir", "TEXT"),
             ("uploads_dir", "TEXT"),
             ("settings", "TEXT"),
+            ("serving_origin", "TEXT"),
         ],
     )?;
     add_columns(
         connection,
         "releases",
-        &[("declared", "INTEGER NOT NULL DEFAULT 0")],
+        &[
+            ("declared", "INTEGER NOT NULL DEFAULT 0"),
+            ("number", "INTEGER"),
+            ("preview_secret", "TEXT"),
+        ],
     )
+}
+
+/// Give a preview secret to every release that has none (version 23,
+/// issue 928): the releases of an older store, and those of a copy made
+/// by `muructl doctor store --copy`, which leaves the secrets out.
+fn give_preview_secrets(connection: &Connection) -> Result<(), StoreError> {
+    let without: Vec<i64> = {
+        let mut statement =
+            connection.prepare("SELECT rowid FROM releases WHERE preview_secret IS NULL")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+
+    for row in without {
+        connection.execute(
+            "UPDATE releases SET preview_secret = ?1 WHERE rowid = ?2",
+            params![new_preview_secret()?, row],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// A new preview secret, or why the store cannot record a release
+/// without one.
+fn new_preview_secret() -> Result<String, StoreError> {
+    crate::detours::secret().map_err(StoreError::Decode)
+}
+
+/// Give every release a number (version 22, issue 948): the count the
+/// numbers come from is started where the highest number is, and the
+/// releases of an older store, which have none, are numbered oldest
+/// first. A number names the release's host directory (section 13.8),
+/// which is why it is short and never an application's name or an ID.
+fn number_releases(connection: &Connection) -> Result<(), StoreError> {
+    let counted: i64 =
+        connection.query_row("SELECT COUNT(*) FROM release_numbers", [], |row| row.get(0))?;
+
+    if counted == 0 {
+        connection.execute(
+            "INSERT INTO release_numbers (last) SELECT COALESCE(MAX(number), 0) FROM releases",
+            [],
+        )?;
+    }
+
+    let unnumbered: Vec<i64> = {
+        let mut statement = connection.prepare(
+            "SELECT rowid FROM releases WHERE number IS NULL ORDER BY created_unix_ms, rowid",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+
+    for row in unnumbered {
+        connection.execute("UPDATE release_numbers SET last = last + 1", [])?;
+        connection.execute(
+            "UPDATE releases SET number = (SELECT last FROM release_numbers) WHERE rowid = ?1",
+            [row],
+        )?;
+    }
+
+    Ok(())
 }
 
 /// The columns a run is read from, in `run_from_row`'s order.
@@ -1784,10 +2340,44 @@ impl Writes<'_> {
         current: Option<&str>,
         previous: Option<&str>,
     ) -> Result<(), StoreError> {
+        // How the serving release was set is said after, by an apply or
+        // a rollback. Anything else leaves none, which reads as a
+        // command having set it.
+
         self.connection.execute(
-            "UPDATE apps SET current_release = ?2, previous_release = ?3, \
+            "UPDATE apps SET current_release = ?2, previous_release = ?3, serving_origin = NULL, \
                  resource_version = resource_version + 1 WHERE name = ?1",
             params![name, current, previous],
+        )?;
+        Ok(())
+    }
+
+    /// Remember that applied files wrote the application's settings:
+    /// muructl app set then says that their next apply takes its change
+    /// away (ADR 0080).
+    pub fn mark_settings_applied(&self, name: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO ownership (kind, key, deployment) VALUES ('settings', ?1, 'apply') \
+             ON CONFLICT(kind, key) DO NOTHING",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    /// Record that applied files or a rollback set the serving release
+    /// just written (ADR 0082).
+    pub fn set_serving_origin(
+        &self,
+        name: &str,
+        how: crate::model::ServingSetBy,
+    ) -> Result<(), StoreError> {
+        let origin = crate::model::ServingOrigin {
+            how,
+            at_unix_ms: now_unix_ms(),
+        };
+        self.connection.execute(
+            "UPDATE apps SET serving_origin = ?2 WHERE name = ?1",
+            params![name, origin.encode()],
         )?;
         Ok(())
     }
@@ -1980,6 +2570,7 @@ fn release_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Release> {
         message: row.get(4)?,
         created_unix_ms: row.get::<_, i64>(5)? as u64,
         resource_version: row.get::<_, i64>(6)? as u64,
+        number: row.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
     })
 }
 
@@ -2001,6 +2592,7 @@ pub(crate) mod tests {
             interface: Interface::Auto,
             python: PathBuf::from("/srv/shop/.venv/bin/python"),
             processes: 2,
+            initial_processes: None,
             threads: 4,
             sync_threads: 8,
             concurrency: 1000,
@@ -2020,6 +2612,8 @@ pub(crate) mod tests {
             logging: Default::default(),
             max_requests: None,
             max_lifetime_ms: None,
+            max_surge: muru_config::DEFAULT_MAX_SURGE,
+            max_unavailable: muru_config::DEFAULT_MAX_UNAVAILABLE,
             timeouts: Default::default(),
             memory: Default::default(),
             env: Vec::new(),
@@ -2061,6 +2655,241 @@ pub(crate) mod tests {
         );
         assert_eq!(store.app("shop").unwrap().current.as_deref(), Some("r1"));
         assert!(store.release("shop", "r9").is_err());
+    }
+
+    #[test]
+    fn a_sound_store_breaks_no_rule_and_a_broken_one_says_which() {
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        store.create_release("shop", "r1", &spec()).unwrap();
+        store.set_app_releases("shop", Some("r1"), None).unwrap();
+        store
+            .append_event("release.ready", "shop@r1", "info", "ready")
+            .unwrap();
+        store
+            .append_event("release.ready", "shop@r1", "info", "again")
+            .unwrap();
+
+        assert!(store.integrity().unwrap().is_empty());
+        assert!(store.foreign_key_faults().unwrap().is_empty());
+        assert_eq!(store.schema_version().unwrap(), Some(SCHEMA_VERSION));
+        assert!(
+            store
+                .rule_breaks()
+                .unwrap()
+                .iter()
+                .all(|(_, breaks)| breaks.is_empty())
+        );
+
+        let counts = store.table_counts().unwrap();
+        assert!(counts.contains(&("releases".to_owned(), 1)), "{counts:?}");
+        assert!(counts.contains(&("events".to_owned(), 2)), "{counts:?}");
+        assert!(
+            store
+                .schema_sql()
+                .unwrap()
+                .contains("CREATE TABLE releases (")
+        );
+
+        // A serving release that is gone, a release with no application
+        // and a gap in the events are each a break of their own rule.
+
+        store
+            .with(|connection| {
+                connection.pragma_update(None, "foreign_keys", "OFF")?;
+                connection.execute("UPDATE apps SET current_release = 'r9'", [])?;
+                connection.execute(
+                    "INSERT INTO releases (app, id, spec, state, created_unix_ms, number) \
+                     VALUES ('gone', 'r1', '', 'stopped', 1, 1)",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO events (sequence, time_unix_ms, type, subject, level, message) \
+                     VALUES (9, 1, 'a', 'b', 'info', 'c')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let breaks: Vec<String> = store
+            .rule_breaks()
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, breaks)| breaks)
+            .collect();
+        assert_eq!(
+            breaks,
+            [
+                "release gone@r1 has no application",
+                "application shop serves r9, which is no release",
+                "the number 1 names 2 releases",
+                "the events run from 1 to 9 and there are 3",
+            ]
+        );
+        assert_eq!(
+            store.foreign_key_faults().unwrap(),
+            ["releases row 2 names no row of apps"]
+        );
+    }
+
+    #[test]
+    fn a_copy_of_a_store_is_a_whole_store_and_the_original_is_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("muru.sqlite");
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.ensure_app("shop").unwrap();
+            store.create_release("shop", "r1", &spec()).unwrap();
+        }
+
+        let before = std::fs::read(&path).unwrap();
+        let copy = directory.path().join("copy.sqlite");
+        Store::open_read_only(&path)
+            .unwrap()
+            .copy_to(&copy)
+            .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let copied = Store::open_read_only(&copy).unwrap();
+        assert_eq!(copied.release("shop", "r1").unwrap().number, 1);
+        assert!(copied.integrity().unwrap().is_empty());
+
+        // The copy holds no release's preview secret, in its rows or in
+        // the bytes of its file, and a daemon that opens it gives each a
+        // new one.
+
+        let secret = Store::open_read_only(&path)
+            .unwrap()
+            .preview_secret("shop", "r1")
+            .unwrap();
+        assert!(copied.preview_secret("shop", "r1").is_err());
+        drop(copied);
+        let bytes = std::fs::read(&copy).unwrap();
+        assert!(
+            !bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes())
+        );
+        let opened = Store::open(&copy).unwrap();
+        assert_ne!(opened.preview_secret("shop", "r1").unwrap(), secret);
+
+        // A copy never replaces a file that is there.
+
+        assert!(
+            Store::open_read_only(&path)
+                .unwrap()
+                .copy_to(&copy)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_release_has_a_number_that_is_never_given_twice() {
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        store.ensure_app("blog").unwrap();
+
+        let first = store.create_release("shop", "r1", &spec()).unwrap();
+        let second = store.create_release("blog", "r1", &spec()).unwrap();
+        assert_eq!((first.number, second.number), (1, 2));
+
+        // The highest number is not given again once its release is gone.
+
+        store.delete_release("blog", "r1").unwrap();
+        let third = store.create_release("blog", "r2", &spec()).unwrap();
+        assert_eq!(third.number, 3);
+        assert_eq!(store.releases(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_release_keeps_its_preview_secret_until_it_is_given_a_new_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("muru.sqlite");
+
+        let (first, second) = {
+            let store = Store::open(&path).unwrap();
+            store.ensure_app("shop").unwrap();
+            store.create_release("shop", "r1", &spec()).unwrap();
+            store.create_release("shop", "r2", &spec()).unwrap();
+            (
+                store.preview_secret("shop", "r1").unwrap(),
+                store.preview_secret("shop", "r2").unwrap(),
+            )
+        };
+
+        // 128 bits in hexadecimal, each release its own.
+
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+
+        // A store opened again holds the same secrets, and one from
+        // before releases had them gives a secret to each that has none.
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.preview_secret("shop", "r1").unwrap(), first);
+        store
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE releases SET preview_secret = NULL WHERE id = 'r2'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.preview_secret("shop", "r1").unwrap(), first);
+        let given = store.preview_secret("shop", "r2").unwrap();
+        assert!(given.len() == 32 && given != second);
+
+        // A new secret replaces the old, for that release alone, and the
+        // release's record carries no secret to print.
+
+        let renewed = store.renew_preview_secret("shop", "r1").unwrap();
+        assert_ne!(renewed, first);
+        assert_eq!(store.preview_secret("shop", "r1").unwrap(), renewed);
+        assert_eq!(store.preview_secret("shop", "r2").unwrap(), given);
+        assert_eq!(store.preview_secrets().unwrap().len(), 2);
+        assert!(store.renew_preview_secret("shop", "r9").is_err());
+        assert!(store.preview_secret("shop", "r9").is_err());
+        let record = format!("{:?}", store.release("shop", "r1").unwrap());
+        assert!(!record.contains(&renewed));
+    }
+
+    #[test]
+    fn the_releases_of_an_older_store_are_numbered_oldest_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("muru.sqlite");
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.ensure_app("shop").unwrap();
+            store.create_release("shop", "r1", &spec()).unwrap();
+            store.create_release("shop", "r2", &spec()).unwrap();
+
+            store
+                .with(|connection| {
+                    connection.execute("UPDATE releases SET number = NULL", [])?;
+                    connection.execute("DELETE FROM release_numbers", [])?;
+                    connection.execute(
+                        "UPDATE releases SET created_unix_ms = 5 WHERE id = 'r2'",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.release("shop", "r2").unwrap().number, 1);
+        assert_eq!(store.release("shop", "r1").unwrap().number, 2);
+        assert_eq!(
+            store.create_release("shop", "r3", &spec()).unwrap().number,
+            3
+        );
     }
 
     #[test]
@@ -2315,6 +3144,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_hosts_event_sent_again_is_recorded_once() {
+        use crate::host::EventNumber;
+
+        let store = Store::in_memory().unwrap();
+        store.ensure_app("shop").unwrap();
+        store.create_release("shop", "r1", &spec()).unwrap();
+        let first = EventNumber { stream: 7, seq: 1 };
+        let record = |number: EventNumber| {
+            store
+                .append_host_event(&HostEvent {
+                    app: "shop",
+                    release: "r1",
+                    number,
+                    kind: "worker.started",
+                    level: "info",
+                    message: "started",
+                    happened_unix_ms: None,
+                })
+                .unwrap()
+        };
+
+        // Issue 982: an event with a number already recorded from the
+        // same host is not recorded again, one after it is, and another
+        // host of the release starts its numbers again.
+
+        assert_eq!(record(first).unwrap().subject, "shop@r1");
+        assert!(record(first).is_none());
+        assert!(record(EventNumber { stream: 7, seq: 3 }).is_some());
+        assert!(record(EventNumber { stream: 7, seq: 2 }).is_none());
+        assert!(record(EventNumber { stream: 8, seq: 1 }).is_some());
+        assert_eq!(store.last_event_sequence().unwrap(), 3);
+
+        // The number goes with the release, and none is kept for a
+        // release the store does not hold.
+
+        store.delete_release("shop", "r1").unwrap();
+        assert!(record(EventNumber { stream: 8, seq: 1 }).is_some());
+        assert!(record(EventNumber { stream: 8, seq: 1 }).is_some());
+    }
+
+    #[test]
     fn sink_cursors_are_kept_by_name() {
         let store = Store::in_memory().unwrap();
         assert_eq!(store.sink_cursor("ops").unwrap(), None);
@@ -2326,6 +3196,47 @@ pub(crate) mod tests {
         store.set_sink_cursor("ops", event.sequence).unwrap();
         store.set_sink_cursor("ops", event.sequence + 1).unwrap();
         assert_eq!(store.sink_cursor("ops").unwrap(), Some(event.sequence + 1));
+    }
+
+    #[test]
+    fn an_event_recorded_late_keeps_the_time_it_happened_and_takes_the_next_sequence() {
+        let store = Store::in_memory().unwrap();
+        let first = store
+            .append_event("daemon.started", "daemon", "info", "up")
+            .unwrap();
+        let held = store
+            .append_event_at(
+                "worker.recycled",
+                "shop@r1",
+                "info",
+                "held",
+                Some(1_700_000_000_000),
+            )
+            .unwrap();
+        assert_eq!(held.sequence, first.sequence + 1);
+        assert_eq!(held.time_unix_ms, 1_700_000_000_000);
+
+        // A time ahead of the clock is taken as now.
+
+        let ahead = store
+            .append_event_at(
+                "worker.recycled",
+                "shop@r1",
+                "info",
+                "ahead",
+                Some(u64::MAX / 2),
+            )
+            .unwrap();
+        assert!(ahead.time_unix_ms >= first.time_unix_ms);
+        assert!(ahead.time_unix_ms <= now_unix_ms());
+
+        let times: Vec<u64> = store
+            .events_after(first.sequence, 10)
+            .unwrap()
+            .iter()
+            .map(|event| event.time_unix_ms)
+            .collect();
+        assert_eq!(times, [held.time_unix_ms, ahead.time_unix_ms]);
     }
 
     #[test]

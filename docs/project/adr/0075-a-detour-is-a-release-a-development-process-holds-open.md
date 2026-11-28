@@ -257,3 +257,11 @@ route, are superseded by [ADR
 0077](0077-what-a-detours-run-is-told-and-the-paths-a-detour-takes.md):
 a detour may take only the paths it names, which the edge checks after
 the release choice. The rest of the record stands.
+
+The preview of a detour, its secret, its entry links and the reserved
+`/_muru/preview/` paths, is extended to every release by [ADR
+0084](0084-every-preview-carries-the-releases-secret.md): the paths are
+reserved on every daemon's edge, `muructl detour preview` and the
+`PreviewDetour` call become `muructl preview` and `PreviewRelease`, and
+a release that is no detour is no longer previewed by its ID alone. The
+rest of the record stands.

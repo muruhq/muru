@@ -98,7 +98,7 @@ def test_render_writes_the_groups() -> None:
     muructl = support.muructl_path()
     assert muructl is not None
     completed = subprocess.run(
-        [str(muructl), "render", "grouped", str(GROUPED)],
+        [str(muructl), "render", "grouped", str(GROUPED), "--release", "r1", "--no-git-metadata"],
         capture_output=True,
         text=True,
         check=True,
@@ -256,7 +256,7 @@ memory = {{ hard_limit = "1GB" }}
 
     import tomllib
 
-    exported = tomllib.loads(daemon.muructl("config", "export", "--app", "shop").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "export", "--app", "shop").stdout)
     groups = exported["app"]["shop"]["release"]["r1"]["groups"]
     assert groups == {
         "hot": {
@@ -318,7 +318,7 @@ def test_an_optional_group_that_cannot_start_leaves_the_release_ready(daemon: Da
 
     import tomllib
 
-    exported = tomllib.loads(daemon.muructl("config", "export", "--app", "grouped").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "export", "--app", "grouped").stdout)
     assert exported["app"]["grouped"]["release"]["r1"]["groups"]["batch"]["optional"] is True
 
 
@@ -360,6 +360,10 @@ def test_invalid_groups_are_refused(daemon: Daemon, tmp_path: Path) -> None:
         (
             "[app.shop.release.r1.groups.hot]\npaths = ['/x']\nmax_lifetime = 'soon'\n",
             "worker group hot: max_lifetime:",
+        ),
+        (
+            "[app.shop.release.r1.groups.hot]\npaths = ['/x']\nmax_surge = 0\n",
+            "worker group hot: max_surge and max_unavailable are both 0",
         ),
     ]:
         config.write_text(

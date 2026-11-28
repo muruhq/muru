@@ -2,7 +2,7 @@
 //! sections 10.4, 13.2 and 13.3, appendix A): `daemon run`, `daemon
 //! start`, `daemon stop`, `daemon status`, `up`, `deploy`, `app list`,
 //! `release list`, `release wait`, `rollback`, `drain`, `status`,
-//! `events`, `logs`, `logs reopen`, `apply`, `config export` and `config
+//! `events`, `logs`, `logs reopen`, `apply`, `deployment export` and `config
 //! diff`.
 
 use std::net::SocketAddr;
@@ -723,7 +723,7 @@ impl SocketArgs {
 
     /// The daemon's log, for a command of the daemon's own that names
     /// it: where the instance's options and the daemon's files put it.
-    fn daemon_log(&self, files: &DaemonFileArgs) -> PathBuf {
+    pub(crate) fn daemon_log(&self, files: &DaemonFileArgs) -> PathBuf {
         Locations::resolve(&Options {
             run_dir: self.locations.run_dir.clone(),
             system: self.locations.system,
@@ -1170,6 +1170,23 @@ pub enum DaemonCommand {
         files: DaemonFileArgs,
     },
 
+    /// Re-execute the daemon from the muructl it runs, so that it reads
+    /// its configuration file afresh, the settings read only at start
+    /// among them: hosts and the edge keep serving, and the daemon
+    /// keeps its pid.
+    Restart {
+        /// How long to wait for the restarted daemon to be ready.
+        #[arg(long, value_name = "DURATION", default_value = "120s", value_parser = muru_config::parse_duration)]
+        timeout: Duration,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        /// The daemon's own files, as it was started with them.
+        #[command(flatten)]
+        files: DaemonFileArgs,
+    },
+
     /// Show the daemon's status, or where its files would be when none
     /// is running, exiting 3 then.
     Status {
@@ -1182,6 +1199,23 @@ pub enum DaemonCommand {
 
         #[command(flatten)]
         output: JsonArgs,
+    },
+
+    /// Put the instance back to nothing, with everything of it stopped:
+    /// remove its state store and what its releases left (environments,
+    /// bytecode, static directories, the upload spool), after listing
+    /// what goes and what stays and asking. The configuration file is
+    /// kept, and so are application data and logs unless --data and
+    /// --logs. Refused while a daemon, an edge or a host of it runs.
+    Reset(Box<crate::daemon_reset::ResetArgs>),
+
+    /// The daemon's own configuration file: where it is, what it holds,
+    /// whether the daemon would take it, and changes that are checked,
+    /// written and reloaded. What the daemon serves is not in it: that
+    /// is muructl apply's.
+    Config {
+        #[command(subcommand)]
+        command: crate::daemon_config::DaemonConfigCommand,
     },
 }
 
@@ -1220,10 +1254,36 @@ pub struct DaemonRunArgs {
     #[arg(long)]
     timestamps: bool,
 
+    /// Apply these files once the daemon is up, as muructl apply -f
+    /// does, and report ready only when they are applied: a file, or a
+    /// directory whose .toml files are applied together; repeatable. They
+    /// are applied at every start, and to a daemon that is already
+    /// running. A start whose files cannot be applied fails, leaving
+    /// what was serving as it was.
+    #[arg(long, value_name = "FILE or DIR")]
+    apply: Vec<PathBuf>,
+
+    /// With --apply: also remove what the files do not contain, of the
+    /// deployments they name; with --prune=all, of every deployment, so
+    /// the files are the whole of what the daemon serves.
+    #[arg(
+        long,
+        requires = "apply",
+        value_name = "REACH",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "files"
+    )]
+    prune: Option<PruneScope>,
+
     /// Set by a daemon that re-executed itself for an upgrade: the
     /// version it ran before.
     #[arg(long, hide = true, value_name = "VERSION")]
     upgraded_from: Option<String>,
+
+    /// Set by a daemon that re-executed itself for a restart.
+    #[arg(long, hide = true)]
+    restarted: bool,
 
     /// Set by a daemon that re-executed itself for an upgrade: the
     /// descriptors that hold its locks on the state and run directories.
@@ -1234,26 +1294,28 @@ pub struct DaemonRunArgs {
     locations: LocationArgs,
 }
 
-/// The arguments a daemon re-executes itself with on an upgrade: its own,
-/// with --upgraded-from naming this version in place of any earlier one.
-/// The descriptors that hold its locks are added when it re-executes, in
-/// place of any it was given.
-fn upgrade_arguments() -> Vec<std::ffi::OsString> {
-    let mut arguments: Vec<std::ffi::OsString> =
-        muru_common::title::args_os().into_iter().skip(1).collect();
+/// The arguments a daemon re-executes itself with on an upgrade or a
+/// restart: its own, without the flags an earlier re-execution gave it.
+/// The flag that says which this one is, and the descriptors that hold
+/// its locks, are added when it re-executes.
+fn reexec_arguments() -> Vec<std::ffi::OsString> {
+    without_reexec_flags(muru_common::title::args_os().into_iter().skip(1).collect())
+}
 
-    for flag in [
-        "--upgraded-from",
-        muru_controller::ownership::HELD_LOCKS_FLAG,
+/// Arguments without the flags a re-execution adds, each with its value
+/// when it takes one.
+fn without_reexec_flags(mut arguments: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    for (flag, takes_value) in [
+        (muru_controller::daemon::UPGRADED_FROM_FLAG, true),
+        (muru_controller::daemon::RESTARTED_FLAG, false),
+        (muru_controller::ownership::HELD_LOCKS_FLAG, true),
     ] {
         if let Some(at) = arguments.iter().position(|argument| argument == flag) {
-            let end = (at + 2).min(arguments.len());
+            let end = (at + 1 + usize::from(takes_value)).min(arguments.len());
             arguments.drain(at..end);
         }
     }
 
-    arguments.push("--upgraded-from".into());
-    arguments.push(env!("CARGO_PKG_VERSION").into());
     arguments
 }
 
@@ -1337,12 +1399,37 @@ pub async fn daemon_run(args: DaemonRunArgs) -> anyhow::Result<()> {
         overrides,
         access_log,
         executable: std::env::current_exe().context("finding the muructl executable")?,
-        upgrade_arguments: upgrade_arguments(),
+        reexec_arguments: reexec_arguments(),
         upgraded_from: args.upgraded_from.clone(),
+        restarted: args.restarted,
         rename_check: rename_check(),
         ownership,
+        start_apply: start_apply(&args),
     })
     .await
+}
+
+/// The files `--apply` names, read here as muructl apply reads them, so
+/// that their paths are taken from where each file is. Files that cannot
+/// be read as one configuration are carried as the reason, which the
+/// daemon reports once it has restored what its store holds.
+fn start_apply(args: &DaemonRunArgs) -> Option<muru_controller::daemon::StartApply> {
+    if args.apply.is_empty() {
+        return None;
+    }
+
+    let paths: Vec<String> = args
+        .apply
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    let documents = load_documents(&args.apply).map_err(|error| format!("{error:#}"));
+
+    Some(muru_controller::daemon::StartApply {
+        paths: paths.join(" and "),
+        documents,
+        prune: PruneScope::reach(args.prune),
+    })
 }
 
 /// How often the daemon checks for a renamed log file: every five
@@ -1376,7 +1463,11 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
 
         if Path::new(&status.state_dir) == locations.state.path {
             println!("muru: the daemon is already running (pid {})", status.pid);
-            return Ok(());
+
+            // The files are applied to it all the same: the command means
+            // running, and serving these files (ADR 0081).
+
+            return apply_to_running(&args, &socket);
         }
 
         anyhow::bail!(
@@ -1423,6 +1514,19 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         command.arg("--user").arg(user);
     }
 
+    // The daemon reads the files itself, so their paths are made whole
+    // here, where a relative one means something.
+
+    for path in &args.apply {
+        command
+            .arg("--apply")
+            .arg(std::path::absolute(path).unwrap_or_else(|_| path.clone()));
+    }
+
+    if let Some(scope) = args.prune {
+        command.arg(scope.flag());
+    }
+
     command.args(args.locations.as_arguments());
     command
         .stdin(std::process::Stdio::null())
@@ -1454,12 +1558,33 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
             && let Ok(status) = client.get_status(pb::GetStatusRequest {}).await
         {
             let status = status.into_inner();
+
+            // With files to apply, started means applied: the daemon is
+            // ready only then, and one whose files cannot be applied
+            // exits, with why in its log.
+
+            if !args.apply.is_empty() {
+                await_start_apply(&socket, &mut child, &locations, written_before).await?;
+            }
+
             println!(
                 "muru: daemon started (pid {}), serving on {}, log {}",
                 status.pid,
                 status.listeners.join(" and "),
                 locations.daemon_log().display()
             );
+
+            if !args.apply.is_empty() {
+                let written = daemon_log_since(&locations.daemon_log(), written_before);
+
+                if let Some(line) = written
+                    .lines()
+                    .rfind(|line| line.contains("start apply of "))
+                {
+                    println!("muru: {}", after_stamp(line));
+                }
+            }
+
             return Ok(());
         }
 
@@ -1477,6 +1602,17 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
                 anyhow::bail!("{}", refusal.1);
             }
 
+            // A start whose files could not be applied says that, and no
+            // more of the log.
+
+            if let Some(failed) = written
+                .lines()
+                .rfind(|line| line.contains("start apply of ") && line.contains(" failed: "))
+                .and_then(|line| line.split_once("error: "))
+            {
+                anyhow::bail!("{}", failed.1.trim_end_matches(" (subject=daemon)"));
+            }
+
             anyhow::bail!("the daemon exited before it answered ({exited}); {written}");
         }
 
@@ -1487,6 +1623,85 @@ pub async fn daemon_start(args: DaemonRunArgs) -> anyhow::Result<()> {
         "the daemon did not answer within 30 seconds; see {}",
         locations.daemon_log().display()
     )
+}
+
+/// A daemon's log line without the time and the `muru:` in front of it.
+fn after_stamp(line: &str) -> &str {
+    line.split_once("muru: ").map_or(line, |(_, rest)| rest)
+}
+
+/// Wait for a daemon started with `--apply` to finish applying: until it
+/// answers that it has started up, or exits, when what its log says of
+/// the apply is the error.
+async fn await_start_apply(
+    socket: &Path,
+    child: &mut std::process::Child,
+    locations: &Locations,
+    written_before: u64,
+) -> anyhow::Result<()> {
+    loop {
+        if let Some(exited) = child.try_wait().context("waiting for the daemon")? {
+            let written = daemon_log_since(&locations.daemon_log(), written_before);
+            let why = written
+                .lines()
+                .rfind(|line| line.contains("start apply of ") && line.contains(" failed: "))
+                .and_then(|line| line.split_once("error: "))
+                .map(|(_, why)| why.trim_end_matches(" (subject=daemon)"));
+
+            match why {
+                Some(why) => anyhow::bail!("{why}"),
+                None => anyhow::bail!("the daemon exited while applying ({exited}); {written}"),
+            }
+        }
+
+        // The daemon may be gone between one look and the next, so each
+        // look connects again.
+
+        let started = match client::connect(&client::Endpoint::unix(socket)).await {
+            Ok(mut client) => client
+                .probe(pb::ProbeRequest {
+                    probe: "startup".to_owned(),
+                    ..pb::ProbeRequest::default()
+                })
+                .await
+                .map(|answer| answer.into_inner().ok)
+                .unwrap_or(false),
+            Err(_) => false,
+        };
+
+        if started {
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Apply the `--apply` files of a start to the daemon that already
+/// runs, by running muructl apply against it, and fail as it fails.
+fn apply_to_running(args: &DaemonRunArgs, socket: &Path) -> anyhow::Result<()> {
+    if args.apply.is_empty() {
+        return Ok(());
+    }
+
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.arg("apply").arg("--socket").arg(socket);
+
+    for path in &args.apply {
+        command.arg("-f").arg(path);
+    }
+
+    if let Some(scope) = args.prune {
+        command.arg(scope.flag());
+    }
+
+    let status = command.status().context("running muructl apply")?;
+
+    if !status.success() {
+        anyhow::bail!("the files were not applied; the daemon runs on as it was");
+    }
+
+    Ok(())
 }
 
 /// Refuse to start a named instance with no configuration file, naming
@@ -1604,7 +1819,7 @@ const STOP_EXCHANGE: Duration = Duration::from_secs(5);
 
 /// Ask the daemon at `path` for its status, within `bound`. None when
 /// there is no daemon there, it refused, or it did not answer in time.
-async fn status_within(path: &Path, bound: Duration) -> Option<pb::Status> {
+pub(crate) async fn status_within(path: &Path, bound: Duration) -> Option<pb::Status> {
     let exchange = async {
         let mut client = client::connect(&client::Endpoint::unix(path)).await.ok()?;
         client
@@ -1691,6 +1906,113 @@ pub async fn daemon_stop(
     )
 }
 
+/// Re-execute the daemon from the binary it runs and wait until it is
+/// ready again.
+pub async fn daemon_restart(
+    socket: SocketArgs,
+    files: DaemonFileArgs,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    restart_at(
+        &socket.socket()?,
+        &socket.daemon_log(&files),
+        timeout,
+        false,
+    )
+    .await
+}
+
+/// Restart the daemon whose admin socket is at `path`, whose log is
+/// `log`, and wait until it is ready again, saying nothing of how it
+/// goes when `quiet`.
+pub async fn restart_at(
+    path: &Path,
+    log: &Path,
+    timeout: Duration,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    let mut client = client::connect(&client::Endpoint::unix(path)).await?;
+    let before = client
+        .get_status(pb::GetStatusRequest {})
+        .await?
+        .into_inner();
+    let response = client
+        .restart_daemon(pb::RestartDaemonRequest {})
+        .await
+        .map_err(|status| anyhow::anyhow!("{}", status.message()))?
+        .into_inner();
+
+    if !quiet {
+        println!(
+            "muru: daemon (pid {}) re-executing from {}",
+            before.pid, response.executable
+        );
+    }
+
+    // The daemon answers again from the new image with a new start time,
+    // and is ready once it has re-adopted the hosts and the edge.
+
+    let started = Instant::now();
+    let mut answered = false;
+
+    while started.elapsed() < timeout {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let status = status_within(path, remaining.min(STOP_EXCHANGE)).await;
+
+        if let Some(status) = status.filter(|now| now.started_unix_ms != before.started_unix_ms) {
+            answered = true;
+
+            if ready_within(path, remaining.min(STOP_EXCHANGE)).await {
+                if !quiet {
+                    println!("muru: daemon restarted (pid {})", status.pid);
+                }
+
+                return Ok(());
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    if answered {
+        anyhow::bail!(
+            "the daemon re-executed (pid {}) but was not ready within {} seconds; see muructl \
+             events",
+            before.pid,
+            timeout.as_secs()
+        )
+    }
+
+    anyhow::bail!(
+        "the daemon (pid {}) did not answer again within {} seconds; see {}",
+        before.pid,
+        timeout.as_secs(),
+        log.display()
+    )
+}
+
+/// Whether the daemon at `path` says within `bound` that it has started
+/// all it restores.
+async fn ready_within(path: &Path, bound: Duration) -> bool {
+    let exchange = async {
+        let mut client = client::connect(&client::Endpoint::unix(path)).await.ok()?;
+        client
+            .probe(pb::ProbeRequest {
+                probe: "startup".to_owned(),
+                ..pb::ProbeRequest::default()
+            })
+            .await
+            .ok()
+            .map(|answer| answer.into_inner().ok)
+    };
+
+    tokio::time::timeout(bound, exchange)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
 /// Re-execute the daemon from the installed binary and wait until it
 /// answers again with the edge replaced.
 pub async fn daemon_upgrade(
@@ -1704,6 +2026,26 @@ pub async fn daemon_upgrade(
         .get_status(pb::GetStatusRequest {})
         .await?
         .into_inner();
+
+    // Section 13.8 (issue 948): a daemon that keeps its lock and records
+    // in its run directory is from before they moved to the state
+    // directory. This version would start without the edge and the hosts
+    // that daemon runs, which would be left running with nothing
+    // looking after them, so it is not asked to re-execute.
+
+    if muru_controller::locations::earlier_daemon_owns(Path::new(&before.run_dir)) {
+        anyhow::bail!(
+            "the daemon (pid {}, version {}) keeps its runtime files in its run directory {}, \
+             and this version of Muru keeps them in the state directory, so it cannot take \
+             over that daemon's edge and releases and does not upgrade it in place; stop it and \
+             its releases with muructl daemon stop --shutdown, then start it again with \
+             muructl daemon start",
+            before.pid,
+            before.version,
+            before.run_dir
+        );
+    }
+
     let response = client
         .upgrade_daemon(pb::UpgradeDaemonRequest {})
         .await
@@ -4433,6 +4775,18 @@ pub struct ReleaseArgs {
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     pub(crate) max_lifetime: Option<Duration>,
 
+    /// Workers a group may run over its count while workers are swapped
+    /// (default 1): a replacement starts before the old worker stops
+    /// while the group is within it, and with 0 the old worker stops
+    /// first.
+    #[arg(long, value_name = "N")]
+    pub(crate) max_surge: Option<u32>,
+
+    /// Workers a group may run under its count while workers are
+    /// swapped (default 0).
+    #[arg(long, value_name = "N")]
+    pub(crate) max_unavailable: Option<u32>,
+
     /// A host timeout as NAME=DURATION: soft (interrupt a request that
     /// runs this long; off), hard (replace a worker whose request runs
     /// this long; off), hard_drain_grace (10s), shutdown (5s),
@@ -4515,6 +4869,21 @@ pub struct ReleaseArgs {
     command: Vec<String>,
 }
 
+/// An `--initial-processes` value: a count for the release, or
+/// `GROUP=N` for one worker group.
+fn parse_initial_processes(text: &str) -> Result<(Option<String>, u32), String> {
+    let (group, count) = match text.split_once('=') {
+        Some((group, count)) if !group.is_empty() => (Some(group.to_owned()), count),
+        Some(_) => return Err("give N, or GROUP=N for one worker group".to_owned()),
+        None => (None, text),
+    };
+
+    match count.parse::<u32>() {
+        Ok(count) if count >= 1 => Ok((group, count)),
+        _ => Err(format!("{count:?} is not a count of at least 1")),
+    }
+}
+
 /// What `deploy` takes.
 #[derive(Args)]
 pub struct DeployArgs {
@@ -4537,9 +4906,14 @@ pub struct DeployArgs {
     no_wait: bool,
 
     /// Start the release but leave traffic where it is, for a preview
-    /// with the Muru-Preview header or a rollout.
+    /// with muructl preview or a rollout.
     #[arg(long)]
     hold: bool,
+
+    /// With --hold, open an entry link to the release's preview in the
+    /// browser once it is ready.
+    #[arg(long, requires = "hold", conflicts_with_all = ["no_wait", "dry_run"])]
+    open_preview: bool,
 
     /// Deploy although an overlay freezes the application's deploys;
     /// recorded as an event.
@@ -4556,6 +4930,14 @@ pub struct DeployArgs {
     /// min_workers is 0; 0 keeps the host alone).
     #[arg(long, value_name = "N")]
     retain_workers: Option<u32>,
+
+    /// The workers the release starts with, where that is fewer than
+    /// its processes: the count the node's budget checks the deploy at,
+    /// and the count the release keeps while it takes no traffic. Once
+    /// it serves it takes its processes, or what its scaling policy
+    /// says. GROUP=N gives one worker group's; repeatable.
+    #[arg(long = "initial-processes", value_name = "N|GROUP=N", value_parser = parse_initial_processes)]
+    initial_processes: Vec<(Option<String>, u32)>,
 
     /// Report what the deploy would do, with where each of the release's
     /// settings would come from, and change nothing.
@@ -4864,6 +5246,8 @@ impl ReleaseArgs {
     pub(crate) fn request(self, app: &str, source: &str, python: String) -> pb::DeployRequest {
         pb::DeployRequest {
             metadata: std::collections::BTreeMap::new(),
+            initial_processes: None,
+            group_initial_processes: std::collections::BTreeMap::new(),
             app: app.to_owned(),
             source: source.to_owned(),
             kind: self.server.map(|_| "http".to_owned()).unwrap_or_default(),
@@ -4918,6 +5302,8 @@ impl ReleaseArgs {
             max_lifetime_ms: self
                 .max_lifetime
                 .map(|lifetime| lifetime.as_millis() as u64),
+            max_surge: self.max_surge,
+            max_unavailable: self.max_unavailable,
             soft_timeout_ms: timeout_ms(&self.timeouts, "soft"),
             accel_redirect: None,
             cgi_local_redirect: None,
@@ -5009,7 +5395,8 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
     ))
     .map_err(anyhow::Error::msg)?;
 
-    let mut client = client::connect(&args.socket.endpoint()?).await?;
+    let endpoint = args.socket.endpoint()?;
+    let mut client = client::connect(&endpoint).await?;
     let python = args
         .settings
         .python
@@ -5025,6 +5412,17 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
         override_freeze: args.override_freeze,
         retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
         retain_workers: args.retain_workers,
+        initial_processes: args
+            .initial_processes
+            .iter()
+            .rev()
+            .find(|(group, _)| group.is_none())
+            .map(|(_, count)| *count),
+        group_initial_processes: args
+            .initial_processes
+            .iter()
+            .filter_map(|(group, count)| group.clone().map(|group| (group, *count)))
+            .collect(),
         ..args
             .settings
             .request(&args.app, &source.display().to_string(), python)
@@ -5053,6 +5451,10 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
         return Ok(0);
     }
 
+    if !release.notice.is_empty() {
+        eprintln!("muru: warning: {}", release.notice);
+    }
+
     if args.no_wait {
         println!(
             "muru: release {}@{} recorded ({})",
@@ -5075,6 +5477,25 @@ pub async fn deploy(args: DeployArgs) -> anyhow::Result<i32> {
                 .map(|origin| format!(", {origin}"))
                 .unwrap_or_default()
         );
+    }
+
+    // A held release is there to be tried: say how, and with
+    // --open-preview do it. The preview's secret is never printed here.
+
+    if args.hold && !args.no_wait && !release.serving {
+        let name = format!("{}@{}", release.app, release.id);
+
+        if !args.open_preview {
+            eprintln!("muru: muructl preview {name} opens a preview of it");
+        } else if let Err(error) =
+            crate::preview::open_for(&endpoint, &release.app, &release.id, None, false).await
+        {
+            eprintln!("muru: no preview link: {error:#}; muructl preview {name} gives one");
+        } else {
+            // The browser is given a moment to start before muructl exits.
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     Ok(0)
@@ -5242,6 +5663,14 @@ pub enum RolloutCommand {
         /// Wait for `rollout resume` before each step after the first.
         #[arg(long)]
         approve_each_step: bool,
+
+        /// How the two releases are sized: own, each at its own size
+        /// (the default), or shared, the two sharing the worker count
+        /// the baseline has when the rollout starts, each sized by its
+        /// share of the traffic, for a node with no room for two full
+        /// copies.
+        #[arg(long, value_name = "MODE", default_value = "own", value_parser = ["own", "shared"])]
+        capacity: String,
 
         /// Stay until the rollout is promoted or rolled back.
         #[arg(long)]
@@ -5439,8 +5868,8 @@ pub enum ScaleCommand {
     },
 }
 
-/// What `restart` takes: one worker of a release, by index or pid, or
-/// every worker in turn, gracefully or at once.
+/// What `restart` takes: one worker of a release, by index or pid,
+/// gracefully or at once, or every worker in turn.
 #[derive(Args)]
 pub struct RestartArgs {
     /// The release as app@release, or an application for its current
@@ -5459,18 +5888,26 @@ pub struct RestartArgs {
     #[arg(long, value_name = "PID", conflicts_with = "all")]
     pid: Option<u32>,
 
-    /// Every worker of the release, one at a time so capacity holds.
-    #[arg(long, required_unless_present_any = ["worker", "pid"])]
+    /// Every worker of the release, each in its turn: as many at once
+    /// as the max_surge and max_unavailable of its group allow, one at a
+    /// time by default, so capacity holds. The release's host takes the
+    /// turns, so the restart carries on if the daemon is stopped.
+    #[arg(long, required_unless_present_any = ["worker", "pid", "group", "cancel"])]
     all: bool,
 
-    /// With --all, the workers of one group only.
-    #[arg(long, value_name = "NAME", requires = "all")]
+    /// Every worker of one worker group, each in its turn.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["worker", "pid"])]
     group: Option<String>,
+
+    /// End a restart of every worker that is under way: the workers not
+    /// yet replaced stay as they are.
+    #[arg(long, conflicts_with_all = ["worker", "pid", "all", "group", "force", "no_wait"])]
+    cancel: bool,
 
     /// Take the worker out of routing and kill it at once, its stacks
     /// written to the log; the requests it is serving fail, and a
-    /// debugger session in it ends.
-    #[arg(long)]
+    /// debugger session in it ends. For one worker.
+    #[arg(long, conflicts_with_all = ["all", "group"])]
     force: bool,
 
     /// Return once the restart is under way, without waiting for the
@@ -5495,6 +5932,10 @@ const RESTART_POLL: Duration = Duration::from_millis(250);
 
 /// Replace one worker of a release, or each in turn, with a fresh one.
 pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
+    if args.cancel || args.all || args.group.is_some() {
+        return restart_release(args).await;
+    }
+
     let status = ask(
         &args.socket,
         args.target.as_deref().unwrap_or_default(),
@@ -5532,13 +5973,7 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
         None => status.release.clone(),
     };
 
-    let chosen: Vec<(WorkerName, u32)> = if args.all {
-        serving
-            .iter()
-            .filter(|(_, _, group)| args.group.as_ref().is_none_or(|wanted| wanted == group))
-            .map(|(name, pid, _)| (name.clone(), *pid))
-            .collect()
-    } else if let Some(pid) = args.pid {
+    let chosen: Vec<(WorkerName, u32)> = if let Some(pid) = args.pid {
         serving
             .iter()
             .find(|(_, candidate, _)| *candidate == pid)
@@ -5548,22 +5983,13 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
         let wanted = args
             .worker
             .as_ref()
-            .expect("clap requires --worker, --pid or --all");
+            .expect("clap requires --worker or --pid without --all");
         serving
             .iter()
             .find(|(name, _, _)| name == wanted)
             .map(|(name, pid, _)| vec![(name.clone(), *pid)])
             .ok_or_else(|| anyhow::anyhow!("{release} has no serving worker {wanted}"))?
     };
-
-    if chosen.is_empty() {
-        let group = args
-            .group
-            .as_ref()
-            .map(|group| format!(" in group {group}"))
-            .unwrap_or_default();
-        anyhow::bail!("{release} has no serving worker{group}");
-    }
 
     // With --json, one object for each worker replaced, printed together
     // at the end.
@@ -5590,7 +6016,13 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
             .unwrap_or_default();
         let how = if args.force { ", killed at once" } else { "" };
 
-        if !args.output.json {
+        // Section 7.8: a worker that stops first has no successor yet.
+
+        if !args.output.json && new_pid == 0 {
+            println!(
+                "muru: worker {name} (pid {pid}) is stopping, and is replaced once it has stopped{how}"
+            );
+        } else if !args.output.json {
             println!("muru: worker {name} (pid {pid}) is being replaced by pid {new_pid}{how}");
         }
 
@@ -5620,6 +6052,108 @@ pub async fn restart(args: RestartArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// `restart --all`, `--group` and `--cancel`: every worker of a release,
+/// or of one group, replaced in turn by one call of the admin API, which
+/// the release's host carries out, or such a restart cancelled.
+async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
+    let target = args.target.as_deref().unwrap_or_default();
+
+    let (app, release) = match target {
+        "" => ("", ""),
+        target => split_target(target)?,
+    };
+
+    let mut client = client::connect(&args.socket.endpoint()?).await?;
+
+    if args.cancel {
+        let answer = client
+            .cancel_restart(pb::CancelRestartRequest {
+                app: app.to_owned(),
+                release: release.to_owned(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+
+        if args.output.json {
+            return print_answer(&answer);
+        }
+
+        println!(
+            "muru: the restart of {} is cancelled: {} left as {} {}",
+            release_name(&answer.app, &answer.release),
+            counted(answer.workers.len(), "worker", "workers"),
+            if answer.workers.len() == 1 {
+                "it"
+            } else {
+                "they"
+            },
+            if answer.workers.len() == 1 {
+                "was"
+            } else {
+                "were"
+            },
+        );
+        return Ok(());
+    }
+
+    let answer = client
+        .restart_release(pb::RestartReleaseRequest {
+            app: app.to_owned(),
+            release: release.to_owned(),
+            group: args.group.clone().unwrap_or_default(),
+            wait: !args.no_wait,
+            wait_timeout_ms: 0,
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+    let name = release_name(&answer.app, &answer.release);
+    let scope = args
+        .group
+        .as_ref()
+        .map(|group| format!(" of the group {group}"))
+        .unwrap_or_default();
+
+    if answer.workers.is_empty() {
+        anyhow::bail!("{name} has no worker{scope} to restart");
+    }
+
+    if args.output.json {
+        print_answer(&answer)?;
+    } else {
+        println!(
+            "muru: {}{scope} of {name} marked to be replaced, each in its turn",
+            counted(answer.workers.len(), "worker", "workers"),
+        );
+    }
+
+    match (&answer.restart, args.no_wait) {
+        (Some(restart), false) => anyhow::bail!(
+            "the restart of {name} is still under way: {} of {} left; muructl release show \
+             says how far it has got, and muructl restart --cancel ends it",
+            counted(restart.left as usize, "worker", "workers"),
+            restart.total
+        ),
+        (None, false) if !args.output.json => {
+            println!("muru: the restart of {name} has finished");
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// A release as a line names it: app@release, or the release alone for
+/// the one application of a run that named none.
+fn release_name(app: &str, release: &str) -> String {
+    if app.is_empty() {
+        release.to_owned()
+    } else {
+        format!("{app}@{release}")
+    }
 }
 
 /// Wait until the worker at `index` is one other than `old_pid`, ready,
@@ -5771,8 +6305,11 @@ pub async fn scale(args: ScaleArgs) -> anyhow::Result<()> {
 
     match args.processes {
         Some(count) => println!(
-            "muru: {}@{} {} pinned to {count} workers",
-            status.app, status.release, args.group
+            "muru: {}@{} {} pinned to {}",
+            status.app,
+            status.release,
+            args.group,
+            counted(count, "worker", "workers")
         ),
         None => println!(
             "muru: {}@{} {} unpinned; the autoscaler decides again",
@@ -6007,6 +6544,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
             probes,
             min_requests,
             approve_each_step,
+            capacity,
             wait,
             override_freeze,
             socket,
@@ -6034,6 +6572,7 @@ pub async fn rollout(command: RolloutCommand) -> anyhow::Result<()> {
                     min_requests,
                     approve_each_step,
                     override_freeze,
+                    capacity,
                 })
                 .await
                 .map_err(explain)?
@@ -6299,6 +6838,10 @@ async fn wait_rollout(
 pub enum AppCommand {
     /// List the applications.
     List {
+        /// Only what this deployment owns.
+        #[arg(long, value_name = "NAME")]
+        deployment: Option<String>,
+
         #[command(flatten)]
         socket: SocketArgs,
 
@@ -6321,7 +6864,8 @@ pub enum AppCommand {
 
     /// Remove release settings from the application, by key: processes,
     /// threads, sync_threads, concurrency, max_requests, max_lifetime,
-    /// timeouts.KEY, memory.KEY, env.NAME, or env for every variable.
+    /// max_surge, max_unavailable, timeouts.KEY, memory.KEY, env.NAME,
+    /// or env for every variable.
     Unset(Box<AppUnsetArgs>),
 
     /// Show the release settings the application gives its releases.
@@ -6367,6 +6911,18 @@ pub struct AppSetArgs {
     /// Replace a worker after this long, for example 1h, with jitter.
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     max_lifetime: Option<Duration>,
+
+    /// Workers a group may run over its count while workers are swapped
+    /// (default 1): a replacement starts before the old worker stops
+    /// while the group is within it, and with 0 the old worker stops
+    /// first.
+    #[arg(long, value_name = "N")]
+    max_surge: Option<u32>,
+
+    /// Workers a group may run under its count while workers are
+    /// swapped (default 0).
+    #[arg(long, value_name = "N")]
+    max_unavailable: Option<u32>,
 
     /// A host timeout as NAME=DURATION, as deploy --timeout takes it:
     /// soft, hard, hard_drain_grace, shutdown, websocket_drain_grace,
@@ -6457,6 +7013,8 @@ impl AppSetArgs {
             max_lifetime_ms: self
                 .max_lifetime
                 .map(|lifetime| lifetime.as_millis() as u64),
+            max_surge: self.max_surge,
+            max_unavailable: self.max_unavailable,
             soft_timeout_ms: timeout("soft"),
             hard_timeout_ms: timeout("hard"),
             hard_drain_grace_ms: timeout("hard_drain_grace"),
@@ -6478,6 +7036,7 @@ impl AppSetArgs {
             memory_check_interval_ms: memory_setting(&self.memory, "check_interval")
                 .and_then(|text| muru_config::parse_duration(&text).ok())
                 .map(|duration| duration.as_millis() as u64),
+            notice: String::new(),
         }
     }
 }
@@ -6552,6 +7111,11 @@ fn report_app_settings(app: &str, settings: &pb::AppSettings, json: bool) -> any
         "muru: {app}'s settings are changed for the releases deployed from now; \
          no running release changes"
     );
+
+    if !settings.notice.is_empty() {
+        eprintln!("muru: warning: {}", settings.notice);
+    }
+
     print_app_settings(app, settings)
 }
 
@@ -6603,9 +7167,39 @@ pub struct AppRemoveArgs {
 }
 
 /// List applications.
-pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+/// Keep what one deployment owns, when one is named.
+fn of_deployment<T>(items: &mut Vec<T>, deployment: Option<&str>, owner: impl Fn(&T) -> &str) {
+    if let Some(deployment) = deployment {
+        items.retain(|item| owner(item) == deployment);
+    }
+}
+
+/// Whether a list has a DEPLOYMENT column: when something in it belongs
+/// to a named deployment. A node that names none sees the lists as they
+/// are without deployments.
+fn names_deployments<'a>(mut owners: impl Iterator<Item = &'a str>) -> bool {
+    owners.any(|owner| !owner.is_empty() && owner != muru_controller::deployments::DEFAULT)
+}
+
+/// The DEPLOYMENT column's cell, or nothing when the list has none.
+fn deployment_cell(shown: bool, deployment: &str) -> String {
+    if shown {
+        format!("{:<16} ", or_dash(deployment))
+    } else {
+        String::new()
+    }
+}
+
+pub async fn app_list(
+    socket: SocketArgs,
+    json: bool,
+    deployment: Option<String>,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let answer = client.list_apps(pb::ListAppsRequest {}).await?.into_inner();
+    let mut answer = client.list_apps(pb::ListAppsRequest {}).await?.into_inner();
+    of_deployment(&mut answer.apps, deployment.as_deref(), |app| {
+        &app.deployment
+    });
 
     if json {
         return print_answer(&answer);
@@ -6618,7 +7212,14 @@ pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<12} {:<12} USER", "APP", "CURRENT", "PREVIOUS");
+    let owned = names_deployments(apps.iter().map(|app| app.deployment.as_str()));
+    println!(
+        "{:<20} {}{:<12} {:<12} USER",
+        "APP",
+        deployment_cell(owned, "DEPLOYMENT"),
+        "CURRENT",
+        "PREVIOUS"
+    );
 
     for app in apps {
         let user = if app.user.is_empty() {
@@ -6629,8 +7230,9 @@ pub async fn app_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             format!("{}:{}", app.user, app.group)
         };
         println!(
-            "{:<20} {:<12} {:<12} {user}{}{}{}",
+            "{:<20} {}{:<12} {:<12} {user}{}{}{}",
             app.name,
+            deployment_cell(owned, &app.deployment),
             or_dash(&app.current_release),
             or_dash(&app.previous_release),
             if app.umask.is_empty() {
@@ -7124,6 +7726,10 @@ fn round_figure(value: f64) -> f64 {
 pub enum OverlayCommand {
     /// Every overlay, whether it is active and what it changes.
     List {
+        /// Only what this deployment owns.
+        #[arg(long, value_name = "NAME")]
+        deployment: Option<String>,
+
         #[command(flatten)]
         socket: SocketArgs,
 
@@ -7198,8 +7804,12 @@ pub enum OverlayCommand {
 /// List, activate, end, preview or promote overlays.
 pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
     let (name, action, until, socket, json) = match command {
-        OverlayCommand::List { socket, output } => {
-            return list_overlays(&socket, output.json).await;
+        OverlayCommand::List {
+            deployment,
+            socket,
+            output,
+        } => {
+            return list_overlays(&socket, output.json, deployment).await;
         }
         OverlayCommand::Preview {
             name,
@@ -7313,13 +7923,20 @@ pub async fn overlay(command: OverlayCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn list_overlays(socket: &SocketArgs, json: bool) -> anyhow::Result<()> {
+async fn list_overlays(
+    socket: &SocketArgs,
+    json: bool,
+    deployment: Option<String>,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let answer = client
+    let mut answer = client
         .list_overlays(pb::ListOverlaysRequest {})
         .await
         .map_err(explain)?
         .into_inner();
+    of_deployment(&mut answer.overlays, deployment.as_deref(), |overlay| {
+        &overlay.deployment
+    });
 
     if json {
         return print_answer(&answer);
@@ -7351,15 +7968,23 @@ fn overlay_table(overlays: &[pb::OverlayInfo]) -> Vec<String> {
             .max(least)
     };
     let (name, state, trigger) = (width(0, 24), width(1, 10), width(2, 34));
+    let owned = names_deployments(overlays.iter().map(|overlay| overlay.deployment.as_str()));
     let mut lines = vec![format!(
-        "{:<name$} {:<state$} {:<trigger$} CHANGES",
-        "OVERLAY", "STATE", "TRIGGER"
+        "{:<name$} {}{:<state$} {:<trigger$} CHANGES",
+        "OVERLAY",
+        deployment_cell(owned, "DEPLOYMENT"),
+        "STATE",
+        "TRIGGER"
     )];
 
-    for row in &rows {
+    for (row, overlay) in rows.iter().zip(overlays) {
         lines.push(format!(
-            "{:<name$} {:<state$} {:<trigger$} {}",
-            row[0], row[1], row[2], row[3]
+            "{:<name$} {}{:<state$} {:<trigger$} {}",
+            row[0],
+            deployment_cell(owned, &overlay.deployment),
+            row[1],
+            row[2],
+            row[3]
         ));
     }
 
@@ -7571,6 +8196,10 @@ pub async fn dashboard(command: DashboardCommand) -> anyhow::Result<()> {
 pub enum HostCommand {
     /// List the virtual hosts.
     List {
+        /// Only what this deployment owns.
+        #[arg(long, value_name = "NAME")]
+        deployment: Option<String>,
+
         #[command(flatten)]
         socket: SocketArgs,
 
@@ -7580,12 +8209,19 @@ pub enum HostCommand {
 }
 
 /// List virtual hosts.
-pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+pub async fn host_list(
+    socket: SocketArgs,
+    json: bool,
+    deployment: Option<String>,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let answer = client
+    let mut answer = client
         .list_hosts(pb::ListHostsRequest {})
         .await?
         .into_inner();
+    of_deployment(&mut answer.hosts, deployment.as_deref(), |host| {
+        &host.deployment
+    });
 
     if json {
         return print_answer(&answer);
@@ -7598,7 +8234,14 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("{:<16} {:<8} {:<10} NAMES", "HOST", "TLS", "LISTENERS");
+    let owned = names_deployments(hosts.iter().map(|host| host.deployment.as_str()));
+    println!(
+        "{:<16} {}{:<8} {:<10} NAMES",
+        "HOST",
+        deployment_cell(owned, "DEPLOYMENT"),
+        "TLS",
+        "LISTENERS"
+    );
 
     for host in hosts {
         let mut names = host.names.join(", ");
@@ -7666,8 +8309,9 @@ pub async fn host_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
         }
 
         println!(
-            "{:<16} {:<8} {:<10} {names}",
+            "{:<16} {}{:<8} {:<10} {names}",
             host.name,
+            deployment_cell(owned, &host.deployment),
             if host.tls { "yes" } else { "" },
             if host.listeners.is_empty() {
                 "all".to_owned()
@@ -7695,6 +8339,10 @@ fn timeouts_note(timeouts: &std::collections::BTreeMap<String, String>) -> Strin
 pub enum UpstreamCommand {
     /// List the HTTP upstreams.
     List {
+        /// Only what this deployment owns.
+        #[arg(long, value_name = "NAME")]
+        deployment: Option<String>,
+
         #[command(flatten)]
         socket: SocketArgs,
 
@@ -7704,12 +8352,19 @@ pub enum UpstreamCommand {
 }
 
 /// List HTTP upstreams.
-pub async fn upstream_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+pub async fn upstream_list(
+    socket: SocketArgs,
+    json: bool,
+    deployment: Option<String>,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let answer = client
+    let mut answer = client
         .list_upstreams(pb::ListUpstreamsRequest {})
         .await?
         .into_inner();
+    of_deployment(&mut answer.upstreams, deployment.as_deref(), |upstream| {
+        &upstream.deployment
+    });
 
     if json {
         return print_answer(&answer);
@@ -7722,9 +8377,17 @@ pub async fn upstream_list(socket: SocketArgs, json: bool) -> anyhow::Result<()>
         return Ok(());
     }
 
+    let owned = names_deployments(
+        upstreams
+            .iter()
+            .map(|upstream| upstream.deployment.as_str()),
+    );
     println!(
-        "{:<16} {:<8} {:<6} ADDRESSES",
-        "UPSTREAM", "PROTOCOL", "TLS"
+        "{:<16} {}{:<8} {:<6} ADDRESSES",
+        "UPSTREAM",
+        deployment_cell(owned, "DEPLOYMENT"),
+        "PROTOCOL",
+        "TLS"
     );
 
     for upstream in upstreams {
@@ -7739,8 +8402,9 @@ pub async fn upstream_list(socket: SocketArgs, json: bool) -> anyhow::Result<()>
         }
 
         println!(
-            "{:<16} {:<8} {:<6} {addresses}",
+            "{:<16} {}{:<8} {:<6} {addresses}",
             upstream.name,
+            deployment_cell(owned, &upstream.deployment),
             upstream.protocol,
             if upstream.tls { "yes" } else { "" }
         );
@@ -7754,6 +8418,10 @@ pub async fn upstream_list(socket: SocketArgs, json: bool) -> anyhow::Result<()>
 pub enum RouteCommand {
     /// List the routes.
     List {
+        /// Only what this deployment owns.
+        #[arg(long, value_name = "NAME")]
+        deployment: Option<String>,
+
         #[command(flatten)]
         socket: SocketArgs,
 
@@ -7763,12 +8431,19 @@ pub enum RouteCommand {
 }
 
 /// List routes.
-pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+pub async fn route_list(
+    socket: SocketArgs,
+    json: bool,
+    deployment: Option<String>,
+) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let answer = client
+    let mut answer = client
         .list_routes(pb::ListRoutesRequest {})
         .await?
         .into_inner();
+    of_deployment(&mut answer.routes, deployment.as_deref(), |route| {
+        &route.deployment
+    });
 
     if json {
         return print_answer(&answer);
@@ -7781,7 +8456,13 @@ pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("{:<16} {:<24} TARGET", "HOST", "PATH");
+    let owned = names_deployments(routes.iter().map(|route| route.deployment.as_str()));
+    println!(
+        "{:<16} {:<24} {}TARGET",
+        "HOST",
+        "PATH",
+        deployment_cell(owned, "DEPLOYMENT")
+    );
 
     for route in routes {
         // Section 4.13: an upstream as the target, or behind the files.
@@ -7893,7 +8574,12 @@ pub async fn route_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
             target.push_str(&format!(" [for {}]", route.client_classes.join(", ")));
         }
 
-        println!("{:<16} {:<24} {target}", route.host, route.path);
+        println!(
+            "{:<16} {:<24} {}{target}",
+            route.host,
+            route.path,
+            deployment_cell(owned, &route.deployment)
+        );
     }
 
     Ok(())
@@ -7935,8 +8621,8 @@ pub enum ReleaseCommand {
 
     /// Remove one release: its record, environment, bytecode and logs.
     /// Refused for the serving or rollback release, a running one or one
-    /// a route or rollout uses. Asks first; without a terminal it needs
-    /// --yes.
+    /// a route or rollout uses, and for one applied files declare unless
+    /// --force. Asks first; without a terminal it needs --yes.
     Remove(Box<ReleaseRemoveArgs>),
 
     /// Wait until a release reaches a state.
@@ -8004,6 +8690,11 @@ pub struct ReleaseRemoveArgs {
     /// Leave its log and log archives.
     #[arg(long)]
     keep_logs: bool,
+
+    /// Remove it although applied files declare it; the next apply of
+    /// those files creates it again.
+    #[arg(long)]
+    force: bool,
 
     /// Only say what would be removed.
     #[arg(long)]
@@ -8122,6 +8813,7 @@ pub async fn release_remove(args: ReleaseRemoveArgs) -> anyhow::Result<()> {
         release: id.to_owned(),
         keep_logs: args.keep_logs,
         dry_run: true,
+        force: args.force,
     };
 
     let plan = client
@@ -8289,6 +8981,43 @@ fn workers_column(release: &pb::Release) -> String {
 }
 
 /// Show one release.
+/// A release's or a group's `max_surge` and `max_unavailable` in words,
+/// with the order its swaps take.
+fn swap_settings(max_surge: u32, max_unavailable: u32) -> String {
+    let order = if max_surge == 0 {
+        "the old worker stops first"
+    } else {
+        "the new worker starts first"
+    };
+
+    format!("max_surge {max_surge}, max_unavailable {max_unavailable} ({order})")
+}
+
+/// What a release's description says of a surge allowance the daemon
+/// granted short of `max_surge`, or nothing when it is whole or no host
+/// runs.
+fn surge_granted(max_surge: u32, allowance: Option<u32>, short: &str) -> String {
+    let Some(allowance) = allowance.filter(|allowance| *allowance < max_surge) else {
+        return String::new();
+    };
+
+    let why = match short {
+        "traffic" => "the release takes no traffic".to_owned(),
+        "workers" => "the node's worker budget has no room".to_owned(),
+        "memory" => "the node's memory budget has no room".to_owned(),
+        "cpu" => "the node's CPU budget has no room".to_owned(),
+        _ => "the node's budget has no room".to_owned(),
+    };
+
+    if allowance == 0 && short == "traffic" {
+        format!("; no surge allowance now, since {why}, so the old worker stops first")
+    } else if allowance == 0 {
+        format!("; no surge allowance now, since {why}")
+    } else {
+        format!("; a surge allowance of {allowance} now, since {why}")
+    }
+}
+
 pub async fn release_show(release: String, socket: SocketArgs, json: bool) -> anyhow::Result<()> {
     let (app, id) = split_release(&release)?;
     let mut client = client::connect(&socket.endpoint()?).await?;
@@ -8338,6 +9067,12 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
 
     if !release.message.is_empty() {
         lines.push(("message".to_owned(), release.message.clone()));
+    }
+
+    // Section 13.8: the number that names its host's directories.
+
+    if release.number > 0 {
+        lines.push(("number".to_owned(), release.number.to_string()));
     }
 
     lines.push(("source".to_owned(), release.source.clone()));
@@ -8464,7 +9199,7 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
             release.threads,
             release.concurrency,
             release.sync_threads,
-        ),
+        ) + &initial_note(release.initial_processes),
     ));
 
     for group in &release.groups {
@@ -8494,8 +9229,51 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
                     group.threads,
                     group.concurrency,
                     group.sync_threads
-                ),
+                ) + &initial_note(group.initial_processes),
                 if group.optional { ", optional" } else { "" }
+            ) + &if (group.max_surge, group.max_unavailable)
+                == (release.max_surge, release.max_unavailable)
+            {
+                String::new()
+            } else {
+                format!(
+                    ", {}",
+                    swap_settings(group.max_surge, group.max_unavailable)
+                )
+            } + &surge_granted(group.max_surge, group.surge_allowance, &group.surge_short),
+        ));
+    }
+
+    // Section 7.8: how far a group may move from its count while its
+    // workers are swapped. A release of another kind has neither.
+
+    if release.max_surge + release.max_unavailable > 0 {
+        lines.push((
+            "swaps".to_owned(),
+            swap_settings(release.max_surge, release.max_unavailable)
+                + &surge_granted(
+                    release.max_surge,
+                    release.surge_allowance,
+                    &release.surge_short,
+                ),
+        ));
+    }
+
+    // Section 10.14: a restart of every worker under way.
+
+    if let Some(restart) = &release.restart {
+        lines.push((
+            "restart".to_owned(),
+            format!(
+                "{} of {}{} still to be replaced, each in its turn; muructl restart --cancel \
+                 leaves them",
+                restart.left,
+                counted(restart.total, "worker", "workers"),
+                if restart.group.is_empty() {
+                    String::new()
+                } else {
+                    format!(" of the group {}", restart.group)
+                }
             ),
         ));
     }
@@ -8573,6 +9351,14 @@ struct Uses {
     threads: bool,
     /// The event loop, for ASGI and gRPC.
     event_loop: bool,
+}
+
+/// What `release show` adds to a group's size when the release was
+/// deployed with fewer workers to start with (issue 964).
+fn initial_note(initial: Option<u32>) -> String {
+    initial.map_or_else(String::new, |initial| {
+        format!("; {initial} to start with and while it takes no traffic")
+    })
 }
 
 /// A group's processes and what each takes at once: threads for WSGI,
@@ -8732,17 +9518,31 @@ pub async fn drain(release: String, socket: SocketArgs, json: bool) -> anyhow::R
 /// What `apply` takes.
 #[derive(Args)]
 pub struct ApplyArgs {
-    /// The file to apply, or a directory whose .toml files are applied together.
-    #[arg(short = 'f', long = "file", value_name = "FILE or DIR")]
-    file: PathBuf,
+    /// A file to apply, or a directory whose .toml files are applied
+    /// together. Given more than once, the files are applied as one.
+    #[arg(
+        short = 'f',
+        long = "file",
+        value_name = "FILE or DIR",
+        required = true
+    )]
+    file: Vec<PathBuf>,
 
     /// Report what would change and change nothing.
     #[arg(long)]
     dry_run: bool,
 
-    /// Also remove the applications and releases the files do not contain.
-    #[arg(long)]
-    prune: bool,
+    /// Also remove what the files do not contain, of the deployments
+    /// they name; with --prune=all, of every deployment, so the files
+    /// are the whole of what the daemon serves.
+    #[arg(
+        long,
+        value_name = "REACH",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "files"
+    )]
+    prune: Option<PruneScope>,
 
     /// Deploy or promote releases of applications an overlay freezes;
     /// recorded as an event.
@@ -8750,7 +9550,7 @@ pub struct ApplyArgs {
     override_freeze: bool,
 
     /// Start the releases the apply adds but leave traffic where it is,
-    /// for a preview with the Muru-Preview header or a rollout; refused
+    /// for a preview with muructl preview or a rollout; refused
     /// when an application's serving key would move its traffic.
     #[arg(long)]
     hold: bool,
@@ -8783,18 +9583,21 @@ pub struct ApplyArgs {
 /// changed or everything applied, 2 for a dry run with changes planned
 /// and 1 for errors.
 pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
-    let document = load_documents(&args.file)?;
+    let documents = load_documents(&args.file)?;
     let mut client = client::connect(&args.socket.endpoint()?).await?;
     let report = client
         .apply_config(pb::ApplyConfigRequest {
-            document: document.to_toml().context("writing the configuration")?,
+            documents,
+            document: String::new(),
+            prune_all: args.prune == Some(PruneScope::All),
             dry_run: args.dry_run,
-            prune: args.prune,
+            prune: args.prune.is_some(),
             override_freeze: args.override_freeze,
             hold: args.hold,
             no_wait: args.no_wait,
             retain_ms: args.retain.map(|retain| retain.as_millis() as u64),
             retain_workers: args.retain_workers,
+            remove_data: false,
         })
         .await
         .map_err(explain)?
@@ -8804,18 +9607,78 @@ pub async fn apply(args: ApplyArgs) -> anyhow::Result<i32> {
         print_answer(&report)?;
     } else {
         print_report(&report, args.dry_run);
+
+        if args.hold && !args.dry_run && !args.no_wait {
+            eprintln!("muru: muructl preview APP@RELEASE opens a preview of a held release");
+        }
     }
+
     Ok(exit_code(&report, args.dry_run))
 }
 
 /// The configuration subcommands.
 #[derive(Subcommand)]
-pub enum ConfigCommand {
+pub enum DeploymentCommand {
+    /// List the deployments: the named sets of applications, hosts and
+    /// routes this daemon serves, each applied, pruned and removed
+    /// together. default holds what files with no deployment key and
+    /// commands made.
+    List {
+        #[command(flatten)]
+        socket: SocketArgs,
+
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+
+    /// Remove a deployment as a unit: drain what it runs and remove its
+    /// applications with their releases, its hosts, routes and the rest,
+    /// after listing what goes and asking. Refused while another
+    /// deployment names something of it. default is emptied and kept.
+    /// Application data directories are kept unless --data.
+    Remove {
+        /// The deployment.
+        name: String,
+
+        /// Also remove the data directories of its applications.
+        #[arg(long)]
+        data: bool,
+
+        /// Only list what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Do it without asking.
+        #[arg(long)]
+        yes: bool,
+
+        #[command(flatten)]
+        socket: SocketArgs,
+    },
+
     /// Write desired state as a file that applies back without changes.
     Export {
-        /// One application rather than all.
+        /// The deployment to write, with its deployment key at the top.
+        /// With none, a daemon whose files name no deployment writes
+        /// everything, as default.
+        #[arg(conflicts_with_all = ["dir", "app"])]
+        name: Option<String>,
+
+        /// Write a file for each deployment into this directory, which
+        /// must be empty: NAME.toml, which muructl apply -f DIR applies
+        /// back without changes.
+        #[arg(long, value_name = "DIR", conflicts_with = "app")]
+        dir: Option<PathBuf>,
+
+        /// One application, with the routes that reach it and their
+        /// hosts, whichever deployment each is in.
         #[arg(long, value_name = "NAME")]
         app: Option<String>,
+
+        /// With --app: write this deployment's name at the top, for a
+        /// file that moves the application out of default.
+        #[arg(long = "as", value_name = "DEPLOYMENT", requires = "app")]
+        as_deployment: Option<String>,
 
         /// Write each rollout under way as where it stands: its candidate
         /// declared, and the application's routes splitting traffic at
@@ -8834,7 +9697,12 @@ pub enum ConfigCommand {
     /// Show desired state; with --effective, as the active overlays leave
     /// it, with what each sets that is in force.
     Show {
+        /// One deployment rather than everything, as its files would
+        /// state it.
+        name: Option<String>,
+
         /// One application rather than all.
+        #[arg(long, value_name = "APP", conflicts_with = "name")]
         app: Option<String>,
 
         /// Apply the active overlays and attribute what they set.
@@ -8850,9 +9718,15 @@ pub enum ConfigCommand {
 
     /// Compare a file, or a directory of files, with desired state.
     Diff {
-        /// The file, or a directory whose .toml files are read together.
-        #[arg(short = 'f', long = "file", value_name = "FILE or DIR")]
-        file: PathBuf,
+        /// A file, or a directory whose .toml files are read together.
+        /// Given more than once, the files are read as one.
+        #[arg(
+            short = 'f',
+            long = "file",
+            value_name = "FILE or DIR",
+            required = true
+        )]
+        file: Vec<PathBuf>,
 
         /// Print the report as JSON.
         #[arg(long)]
@@ -8864,45 +9738,129 @@ pub enum ConfigCommand {
 }
 
 /// Export desired state, with a header naming where it came from.
-pub async fn config_export(
-    app: Option<String>,
-    resolve_rollouts: bool,
-    json: bool,
-    socket: SocketArgs,
-) -> anyhow::Result<()> {
+/// What `deployment export` writes.
+pub struct Exporting {
+    /// One deployment.
+    pub name: Option<String>,
+    /// A file for each deployment, into this directory.
+    pub dir: Option<PathBuf>,
+    /// One application.
+    pub app: Option<String>,
+    /// The deployment key to write with `app`.
+    pub as_deployment: Option<String>,
+    /// Each rollout under way as where it stands.
+    pub resolve_rollouts: bool,
+    /// JSON rather than TOML.
+    pub json: bool,
+}
+
+/// Write desired state as files that apply back without changes: one
+/// deployment, one application, or with `dir` a file for each deployment.
+pub async fn config_export(exporting: Exporting, socket: SocketArgs) -> anyhow::Result<()> {
     let mut client = client::connect(&socket.endpoint()?).await?;
-    let export = client
-        .export_config(pb::ExportConfigRequest {
-            app: app.unwrap_or_default(),
-            effective: false,
-            resolve_rollouts,
-        })
+    let named: Vec<String> = client
+        .list_deployments(pb::ListDeploymentsRequest {})
         .await
         .map_err(explain)?
-        .into_inner();
+        .into_inner()
+        .deployments
+        .into_iter()
+        .filter(|deployment| {
+            deployment.name != muru_controller::deployments::DEFAULT
+                || !deployment.apps.is_empty()
+                || deployment.hosts + deployment.routes + deployment.others > 0
+        })
+        .map(|deployment| deployment.name)
+        .collect();
+    let several = named
+        .iter()
+        .any(|name| name != muru_controller::deployments::DEFAULT);
 
-    if json {
-        let document =
-            muru_config::Document::parse(&export.document).map_err(anyhow::Error::msg)?;
-        println!("{}", serde_json::to_string_pretty(&document)?);
+    // One file cannot say which deployment each of its tables belongs
+    // to, so a daemon with named deployments is exported one at a time,
+    // or into a directory.
+
+    if exporting.name.is_none() && exporting.dir.is_none() && exporting.app.is_none() && several {
+        anyhow::bail!(
+            "this daemon has the deployments {}; name one, as in muructl deployment export {}, \
+             or write a file for each with --dir DIR",
+            named.join(", "),
+            named[0]
+        );
+    }
+
+    let extension = if exporting.json { "json" } else { "toml" };
+    let mut fetch = async |deployment: Option<&str>| -> anyhow::Result<String> {
+        let export = client
+            .export_config(pb::ExportConfigRequest {
+                app: exporting.app.clone().unwrap_or_default(),
+                effective: false,
+                resolve_rollouts: exporting.resolve_rollouts,
+                deployment: deployment.unwrap_or_default().to_owned(),
+                as_deployment: exporting.as_deployment.clone().unwrap_or_default(),
+            })
+            .await
+            .map_err(explain)?
+            .into_inner();
+
+        if exporting.json {
+            let document =
+                muru_config::Document::parse(&export.document).map_err(anyhow::Error::msg)?;
+            return Ok(serde_json::to_string_pretty(&document)? + "\n");
+        }
+
+        Ok(format!(
+            "# Muru desired state: muructl {} on {}, {}, state version {}.\n\
+             # Applying this file to the daemon it came from changes nothing.\n\n{}",
+            export.version,
+            export.node,
+            format_time(export.time_unix_ms),
+            export.state_version,
+            export.document
+        ))
+    };
+
+    let Some(dir) = &exporting.dir else {
+        print!("{}", fetch(exporting.name.as_deref()).await?);
+        return Ok(());
+    };
+
+    // A file left from a deployment since removed would be applied back
+    // with the rest, so the directory starts empty.
+
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+
+    if std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .next()
+        .is_some()
+    {
+        anyhow::bail!(
+            "{} is not empty; a file there from a deployment since removed would be applied \
+             back with the rest, so give an empty directory",
+            dir.display()
+        );
+    }
+
+    if named.is_empty() {
+        println!("muru: there is nothing to export");
         return Ok(());
     }
 
-    println!(
-        "# Muru desired state: muructl {} on {}, {}, state version {}.\n\
-         # Applying this file to the daemon it came from changes nothing.\n",
-        export.version,
-        export.node,
-        format_time(export.time_unix_ms),
-        export.state_version
-    );
-    print!("{}", export.document);
+    for name in &named {
+        let path = dir.join(format!("{name}.{extension}"));
+        std::fs::write(&path, fetch(Some(name)).await?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("{}", path.display());
+    }
+
     Ok(())
 }
 
 /// Show desired state, or with `effective` the state the active overlays
 /// make of it, headed by what each sets that is in force.
 pub async fn config_show(
+    deployment: Option<String>,
     app: Option<String>,
     effective: bool,
     socket: SocketArgs,
@@ -8912,8 +9870,10 @@ pub async fn config_show(
     let export = client
         .export_config(pb::ExportConfigRequest {
             app: app.unwrap_or_default(),
+            deployment: deployment.unwrap_or_default(),
             effective,
             resolve_rollouts: false,
+            ..pb::ExportConfigRequest::default()
         })
         .await
         .map_err(explain)?
@@ -8962,14 +9922,127 @@ pub async fn config_show(
     Ok(())
 }
 
+/// List the deployments with what each holds.
+pub async fn deployment_list(socket: SocketArgs, json: bool) -> anyhow::Result<()> {
+    let mut client = client::connect(&socket.endpoint()?).await?;
+    let answer = client
+        .list_deployments(pb::ListDeploymentsRequest {})
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if json {
+        return print_answer(&answer);
+    }
+
+    println!(
+        "{:<24} {:<32} {:>5} {:>6} {:>6}",
+        "NAME", "APPS", "HOSTS", "ROUTES", "OTHER"
+    );
+
+    for deployment in &answer.deployments {
+        let apps = if deployment.apps.is_empty() {
+            "-".to_owned()
+        } else {
+            deployment.apps.join(", ")
+        };
+        println!(
+            "{:<24} {:<32} {:>5} {:>6} {:>6}",
+            deployment.name, apps, deployment.hosts, deployment.routes, deployment.others
+        );
+    }
+
+    Ok(())
+}
+
+/// Remove a deployment as a unit: what an apply of no files for it, with
+/// a prune, removes. The exit code is 0 when it went or there was nothing
+/// to remove, and 1 for a refusal or a failure.
+pub async fn deployment_remove(
+    name: String,
+    data: bool,
+    dry_run: bool,
+    yes: bool,
+    socket: SocketArgs,
+) -> anyhow::Result<i32> {
+    let mut client = client::connect(&socket.endpoint()?).await?;
+    let known = client
+        .list_deployments(pb::ListDeploymentsRequest {})
+        .await
+        .map_err(explain)?
+        .into_inner()
+        .deployments;
+
+    if !known.iter().any(|deployment| deployment.name == name) {
+        anyhow::bail!("there is no deployment {name}; muructl deployment list shows them");
+    }
+
+    // A deployment's files with nothing in them, pruned: everything it
+    // owns goes, and nothing of any other deployment.
+
+    let document = if name == muru_controller::deployments::DEFAULT {
+        String::new()
+    } else {
+        format!("deployment = \"{name}\"\n")
+    };
+    let request = pb::ApplyConfigRequest {
+        documents: vec![document],
+        prune: true,
+        dry_run: true,
+        remove_data: data,
+        ..pb::ApplyConfigRequest::default()
+    };
+    let plan = client
+        .apply_config(request.clone())
+        .await
+        .map_err(explain)?
+        .into_inner();
+
+    if plan.changes.is_empty() && plan.errors.is_empty() {
+        println!("muru: the deployment {name} holds nothing");
+        return Ok(0);
+    }
+
+    print_report(&plan, true);
+
+    if !plan.errors.is_empty() {
+        return Ok(1);
+    }
+
+    if dry_run {
+        return Ok(0);
+    }
+
+    if !confirm(&format!("Remove the deployment {name}?"), yes)? {
+        eprintln!("muru: nothing was changed");
+        return Ok(0);
+    }
+
+    let report = client
+        .apply_config(pb::ApplyConfigRequest {
+            dry_run: false,
+            ..request
+        })
+        .await
+        .map_err(explain)?
+        .into_inner();
+    print_report(&report, false);
+    Ok(exit_code(&report, false))
+}
+
 /// Compare a file with desired state. The exit code is 0 when they
 /// match, 2 when they differ and 1 for errors.
-pub async fn config_diff(file: PathBuf, json: bool, socket: SocketArgs) -> anyhow::Result<i32> {
-    let document = load_documents(&file)?;
+pub async fn config_diff(
+    file: Vec<PathBuf>,
+    json: bool,
+    socket: SocketArgs,
+) -> anyhow::Result<i32> {
+    let documents = load_documents(&file)?;
     let mut client = client::connect(&socket.endpoint()?).await?;
     let report = client
         .diff_config(pb::DiffConfigRequest {
-            document: document.to_toml().context("writing the configuration")?,
+            documents,
+            document: String::new(),
         })
         .await
         .map_err(explain)?
@@ -9088,37 +10161,89 @@ fn resolve_route_overlay(route: &mut muru_config::RouteOverlay, absolute: &dyn F
     }
 }
 
-fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
+/// The files `-f` names, read as one document: each file as it is, and
+/// of a directory its .toml files in name order.
+fn load_documents(paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
     let mut files = Vec::new();
 
-    if path.is_dir() {
+    for path in paths {
+        if !path.is_dir() {
+            files.push(path.clone());
+            continue;
+        }
+
+        // A project's directory is not a directory of files to apply:
+        // its pyproject.toml or muru.toml holds the project's settings,
+        // and failed here on its first key (issue 931).
+
+        if let Some(project) = ["pyproject.toml", "muru.toml"]
+            .iter()
+            .find(|name| path.join(name).is_file())
+        {
+            anyhow::bail!(
+                "{} is a project (it has a {project}), not a directory of files to apply; name \
+                 the file, as in muructl apply -f {}",
+                path.display(),
+                path.join(muru_config::DEPLOY_FILE).display()
+            );
+        }
+
+        let mut found = Vec::new();
+
         for entry in
             std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?
         {
             let entry = entry?.path();
+
             if entry
                 .extension()
                 .is_some_and(|extension| extension == "toml")
             {
-                files.push(entry);
+                found.push(entry);
             }
         }
-        files.sort();
 
-        if files.is_empty() {
+        if found.is_empty() {
             anyhow::bail!("{} holds no .toml files", path.display());
         }
-    } else {
-        files.push(path.to_path_buf());
+
+        found.sort();
+        files.extend(found);
     }
 
-    let mut document = muru_config::Document::default();
+    // Files are read a deployment at a time: those with the same
+    // `deployment` key, or with none, are one document (ADR 0080).
+
+    let mut deployments: std::collections::BTreeMap<String, muru_config::Document> =
+        std::collections::BTreeMap::new();
 
     for file in files {
         let text = std::fs::read_to_string(&file)
             .with_context(|| format!("reading {}", file.display()))?;
         let mut parsed = muru_config::Document::parse(&text)
             .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
+
+        // The daemon's own tables are no part of what an apply changes
+        // (issue 862). They are refused here, by file, since folding the
+        // files into one document keeps only some of them for the daemon
+        // to refuse.
+
+        let daemons = parsed.daemon_tables();
+
+        if !daemons.is_empty() {
+            let lines: Vec<String> = daemons
+                .iter()
+                .map(|table| {
+                    format!(
+                        "{}: {table} is part of the daemon's own configuration, which muructl \
+                         apply does not change: put it in the daemon's configuration file and \
+                         run muructl daemon reload",
+                        file.display()
+                    )
+                })
+                .collect();
+            anyhow::bail!("{}", lines.join("\n"));
+        }
 
         // Paths are resolved here, where the file is, since the daemon
         // may run elsewhere. The file's directory is made absolute first,
@@ -9134,12 +10259,46 @@ fn load_documents(path: &Path) -> anyhow::Result<muru_config::Document> {
             std::env::current_dir().map_or(base.clone(), |cwd| cwd.join(&base))
         });
         resolve_paths(&mut parsed, &base);
-        document
+        deployments
+            .entry(parsed.deployment.clone().unwrap_or_default())
+            .or_default()
             .merge(parsed)
             .map_err(|error| anyhow::anyhow!("{}: {error}", file.display()))?;
     }
 
-    Ok(document)
+    deployments
+        .into_values()
+        .map(|document| document.to_toml().context("writing the configuration"))
+        .collect()
+}
+
+/// How far `--prune` reaches: the deployments the files name, which is
+/// the flag alone, or every deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PruneScope {
+    /// The deployments the files name.
+    Files,
+    /// Every deployment, so the files are the whole of what is served.
+    All,
+}
+
+impl PruneScope {
+    /// The flag that asks for it.
+    fn flag(self) -> &'static str {
+        match self {
+            PruneScope::Files => "--prune",
+            PruneScope::All => "--prune=all",
+        }
+    }
+
+    /// The reach a flag asks for, none without it.
+    fn reach(scope: Option<PruneScope>) -> muru_controller::deployments::Prune {
+        match scope {
+            None => muru_controller::deployments::Prune::No,
+            Some(PruneScope::Files) => muru_controller::deployments::Prune::Files,
+            Some(PruneScope::All) => muru_controller::deployments::Prune::All,
+        }
+    }
 }
 
 /// Print a report as people read it.
@@ -10875,7 +12034,7 @@ pub(crate) fn daemon_locations(socket: &SocketArgs, files: &DaemonFileArgs) -> L
 /// find the daemon. A socket file that is absent, or one left behind that
 /// refuses the connection, is no daemon. Anything else, such as a
 /// permission refused, is left for the connection to report.
-fn no_daemon(socket: &SocketArgs, path: &Path) -> bool {
+pub(crate) fn no_daemon(socket: &SocketArgs, path: &Path) -> bool {
     socket.given_socket().is_none()
         && match path.try_exists() {
             Ok(false) => true,
@@ -11996,15 +13155,7 @@ pub async fn cache_clear(args: CacheClearArgs) -> anyhow::Result<()> {
 
 /// A byte count for a reader, in the units sizes are given in.
 pub(crate) fn human_size(bytes: u64) -> String {
-    const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
-
-    for (scale, unit) in UNITS {
-        if bytes >= scale {
-            return format!("{:.1}{unit}", bytes as f64 / scale as f64);
-        }
-    }
-
-    format!("{bytes}B")
+    muru_controller::disk::human_size(bytes)
 }
 
 /// An access log record as the compact line a development run prints,
@@ -12202,6 +13353,35 @@ fn read_config(path: &Path) -> anyhow::Result<muru_config::Document> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_initial_count_is_the_releases_or_one_groups() {
+        use super::parse_initial_processes as parse;
+
+        assert_eq!(parse("2"), Ok((None, 2)));
+        assert_eq!(parse("jobs=1"), Ok((Some("jobs".to_owned()), 1)));
+
+        for refused in ["0", "jobs=0", "=1", "jobs=", "many"] {
+            assert!(parse(refused).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_re_execution_drops_the_flags_of_the_one_before() {
+        // Issue 940: a restart after an upgrade, or an upgrade after a
+        // restart, says only what it is itself.
+
+        let arguments =
+            |text: &str| -> Vec<std::ffi::OsString> { text.split(' ').map(Into::into).collect() };
+
+        assert_eq!(
+            super::without_reexec_flags(arguments(
+                "daemon run --upgraded-from 1.2.0 --restarted --apply /etc/muru/deploy.d \
+                 --held-locks 5,6"
+            )),
+            arguments("daemon run --apply /etc/muru/deploy.d")
+        );
+    }
+
     use super::condition_wait;
     use super::format_access_line;
     use super::limits_lines;

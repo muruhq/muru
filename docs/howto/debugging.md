@@ -649,7 +649,7 @@ The report holds:
   no module of the application's own is named.
 
 - The effective settings of the serving releases, each with where it
-  came from, as [`muructl config show
+  came from, as [`muructl deployment show
   --effective`](daemon.md#what-an-apply-does) reports them. For a
   development run and `muructl serve` these are the settings
   `--print-config` prints. A setting left at its default is listed with
@@ -774,8 +774,8 @@ Everything is under one directory named as the file is.
 | `manifest.json` | What the bundle is of, its window, and every part: whether it was collected, its size, and why not when it was not |
 | `installation.json` | Muru's version, the platform, how Muru runs and where its directories are, and every release with its state, interface, Python version and workers' states |
 | `events.jsonl` | Every event of the window, in full, a JSON object a line |
-| `config/releases/APP@RELEASE.json` | For every release, serving or not: what it is, its effective settings with where each came from, as `muructl config show --effective` lists them, and its whole specification |
-| `config/effective.toml` | The configuration in force as `muructl config show --effective` writes it: applications, releases, virtual hosts and routes as the active overlays leave them |
+| `config/releases/APP@RELEASE.json` | For every release, serving or not: what it is, its effective settings with where each came from, as `muructl deployment show --effective` lists them, and its whole specification |
+| `config/effective.toml` | The configuration in force as `muructl deployment show --effective` writes it: applications, releases, virtual hosts and routes as the active overlays leave them |
 | `config/in-force.json` | What is in force outside the configuration: each rollout and where it stands, the sizes releases are pinned at, the applications and virtual hosts in maintenance mode, and each overlay's state |
 | `config/daemon.toml` | The daemon's own configuration file |
 | `config/access-log-overrides.json` | The changes `muructl logging access` has in force |
@@ -797,6 +797,7 @@ Everything is under one directory named as the file is.
 | `host/APP@RELEASE/packages.txt` | The distributions installed in the release's environment, each with its version |
 | `host/APP@RELEASE/uv.lock` and the like | The lock files of the release's source that are there: `uv.lock`, `pylock.toml`, `requirements.txt`, `poetry.lock`, `pdm.lock` and `Pipfile.lock` |
 | `host/APP@RELEASE/inspect.json` | What the release's workers have loaded: the interpreter and its build, `sys.path`, the modules with their versions, the threads and descriptors, and the environment as [`muructl debug inspect --json`](#inspect) gives it |
+| `doctor/report.json`, `doctor/store.json` | What [`muructl doctor`](doctor.md) finds of the daemon's installation as the bundle is made: every socket and file with its owner and condition and the checks of one part against another, and the checks of the state store. `muructl doctor --bundle FILE` prints them |
 | `failures/events.jsonl` | Every event Muru still keeps that records something going wrong, from before the window too: a request past its soft timeout or its deadline, a worker killed for a timeout or for memory, recycled, stalled or gone, a release that failed |
 
 With a target, the releases, events and output of other applications

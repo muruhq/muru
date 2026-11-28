@@ -383,7 +383,7 @@ def test_export_round_trips_hosts_and_routes_and_prune_removes_them(
     config = hosts_file(tmp_path, cert, key)
     assert apply(daemon, config).returncode == 0
 
-    exported = daemon.muructl("config", "export").stdout
+    exported = daemon.muructl("deployment", "export").stdout
     document = tomllib.loads(exported)
     assert sorted(document["host"]) == ["echo", "other", "shop"]
     assert document["host"]["echo"]["tls"]["certificate"] == str(cert)
@@ -394,7 +394,7 @@ def test_export_round_trips_hosts_and_routes_and_prune_removes_them(
 
     # One application's export carries only its routes and their hosts.
 
-    only_shop = tomllib.loads(daemon.muructl("config", "export", "--app", "shop").stdout)
+    only_shop = tomllib.loads(daemon.muructl("deployment", "export", "--app", "shop").stdout)
     assert list(only_shop["host"]) == ["shop"]
     assert [route["app"] for route in only_shop["route"]] == ["shop"]
 
@@ -519,6 +519,42 @@ def test_a_restarted_daemon_takes_both_listeners_back(tmp_path: Path) -> None:
             assert f"http://127.0.0.1:{plain}" in status
             assert second.request("/", host="echo.test").status == 200
             assert second.request("/", host="echo.test", port=secure, cafile=cert).status == 200
+        finally:
+            second.stop()
+    finally:
+        if first.process.poll() is None:
+            first.stop()
+
+
+def test_a_restarted_daemon_serves_on_the_listeners_its_file_names(tmp_path: Path) -> None:
+    # Issue 930: an edge re-adopted after a detach kept the listeners it
+    # was started with, whatever the new daemon's file said, until a
+    # reload. A start reads the file as a reload does.
+
+    old, new = support.free_port(), support.free_port()
+    first = start_daemon(tmp_path, listeners=[(old, False)])
+
+    try:
+        first.deploy("shop", SHOP)
+        assert first.get("/").status == 200
+        first.stop(shutdown=False)
+
+        second = start_daemon(tmp_path, run_dir=first.run_dir, listeners=[(new, False)])
+
+        try:
+            # Issue 952: the admin socket answers while the daemon restores
+            # what the first left, and until the edge is replaced status
+            # names the old edge and its listeners, which still serve. The
+            # daemon is not ready until then, so the test waits for it.
+
+            log = second.wait_for_log(" replaced by pid ")
+            assert "re-adopted the edge" in log
+            assert " replaced by pid " in log, log
+            status = second.muructl("status").stdout
+            assert f"http://127.0.0.1:{new}" in status, status
+            assert f"http://127.0.0.1:{old}" not in status, status
+            assert second.request("/", port=new).status == 200
+            assert "edge.replaced" in second.events()
         finally:
             second.stop()
     finally:

@@ -196,7 +196,7 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
         assert re.search(
             r"^  installation\.json +asked for when the bundle is made$", planned, re.M
         )
-        assert re.search(r"^  events\.jsonl +\d+B$", planned, re.M)
+        assert re.search(r"^  events\.jsonl +[\d.]+K?B$", planned, re.M)
         assert re.search(r"^  config/releases/shop@r1\.json +[\d.]+KB$", planned, re.M)
         assert f"{out} has " in planned and " free." in planned
         assert list(out.iterdir()) == []
@@ -273,7 +273,11 @@ def test_bundle_of_a_daemon_running_and_stopped(tmp_path: Path) -> None:
             {"changed": []},
         ]
 
-        for secret in (b"abc123", b"s3cret", b"hunter2", b"hunter3"):
+        # Issue 928: nor does it hold the release's preview secret.
+
+        preview_secret = daemon.preview("shop@r1").rpartition(".")[2].encode()
+
+        for secret in (b"abc123", b"s3cret", b"hunter2", b"hunter3", preview_secret):
             holding = [path for path, content in found.items() if secret in content]
             assert holding == [], f"{secret!r} is in {holding}"
 
@@ -633,7 +637,7 @@ def test_bundle_of_a_development_run_and_of_a_serve(tmp_path: Path) -> None:
         assert b"muru_requests_total" in found["figures/metrics.txt"]
         assert not any(path.startswith("figures/scaling/") for path in found)
 
-        # A run has no state store: its settings are what config show
+        # A run has no state store: its settings are what deployment show
         # --effective prints, and it has no daemon's file.
 
         effective = found["config/effective.toml"].decode()

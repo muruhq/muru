@@ -399,7 +399,13 @@ def test_a_request_is_proxied_with_forwarding_headers(site: Fixture) -> None:
     response = call(
         site.daemon.port,
         "/legacy/items?x=1",
-        {"X-Custom": "kept", "Bad_Name": "dropped", "X-Muru-Redirect": "/evil"},
+        {
+            "X-Custom": "kept",
+            "Bad_Name": "dropped",
+            "X-Muru-Redirect": "/evil",
+            "Muru-Preview": "r1.0f0f",
+            "Cookie": "session=abc; muru_preview=r1.0f0f; theme=dark",
+        },
         method="POST",
         body=b"payload",
     )
@@ -410,6 +416,12 @@ def test_a_request_is_proxied_with_forwarding_headers(site: Fixture) -> None:
     headers = seen["headers"]
     assert isinstance(headers, dict)
     assert headers["host"] == "site.test"
+
+    # Issue 928: a preview's header and cookie carry a release's secret,
+    # so an upstream gets neither, and the other cookies as they were.
+
+    assert "muru-preview" not in headers
+    assert headers["cookie"] == "session=abc; theme=dark"
     assert headers["x-custom"] == "kept"
     assert headers["x-forwarded-for"] == "127.0.0.1"
     assert headers["x-forwarded-proto"] == "http"
@@ -623,12 +635,24 @@ def test_a_traffic_share_goes_to_an_upstream(site: Fixture) -> None:
     cookies = response.header_values("Set-Cookie")
     assert any(cookie.startswith("muru_release=upstream:legacy;") for cookie in cookies), cookies
 
-    # The sticky cookie keeps the client there, and a preview pins it.
+    # The sticky cookie keeps the client there.
 
     seen = report(call(site.daemon.port, "/split/", {"Cookie": "muru_release=upstream:legacy"}))
     assert seen["upstream"] == "legacy"
-    previewed = call(site.daemon.port, "/half/", {"Cookie": "muru_preview=upstream:legacy"})
-    assert report(previewed)["upstream"] == "legacy"
+
+    # Issue 955: the sticky cookie reaches no upstream the route's policy
+    # does not name, whether the route has a policy or none. An upstream
+    # is not previewed at all (issue 928): the cookie is ignored, which
+    # the response says, and let go.
+
+    seen = report(call(site.daemon.port, "/split/", {"Cookie": "muru_release=upstream:socket"}))
+    assert seen["upstream"] == "legacy"
+    answered = call(site.daemon.port, "/", {"Cookie": "muru_release=upstream:legacy"})
+    assert "upstream" not in report(answered)
+    answered = call(site.daemon.port, "/", {"Cookie": "muru_preview=upstream:legacy"})
+    assert "upstream" not in report(answered)
+    assert answered.header_values("Muru-Preview") == ["ignored"]
+    assert any("Max-Age=0" in cookie for cookie in answered.header_values("Set-Cookie"))
 
     # Half the buckets go to the upstream, the rest to the release.
 
@@ -734,5 +758,5 @@ def test_listings_and_apply_checks(site: Fixture, tmp_path: Path) -> None:
 
     # Export writes the upstreams back.
 
-    exported = site.daemon.muructl("config", "export").stdout
+    exported = site.daemon.muructl("deployment", "export").stdout
     assert "[upstream.legacy]" in exported and "[upstream.inner-h2]" in exported

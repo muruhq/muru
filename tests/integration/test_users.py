@@ -57,10 +57,10 @@ def test_a_declared_user_is_recorded_and_reported_as_not_applied_without_root(
         listed = daemon.muructl("app", "list").stdout
         assert "nobody umask 027" in listed
 
-        exported = daemon.muructl("config", "export").stdout
+        exported = daemon.muructl("deployment", "export").stdout
         assert "user = 'nobody'" in exported or 'user = "nobody"' in exported
         assert "umask = '027'" in exported or 'umask = "027"' in exported
-        assert daemon.muructl("config", "diff", "-f", str(config), check=False).returncode == 0
+        assert daemon.muructl("deployment", "diff", "-f", str(config), check=False).returncode == 0
 
         # Applying the same again changes nothing; a bad mask is refused.
 
@@ -252,7 +252,7 @@ def test_a_root_daemon_runs_the_edge_and_applications_as_the_service_user() -> N
         assert info["uid"] == service.pw_uid
         assert info["gid"] == service.pw_gid
         assert "app.user_not_applied" not in daemon.muru("events").stdout
-        sockets = daemon.run_dir / "apps" / "plain" / "r1" / "r1"
+        sockets = daemon.run_dir / "h" / "1"
         assert sockets.stat().st_mode & 0o7777 == 0o2750
 
         # One that names a user runs as that user, with its umask.

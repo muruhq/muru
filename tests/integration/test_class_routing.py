@@ -61,7 +61,10 @@ threads = 2
 """
     config = base / "site.toml"
     config.write_text(
-        f"""[app.site.release.r1]
+        f"""[app.site]
+serving = 'r2'
+
+[app.site.release.r1]
 {release}
 [app.site.release.r1.groups.crawlers]
 match = {{ client_class = ['ai-crawler'] }}
@@ -194,7 +197,7 @@ routes.root.client_routes = {{ ai-crawler = {{ target = {{ static = '{archive}' 
         daemon.muructl("overlay", "activate", "crawler-surge")
         assert eventually(lambda: crawled() == b"archived\n")
         assert seen(daemon, "/")["release"] == "r2"
-        shown = daemon.muructl("config", "show", "--effective").stdout
+        shown = daemon.muructl("deployment", "show", "--effective").stdout
         assert (
             f"route root: client_routes.ai-crawler = static {archive} (overlay crawler-surge)"
             in shown

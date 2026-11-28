@@ -1566,17 +1566,17 @@ async fn serve<I>(
 
             let secure = tls.is_some() || scheme == "https";
 
-            // Section 4.21: while the daemon takes detours, the preview
-            // paths are the edge's, on every host, before routing; they
-            // are not recorded, so a token never reaches a log.
+            // Section 4.22: the preview paths are a daemon's edge's own,
+            // on every host, before routing; they are not recorded, so a
+            // token never reaches a log.
 
-            if routing.takes_detours() && preview::reserved(parts.uri.path()) {
+            if routing.takes_previews() && preview::reserved(parts.uri.path()) {
                 return Ok(preview::answer(
                     &parts.method,
                     parts.uri.path(),
                     shared.pools.previews(),
                     secure,
-                    |app, release| routing.detour_secret(app, release),
+                    |app, release| routing.preview_secret(app, release),
                 ));
             }
 
@@ -2782,9 +2782,22 @@ pub(crate) fn request_head(
                     return None;
                 }
 
+                // Section 4.22: the preview header and cookie carry a
+                // release's secret, which the application never sees.
+
+                if preview::is_header(name) {
+                    return None;
+                }
+
+                let value = if name == "cookie" {
+                    preview::cookies_without(value.as_bytes())?
+                } else {
+                    std::borrow::Cow::Borrowed(value.as_bytes())
+                };
+
                 Some(pb::Header {
                     name: Bytes::copy_from_slice(name.as_bytes()),
-                    value: Bytes::copy_from_slice(value.as_bytes()),
+                    value: Bytes::copy_from_slice(&value),
                 })
             }))
             .collect(),

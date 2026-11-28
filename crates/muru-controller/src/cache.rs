@@ -125,7 +125,7 @@ fn real(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// What a running host has in the runtime directory: its pid and the
+/// What a running host has among the runtime files: its pid and the
 /// runtime library directory it runs with.
 #[derive(serde::Deserialize)]
 struct HostRuntime {
@@ -140,26 +140,33 @@ struct HostRuntime {
 /// whether a release is being built or started.
 pub fn daemon_in_use(locations: &Locations, releases: &[Release]) -> InUse {
     let mut in_use = InUse::default();
-    let apps_dir = locations.run.path.join("apps");
+    let hosts_dir = locations.files().join(crate::locations::HOSTS_DIR);
     let python_root = real(&locations.state.path.join("python"));
 
-    for app in names(&apps_dir) {
-        for id in names(&apps_dir.join(&app)) {
-            let record = apps_dir.join(&app).join(&id).join("host.toml");
-            let Some(host) = std::fs::read_to_string(record)
-                .ok()
-                .and_then(|text| toml::from_str::<HostRuntime>(&text).ok())
-            else {
-                continue;
+    // Each host's directory is named by its release's number.
+
+    for number in names(&hosts_dir) {
+        let record = hosts_dir.join(&number).join(crate::daemon::HOST_RECORD);
+        let Some(host) = std::fs::read_to_string(record)
+            .ok()
+            .and_then(|text| toml::from_str::<HostRuntime>(&text).ok())
+        else {
+            continue;
+        };
+
+        if let Some(runtime) = host.runtime
+            && crate::host::alive(host.pid)
+        {
+            let release = releases
+                .iter()
+                .find(|release| release.number.to_string() == number);
+
+            let user = match release {
+                Some(release) => format!("the release {}@{}", release.app, release.id),
+                None => format!("the host of release number {number}"),
             };
 
-            if let Some(runtime) = host.runtime
-                && crate::host::alive(host.pid)
-            {
-                in_use
-                    .runtime
-                    .insert(real(&runtime), format!("the release {app}@{id}"));
-            }
+            in_use.runtime.insert(real(&runtime), user);
         }
     }
 
@@ -577,7 +584,7 @@ mod tests {
         std::fs::create_dir_all(&gone).unwrap();
 
         let record = |id: &str, pid: u32, runtime: &Path| {
-            let directory = root.join("run/apps/shop").join(id);
+            let directory = root.join("state/run/h").join(id);
             std::fs::create_dir_all(&directory).unwrap();
             std::fs::write(
                 directory.join("host.toml"),
@@ -591,14 +598,14 @@ mod tests {
 
         // This process is alive, and no process has the other pid.
 
-        record("r1", std::process::id(), &library);
-        record("r2", u32::MAX / 2, &gone);
+        record("1", std::process::id(), &library);
+        record("2", u32::MAX / 2, &gone);
 
         let in_use = daemon_in_use(&locations, &[]);
         let library = std::fs::canonicalize(&library).unwrap();
         assert_eq!(
             in_use.runtime.get(&library).map(String::as_str),
-            Some("the release shop@r1")
+            Some("the host of release number 1")
         );
         assert_eq!(in_use.runtime.len(), 1, "{in_use:?}");
     }

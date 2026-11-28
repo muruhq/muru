@@ -57,7 +57,10 @@ it after `soft_for` is acted on. With `reclaim_first` the host asks the
 worker to collect garbage and trim its heap (with `malloc_trim` on
 glibc) and measures once more; a worker still over is recycled, with a
 `worker.recycled` event that names the measure, the figure and the
-limit. Over the hard limit a worker is treated as the hard timeout
+limit. That recycle takes its turn among the group's replacements, as
+`max_surge` and `max_unavailable`
+[allow](recycling.md#how-many-at-once-and-in-which-order); the hard
+limit does not wait. Over the hard limit a worker is treated as the hard timeout
 treats a stuck one: it leaves routing at once, a replacement is forked,
 and it is told to stop after `hard_drain_grace`.
 

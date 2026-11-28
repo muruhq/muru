@@ -28,18 +28,62 @@ impl Events {
     /// Record an event and tell the watchers. A store failure is logged,
     /// since an event must never stop the action it describes.
     pub fn emit(&self, kind: &str, subject: &str, level: &'static str, message: &str) {
-        match self.store.append_event(kind, subject, level, message) {
-            Ok(event) => {
-                match level {
-                    "error" => tracing::error!(%subject, "{message}"),
-                    "warning" => tracing::warn!(%subject, "{message}"),
-                    _ => tracing::info!(%subject, "{message}"),
-                }
+        self.emit_at(kind, subject, level, message, None);
+    }
 
-                let _ = self.sender.send(event);
-            }
+    /// Record an event that happened at `time_unix_ms`, or now when none
+    /// is given, and tell the watchers: an event a host held while no
+    /// daemon was connected carries the time it was raised (section
+    /// 11.5). A time ahead of the clock is taken as now.
+    pub fn emit_at(
+        &self,
+        kind: &str,
+        subject: &str,
+        level: &'static str,
+        message: &str,
+        time_unix_ms: Option<u64>,
+    ) {
+        match self
+            .store
+            .append_event_at(kind, subject, level, message, time_unix_ms)
+        {
+            Ok(event) => self.tell(event),
             Err(error) => tracing::error!(%error, "recording an event failed"),
         }
+    }
+
+    /// Record an event a release's host raised and numbered, and tell
+    /// the watchers, unless it is recorded already (section 11.5, issue
+    /// 982). Returns whether it was new, or none when the store failed,
+    /// in which case the host is not told the event is recorded.
+    pub fn emit_from_host(&self, raised: &crate::store::HostEvent<'_>) -> Option<bool> {
+        let appended = self.store.append_host_event(raised);
+
+        match appended {
+            Ok(Some(event)) => {
+                self.tell(event);
+                Some(true)
+            }
+            Ok(None) => Some(false),
+            Err(error) => {
+                tracing::error!(%error, "recording an event failed");
+                None
+            }
+        }
+    }
+
+    /// Log an event that has been recorded and hand it to the watchers.
+    fn tell(&self, event: Event) {
+        let subject = &event.subject;
+        let message = &event.message;
+
+        match event.level {
+            "error" => tracing::error!(%subject, "{message}"),
+            "warning" => tracing::warn!(%subject, "{message}"),
+            _ => tracing::info!(%subject, "{message}"),
+        }
+
+        let _ = self.sender.send(event);
     }
 
     /// Watch for new events from now on.

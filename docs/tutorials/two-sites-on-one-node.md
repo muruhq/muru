@@ -204,7 +204,7 @@ notes            yes      all        notes.localhost
 shop             yes      all        shop.localhost
 ```
 
-and `muructl config export` writes the hosts, routes and upstream beside
+and `muructl deployment export` writes the hosts, routes and upstream beside
 the shop's release, as one file to keep.
 
 ## Clean up

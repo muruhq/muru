@@ -24,7 +24,9 @@ true` in the `[daemon]` table of its configuration file:
 detours = true
 ```
 
-The setting is read when the daemon starts. A system daemon refuses it,
+The setting is read when the daemon starts, so `muructl daemon config
+set daemon.detours true --restart` turns detours on for a daemon that
+is running. A system daemon refuses it,
 and refuses a detour with a message saying why: its edge serves real
 traffic, and a detour would send that traffic to a process owned by
 whoever ran the command.
@@ -42,7 +44,7 @@ $ muructl detour run
 muru: using [tool.muru] from ./pyproject.toml
 ...
 muru: serving shop.wsgi:application on detour shop@dev-7f3a of the daemon at /run/user/1000/muru/admin.sock with 2 workers of 3 threads
-muru: traffic: previews only; muructl detour preview gives an entry link
+muru: traffic: previews only; muructl preview gives an entry link
 muru: development mode: error pages show tracebacks, no releases are kept, the run reloads on change, and the daemon's edge serves the clients and compresses; Ctrl-C ends the detour
 muru: dashboard on http://127.0.0.1:52817/
 muru: admin socket /run/user/1000/muru/run-7f3a91c2/admin.sock
@@ -100,7 +102,7 @@ in the browser once the detour is open:
 ```console
 $ muructl detour run --open-preview
 ...
-muru: opened https://shop.localhost:8443/ in preview of shop@dev-7f3a (2 other addresses: muructl detour preview --list)
+muru: opened https://shop.localhost:8443/ in preview of shop@dev-7f3a (2 other addresses: muructl preview --list)
 ```
 
 The link is used once, within a minute. Following it gives the browser
@@ -108,15 +110,17 @@ the preview cookie and sends it on to the application's address. The
 cookie lasts until the browser closes, the detour ends or you leave
 preview.
 
-`muructl detour preview` gives a new link while the detour runs:
+[`muructl preview`](traffic.md#previews), which previews any release,
+gives a new link while the detour runs. With no target it takes the
+project's application and its open detour:
 
 ```console
-$ muructl detour preview                      # open a link for the best address
-$ muructl detour preview --host admin.localhost
-$ muructl detour preview --list               # a link for each of the application's addresses
-$ muructl detour preview --print              # print a link, open nothing
-$ muructl detour preview --name alice.shop.test
-$ muructl detour preview --header
+$ muructl preview                      # open a link for the best address
+$ muructl preview --host admin.localhost
+$ muructl preview --list               # a link for each of the application's addresses
+$ muructl preview --print              # print a link, open nothing
+$ muructl preview --name alice.shop.test
+$ muructl preview --header
 Muru-Preview: dev-7f3a.3f9c0e7a51b2d4c68e1f0a9b7c5d3e21
 ```
 
@@ -128,28 +132,32 @@ says which names it left out and why. `--any-name` keeps them. `--name`
 builds the link from a name of your choosing, which must reach a host
 that routes the application, for a host whose names are all patterns or
 to choose a tenant; `muructl detour run --open-preview` takes `--name`
-and `--any-name` too.
+and `--any-name` too. `--valid-for` makes a link that lasts longer than
+a minute, up to an hour.
 
 `--header` prints the header that previews the detour without a cookie,
 for curl or a test client, whatever the application's hosts are, since
 it needs no address:
 
 ```console
-$ curl -H "$(muructl detour preview --header)" https://shop.localhost:8443/
+$ curl -H "$(muructl preview --header)" https://shop.localhost:8443/
 ```
 
 The cookie and the header carry a secret the daemon makes when the
-detour opens, so a detour cannot be reached by guessing its name. A
+detour opens, so a detour cannot be reached by guessing its name, and
+the daemon's edge takes both off a request before the run sees it. A
 cookie left from a detour that has ended reaches nothing: the request
 goes to the serving release and its response removes the cookie.
+`muructl preview --new-secret` gives the detour a new secret while it
+runs.
 
 The toolbar's badge says the page came through the detour (`detour:
 preview`), with a link to leave preview. Leaving preview is the address
 `/_muru/preview/leave` on any of the application's hosts: it removes the
 cookie and goes to `/`.
 
-While detours are on, the daemon's edge answers paths under
-`/_muru/preview/` itself, on every host. Everything else under `/_muru/`
+The daemon's edge answers paths under `/_muru/preview/` itself, on
+every host. Everything else under `/_muru/`
 goes to the application, so the toolbar of a detour, under
 `/_muru/toolbar/`, is reached through the preview like the pages.
 
@@ -229,7 +237,7 @@ every path again:
 
 ```console
 $ muructl detour run --path /app/api
-muru: traffic: previews only, under /app/api; muructl detour preview gives an entry link
+muru: traffic: previews only, under /app/api; muructl preview gives an entry link
 $ muructl detour traffic all --path /app/api --path /app/admin
 muru: detour shop@dev-7f3a now takes all of shop's traffic under /app/admin and /app/api (was previews only, under /app/api)
 $ muructl detour traffic preview --all-paths
@@ -313,13 +321,13 @@ apart:
 $ muructl detour run --label feature-x
 ```
 
-`muructl detour traffic` and `muructl detour preview` choose among them
+`muructl detour traffic` and `muructl preview` choose among them
 by the application when one detour has it, and otherwise by the label,
-the tag `instance list` shows, or a prefix of the detour's ID, given as
-`APP`:
+the tag `instance list` shows, or a prefix of the detour's ID, given in
+the application's place:
 
 ```console
-$ muructl detour preview feature-x
+$ muructl preview feature-x
 ```
 
 An application name with several detours is refused with the value to
@@ -392,8 +400,8 @@ The detour then changes the data the serving release uses.
 
 ## From a coding agent
 
-The MCP server's `detours` tool lists the daemon's detours and gives an
-entry link to one, with its `Muru-Preview` header value, so an agent can
-open a page of the detour it is working on, and `detour_traffic` changes
-what a detour takes. See [coding agents](coding-agents.md) and the
+The MCP server's `detours` tool lists the daemon's detours, `preview`
+gives an entry link to one, with its `Muru-Preview` header value, so an
+agent can open a page of the detour it is working on, and
+`detour_traffic` changes what a detour takes. See [coding agents](coding-agents.md) and the
 [MCP tools](../reference/mcp-tools.md).

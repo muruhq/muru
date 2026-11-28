@@ -104,7 +104,11 @@ them itself:
 - any header starting with `X-Muru-`.
 
 A request header whose name contains an underscore cannot be set, since
-the edge passes no such header to an application. Values are printable
+the edge passes no such header to an application. Nor does it pass the
+`Muru-Preview` header or the `muru_preview` cookie, which carry a
+release's [preview secret](traffic.md#the-preview-secret): an
+application and an upstream get the request without them, with its other
+cookies as they were. Values are printable
 ASCII. The edge puts `X-Request-ID` on every response after the rules
 are applied, so it is always there. A development run adds
 `Server-Timing` and `Muru-Request-Link` after them too, as

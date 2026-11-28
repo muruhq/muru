@@ -263,6 +263,12 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
     // may say sooner (`stop_within`), and the wait gives way to the exit
     // grace then too.
 
+    // Section 5.3 (issue 986): no link connection takes a request from
+    // here, and each tells the edge so and closes once the request it
+    // has, if any, has ended.
+
+    shared.stop_link();
+
     let told = Instant::now();
     let budget_end = told + lifecycle.websocket_drain + lifecycle.drain + lifecycle.exit_grace;
     let exit_grace = lifecycle.exit_grace;
@@ -283,8 +289,14 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
 
     shared.close_pools();
 
+    // A connection that had a request's first bytes when the worker was
+    // told to stop is waited for as a request in flight is, the request
+    // not being counted as one until its head is read.
+
     let wait = |deadline: Instant| {
-        while shared.in_flight() > 0 && Instant::now() < deadline.min(requests_end()) {
+        while (shared.in_flight() > 0 || shared.link_busy() > 0)
+            && Instant::now() < deadline.min(requests_end())
+        {
             std::thread::sleep(Duration::from_millis(10));
         }
     };
@@ -306,9 +318,24 @@ pub fn serve(socket_path: &str, shared: Arc<Shared>, lifecycle: Lifecycle) -> Re
         lifecycle.on_exit.as_ref(),
         kill_at().saturating_duration_since(Instant::now()),
     );
+
+    // The connections have said they are stopping by now, each a small
+    // frame written as the stop was seen; the runtime carries them, so
+    // it is kept for a moment while any is still open.
+
+    let said_by = kill_at().min(Instant::now() + LINK_CLOSE_WAIT);
+
+    while shared.link_open() > 0 && Instant::now() < said_by {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
     drop(runtime);
     served
 }
+
+/// How long a stopping worker waits, at the end, for its link
+/// connections to have told the edge and closed.
+const LINK_CLOSE_WAIT: Duration = Duration::from_millis(500);
 
 /// How often the watchdog looks for requests past the soft timeout.
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
@@ -1171,8 +1198,44 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
     }
 
     let mut early: Option<frame::Frame> = None;
+    let _open = shared.link_opened();
+    let mut stopped = shared.link_stopped();
 
     loop {
+        // Section 5.3 (issue 986): a worker told to stop takes no more
+        // requests. It says so on each connection before closing it, so
+        // the edge knows that a request it has just written here, which
+        // this side will never read, was not started. The stop comes
+        // first: a request whose bytes are here already is not started
+        // either.
+
+        if early.is_none() {
+            use tokio::io::AsyncBufReadExt;
+
+            let arrived = tokio::select! {
+                biased;
+                _ = stopped.wait_for(|stopped| *stopped) => None,
+                buffered = reader.fill_buf() => Some(buffered.is_ok_and(|buffered| !buffered.is_empty())),
+            };
+
+            match arrived {
+                None => return say_stopping(&mut writer).await,
+                Some(false) => return,
+                Some(true) => {}
+            }
+        }
+
+        // The request counts as the connection's from its first bytes,
+        // and the stop is looked at again once it does, so the worker
+        // either sees the connection busy and waits for it, or the
+        // connection sees the stop.
+
+        let _busy = shared.link_busied();
+
+        if shared.link_stopping() {
+            return say_stopping(&mut writer).await;
+        }
+
         let request = match early.take() {
             Some(request) => request,
             None => match frame::read(&mut reader).await {
@@ -1214,9 +1277,37 @@ async fn serve_connection(stream: tokio::net::UnixStream, shared: Arc<Shared>) {
         .await
         {
             Ok(next) => early = next,
+            // A request no thread would take, the worker having closed
+            // its pools to stop, was not started.
+            Err(error) if not_started(&error) => return say_stopping(&mut writer).await,
             Err(_) => return,
         }
     }
+}
+
+/// Tell the edge the worker is stopping and takes no more requests on
+/// the connection, which the caller then closes.
+async fn say_stopping(writer: &mut Writer) {
+    let _ = frame::write(writer, kind::STOPPING, 0, Bytes::new()).await;
+}
+
+/// Marks the error of a request that was refused before any of it ran.
+#[derive(Debug)]
+struct NotStarted;
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the worker is shutting down")
+    }
+}
+
+impl std::error::Error for NotStarted {}
+
+/// Whether an error says a request was refused before any of it ran.
+fn not_started(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<NotStarted>())
 }
 
 /// What the request direction brought while the response was in progress.
@@ -1389,7 +1480,7 @@ async fn handle_request(
 
     if !queued {
         shared.request_finished(request_id);
-        return Err(io::Error::other("the worker is shutting down"));
+        return Err(io::Error::other(NotStarted));
     }
 
     // A WebSocket upgrade reaches a WSGI mount only when it may be handed

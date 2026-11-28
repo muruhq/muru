@@ -109,21 +109,75 @@ pub struct NodeSettings {
     pub conditions: std::collections::BTreeMap<String, muru_config::Condition>,
 }
 
+impl Overrides {
+    /// The flags given, as a command line names them.
+    pub fn flags(&self) -> Vec<String> {
+        [
+            ("--listen", self.listen.is_some()),
+            ("--metrics", self.metrics.is_some()),
+            ("--dashboard", self.dashboard.is_some()),
+            ("--user", self.user.is_some()),
+        ]
+        .into_iter()
+        .filter(|(_, given)| *given)
+        .map(|(flag, _)| flag.to_owned())
+        .collect()
+    }
+}
+
 impl NodeSettings {
     /// Read and check the file at `path`, which need not exist, with the
     /// overrides laid over it. A file store without a path lives under
     /// `secrets_dir`.
     pub fn read(path: &Path, secrets_dir: &Path, overrides: &Overrides) -> Result<Self, String> {
-        let document = match std::fs::read_to_string(path) {
-            Ok(text) => muru_config::Document::parse(&text)
-                .map_err(|error| format!("{}: {error}", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                muru_config::Document::default()
-            }
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(format!("reading {}: {error}", path.display())),
         };
 
+        Self::check(&text, path, secrets_dir, overrides)
+    }
+
+    /// The settings a file with this text would give were it at `path`,
+    /// checked as a start and a reload check it. The text need not be
+    /// the file's: a command that changes the file checks what it is
+    /// about to write (issue 894).
+    pub fn check(
+        text: &str,
+        path: &Path,
+        secrets_dir: &Path,
+        overrides: &Overrides,
+    ) -> Result<Self, String> {
+        let document = muru_config::Document::parse(text)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+
+        // ADR 0079: what the daemon serves is no part of its own file. A
+        // table of that kind here was read and then ignored without a
+        // word (issue 862).
+
+        if let Some(table) = document.deployment_tables().first() {
+            return Err(format!(
+                "{}: {table} says what the daemon serves, which is not part of the daemon's own \
+                 configuration: give it to muructl apply -f",
+                path.display()
+            ));
+        }
+
         Self::from_document(&document, path, secrets_dir, overrides)
+    }
+
+    /// The settings read only when the daemon starts, each as the reload
+    /// names it and as a value to compare (section 10.3): a reload says
+    /// which of them the file has changed since.
+    pub fn at_start(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("[metrics]", format!("{:?}", self.metrics)),
+            ("[dashboard] listen", format!("{:?}", self.dashboard)),
+            ("[overlay_webhook]", format!("{:?}", self.overlay_webhook)),
+            ("[daemon] user", format!("{:?}", self.service_user)),
+            ("[daemon] detours", format!("{:?}", self.detours)),
+        ]
     }
 
     /// The settings of a parsed file, checked, with the overrides laid
@@ -674,6 +728,47 @@ mod tests {
             Path::new("/var/lib/muru/secrets"),
             &Overrides::default(),
         )
+    }
+
+    #[test]
+    fn the_daemons_file_holds_nothing_the_daemon_serves() {
+        // Issue 862: an application, a host, a route, an upstream or an
+        // overlay in the file was read and then ignored without a word.
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("muru.toml");
+        let read = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            NodeSettings::read(&path, directory.path(), &Overrides::default())
+        };
+
+        for (text, table) in [
+            ("[app.shop]\ndata_dir = '/srv/shop'\n", "[app.shop]"),
+            ("[host.shop]\nnames = ['shop.test']\n", "[host.shop]"),
+            ("[[route]]\nhost = 'shop'\napp = 'shop'\n", "[[route]]"),
+            (
+                "[upstream.legacy]\naddresses = ['127.0.0.1:9000']\n",
+                "[upstream.legacy]",
+            ),
+        ] {
+            let Err(error) = read(text) else {
+                panic!("{table} is refused");
+            };
+
+            assert_eq!(
+                error,
+                format!(
+                    "{}: {table} says what the daemon serves, which is not part of the daemon's \
+                     own configuration: give it to muructl apply -f",
+                    path.display()
+                )
+            );
+        }
+
+        // The node's own classes, limits and conditions stay.
+
+        let kept = read("[condition.busy]\nwhen = \"queue_depth{app='shop'} > 5\"\n");
+        assert!(kept.is_ok(), "{:?}", kept.err());
     }
 
     #[test]

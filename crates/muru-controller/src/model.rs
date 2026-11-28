@@ -452,6 +452,26 @@ pub struct GroupSpec {
     /// milliseconds; the release's when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime_ms: Option<u64>,
+    /// How many workers the group may run over its count while workers
+    /// are swapped; the release's when absent (section 7.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_surge: Option<u32>,
+    /// How many workers the group may run under its count while workers
+    /// are swapped; the release's when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unavailable: Option<u32>,
+    /// The workers the group starts with and keeps while the release
+    /// takes no traffic, when that is fewer than `processes` (issue 964).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_processes: Option<u32>,
+}
+
+impl GroupSpec {
+    /// The workers the group's host forks at start: its initial count,
+    /// or its `processes`.
+    pub fn starting_processes(&self) -> u32 {
+        self.initial_processes.unwrap_or(self.processes)
+    }
 }
 
 /// A worker group's own timeouts (section 7.1): the ones a group may
@@ -594,6 +614,21 @@ pub struct ReleaseSpec {
     /// How long a worker lives before it is replaced, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lifetime_ms: Option<u64>,
+    /// How many workers a group may run over its count while workers are
+    /// swapped (section 7.8). A record from before the setting has the
+    /// default.
+    #[serde(default = "default_max_surge")]
+    pub max_surge: u32,
+    /// How many workers a group may run under its count while workers
+    /// are swapped.
+    #[serde(default)]
+    pub max_unavailable: u32,
+    /// The workers the default group starts with and keeps while the
+    /// release takes no traffic, when that is fewer than `processes`
+    /// (issue 964). `processes` stays the count the release is declared
+    /// with, which it takes once it serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_processes: Option<u32>,
     /// The timeouts the host enforces on its workers (section 7.6).
     #[serde(default)]
     pub timeouts: WorkerTimeouts,
@@ -674,16 +709,60 @@ pub fn created_from(spec: &ReleaseSpec) -> String {
     }
 }
 
+fn default_max_surge() -> u32 {
+    muru_config::DEFAULT_MAX_SURGE
+}
+
 impl ReleaseSpec {
+    /// The release's `max_surge` and `max_unavailable` (section 7.8).
+    pub fn swap(&self) -> (u32, u32) {
+        (self.max_surge, self.max_unavailable)
+    }
+
+    /// A group's `max_surge` and `max_unavailable`: its own, else the
+    /// release's. The default group has the release's.
+    pub fn group_swap(&self, group: &str) -> (u32, u32) {
+        let (max_surge, max_unavailable) = self.swap();
+
+        match self.groups.iter().find(|candidate| candidate.name == group) {
+            Some(group) => (
+                group.max_surge.unwrap_or(max_surge),
+                group.max_unavailable.unwrap_or(max_unavailable),
+            ),
+            None => (max_surge, max_unavailable),
+        }
+    }
+
+    /// The workers the default group's host forks at start: the
+    /// release's initial count, or its `processes` (issue 964).
+    pub fn starting_processes(&self) -> u32 {
+        self.initial_processes.unwrap_or(self.processes)
+    }
+
+    /// The initial count of a group, the default group under its name:
+    /// the workers it keeps while the release takes no traffic. None for
+    /// a group that starts at its `processes`, and for one the release
+    /// does not have.
+    pub fn group_initial(&self, group: &str) -> Option<u32> {
+        if group == muru_edge::routing::DEFAULT_GROUP {
+            return self.initial_processes;
+        }
+
+        self.groups
+            .iter()
+            .find(|known| known.name == group)
+            .and_then(|known| known.initial_processes)
+    }
+
     /// The instrumentation list the host is given (sections 6.15, 6.17
     /// and 6.18): the module that defers imports and records the import
     /// report first when either key is on, then the release's own list.
     pub fn host_instrumentation(&self) -> Vec<muru_config::Instrumentation> {
-        let workers = self.processes as usize
+        let workers = self.starting_processes() as usize
             + self
                 .groups
                 .iter()
-                .map(|group| group.processes as usize)
+                .map(|group| group.starting_processes() as usize)
                 .sum::<usize>();
 
         muru_config::lazy_imports_entry(
@@ -1580,21 +1659,61 @@ pub struct Rollout {
     pub created_unix_ms: u64,
     /// When it last changed, Unix milliseconds.
     pub updated_unix_ms: u64,
+    /// Section 9.16: the total of workers the two releases share, and
+    /// where the sharing stands; none when each runs at its own size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<SharedCapacity>,
+}
+
+/// Section 9.16 (issue 321): a rollout whose baseline and candidate
+/// share one total of workers, each sized by its share of the traffic.
+/// It is kept with the rollout, so a daemon that restarts carries on
+/// from the counts it finds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedCapacity {
+    /// The total, by worker group: the baseline's worker count when the
+    /// rollout began.
+    #[serde(default)]
+    pub totals: BTreeMap<String, u32>,
+    /// The count the rollout has pinned each group of the baseline to.
+    #[serde(default)]
+    pub baseline: BTreeMap<String, u32>,
+    /// The count the rollout has pinned each group of the candidate to.
+    #[serde(default)]
+    pub candidate: BTreeMap<String, u32>,
+    /// Whether the current step's workers are still being put in place,
+    /// its traffic not yet moved: the step before's share is in force.
+    #[serde(default)]
+    pub sizing: bool,
+    /// Whether every step has passed and the candidate is being grown
+    /// to the total ahead of its promotion, the last step's share still
+    /// in force.
+    #[serde(default)]
+    pub finishing: bool,
 }
 
 impl Rollout {
     /// The candidate's share in force: the current step's while running
-    /// or paused, the step before while the next awaits approval, all of
-    /// it once promoted and none once rolled back.
+    /// or paused, the step before while the next awaits approval or its
+    /// workers are being put in place (section 9.16), all of it once
+    /// promoted and none once rolled back.
     pub fn percent(&self) -> u32 {
+        let before = || {
+            self.step
+                .checked_sub(1)
+                .and_then(|index| self.steps.get(index))
+                .map_or(0, |step| step.percent)
+        };
+
         match self.state {
             RolloutState::Promoted => 100,
             RolloutState::RolledBack => 0,
-            RolloutState::AwaitingApproval => self
-                .step
-                .checked_sub(1)
-                .and_then(|index| self.steps.get(index))
-                .map_or(0, |step| step.percent),
+            RolloutState::AwaitingApproval => before(),
+            RolloutState::Running | RolloutState::Paused
+                if self.shared.as_ref().is_some_and(|shared| shared.sizing) =>
+            {
+                before()
+            }
             RolloutState::Running | RolloutState::Paused => {
                 self.steps.get(self.step).map_or(0, |step| step.percent)
             }
@@ -1619,6 +1738,11 @@ pub struct Release {
     pub created_unix_ms: u64,
     /// For optimistic concurrency.
     pub resource_version: u64,
+    /// Its number among every release this store has held, from 1, never
+    /// given twice: it names the directories of the release's host
+    /// (section 13.8), so no socket path carries an application's name
+    /// or a release's ID.
+    pub number: u64,
 }
 
 /// An application: a name and which of its releases serves.
@@ -1630,6 +1754,10 @@ pub struct App {
     pub current: Option<String>,
     /// The release a rollback restores, if any.
     pub previous: Option<String>,
+    /// How the serving release was last set, when applied files or a
+    /// rollback set it; none when a deploy, a rollout or another command
+    /// did (ADR 0082).
+    pub serving_origin: Option<ServingOrigin>,
     /// When it was created, Unix milliseconds.
     pub created_unix_ms: u64,
     /// For optimistic concurrency.
@@ -1656,6 +1784,59 @@ pub struct App {
     /// The release settings every release deployed from now takes
     /// (issue 899).
     pub settings: crate::app_settings::AppSettings,
+}
+
+/// How an application's serving release came to serve, which an apply
+/// reads before it moves traffic (ADR 0082): an apply does not undo a
+/// rollback on its own, and says when it moves traffic away from a
+/// release a command made serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingOrigin {
+    /// What set it.
+    pub how: ServingSetBy,
+    /// When, Unix milliseconds.
+    pub at_unix_ms: u64,
+}
+
+/// What set an application's serving release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServingSetBy {
+    /// Applied files.
+    Apply,
+    /// `muructl rollback`, away from the release named.
+    Rollback {
+        /// The release that served before, which the rollback took out
+        /// of traffic.
+        from: String,
+    },
+}
+
+impl ServingOrigin {
+    /// The origin as the store keeps it.
+    pub fn encode(&self) -> String {
+        match &self.how {
+            ServingSetBy::Apply => format!("apply {}", self.at_unix_ms),
+            ServingSetBy::Rollback { from } => format!("rollback {} {from}", self.at_unix_ms),
+        }
+    }
+
+    /// The origin the store kept, none for one this version does not
+    /// know.
+    pub fn decode(text: &str) -> Option<Self> {
+        let mut parts = text.splitn(3, ' ');
+        let how = parts.next()?;
+        let at_unix_ms = parts.next()?.parse().ok()?;
+
+        let how = match (how, parts.next()) {
+            ("apply", None) => ServingSetBy::Apply,
+            ("rollback", Some(from)) => ServingSetBy::Rollback {
+                from: from.to_owned(),
+            },
+            _ => return None,
+        };
+
+        Some(Self { how, at_unix_ms })
+    }
 }
 
 impl App {

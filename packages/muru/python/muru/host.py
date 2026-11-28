@@ -148,6 +148,23 @@ LEAK_RECYCLES = 3
 
 MEMORY_CAUSES = ("memory", "container_memory")
 
+# Section 7.8: the two orders of a swap. Surge first forks the replacement
+# beside the old worker; drain first forks it once the old worker has
+# exited.
+
+SURGE_FIRST = "surge_first"
+DRAIN_FIRST = "drain_first"
+
+# Section 7.9: the limits of the node's budget that can leave a group's
+# surge allowance short, as the daemon names them and as a message does.
+
+BUDGET_LIMITS = {"workers": "worker", "memory": "memory", "cpu": "CPU"}
+
+# Section 10.14: the cause, as one word, of a worker replaced by the
+# restart of every worker on request.
+
+RESTART_CAUSE = "restart"
+
 # Section 7.7 (issue 624): the score every worker raises its own
 # /proc/self/oom_score_adj to after the fork, so the kernel picks a worker,
 # which its host replaces, before a host, the edge or another service.
@@ -352,7 +369,7 @@ def untag_host_streams() -> None:
         sys.stderr = sys.stderr.stream
 
 
-# The file a host held before its fork writes in its run directory, which
+# The file a host held before its fork writes among its files, which
 # tells the daemon its before_fork gates may run (issue 266).
 
 GATES_FILE = "gates"
@@ -361,7 +378,7 @@ GATES_FILE = "gates"
 def hold_for_gates(run_dir: str) -> bool:
     """Wait, once preloaded, for the daemon to run the release's gates.
 
-    The host says it is ready by writing the file `gates` in its run
+    The host says it is ready by writing the file `gates` in its files
     directory, whole, and then reads a line from standard input: `fork`
     goes on to fork the workers, and anything else, or the end of the
     stream because the daemon went away, stops the host.
@@ -443,6 +460,12 @@ def resolve_app(
 # start-up lines of every worker.
 
 UNNAMED_EVENTS = frozenset({"worker.started", "worker.ready"})
+
+# Section 11.5: how many events a host holds that no supervisor has said
+# it recorded, for the one that connects next. Past it the oldest held
+# goes.
+
+HELD_EVENTS = 256
 
 
 def run_exit_callbacks() -> None:
@@ -934,6 +957,12 @@ class Group:
     max_requests: int | None = None
     max_lifetime: float | None = None
 
+    # Section 7.8: how many workers the group may run over and under its
+    # count while workers are swapped; the release's when None.
+
+    max_surge: int | None = None
+    max_unavailable: int | None = None
+
     # ADR 0033: the release is ready without an optional group's workers,
     # which enter routing as each listens, and a worker of one that
     # cannot start is given up rather than stopping the host.
@@ -1135,6 +1164,27 @@ def parse_group_recycle(text: str) -> tuple[str, dict[str, float | None]]:
     return name, {"max_requests": requests, "max_lifetime": lifetime}
 
 
+def parse_group_swap(text: str) -> tuple[str, dict[str, int]]:
+    """Parse NAME=MAX_SURGE,MAX_UNAVAILABLE, two counts that are not both 0."""
+
+    form = "NAME=MAX_SURGE,MAX_UNAVAILABLE"
+    name, _, values = text.partition("=")
+    parts = values.split(",")
+
+    if not name or len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
+
+    try:
+        surge, unavailable = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}") from None
+
+    if surge < 0 or unavailable < 0 or surge + unavailable == 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not {form}")
+
+    return name, {"max_surge": surge, "max_unavailable": unavailable}
+
+
 @dataclass
 class MemoryPolicy:
     """The memory limits of section 7.7, in bytes and seconds."""
@@ -1218,6 +1268,11 @@ class WorkerState:
 
     stop_first_held: bool = False
 
+    # Section 7.8: whether a voluntary swap of this worker waits in its
+    # group's queue, so it joins once.
+
+    queued: bool = False
+
 
 @dataclass
 class PastDeadline:
@@ -1300,6 +1355,39 @@ class Replacement:
 
 
 @dataclass
+class Swap:
+    """A voluntary swap of a worker, waiting its turn in its group's queue (section 7.8)."""
+
+    index: int
+    pid: int
+    reason: str
+    kind: str
+    cause: str
+
+    # What the swap was last said to wait for, so it is said once.
+
+    waiting_for: str = ""
+
+
+@dataclass
+class RestartAll:
+    """A restart of every worker on request, as far as it has got (section 10.14).
+
+    `pending` holds the pids marked and not yet being replaced, and
+    `under_way` those whose replacement has started and that have not
+    exited yet.
+    """
+
+    pending: set[int]
+    under_way: set[int] = field(default_factory=set)
+    total: int = 0
+    started_at: float = 0.0
+    group: str = ""
+    cancelled: int | None = None
+    told: tuple[int, int] | None = None
+
+
+@dataclass
 class Orphan:
     """A process a dead worker left behind, a child of the host now (section 6.10)."""
 
@@ -1344,6 +1432,9 @@ class Host:
         handoff: str | None = None,
         cgroup: str | None = None,
         sendfile: list[tuple[str, list[str], str | None, dict[str, int]]] | None = None,
+        files_dir: str | None = None,
+        max_surge: int = 1,
+        max_unavailable: int = 0,
     ) -> None:
         self.release = release
         self.mounts = mounts or []
@@ -1355,6 +1446,11 @@ class Host:
 
         self.sendfile = sendfile or []
         self.socket_dir = socket_dir
+
+        # The host's regular files are kept apart from its sockets, which
+        # are in a short location where files may be deleted by age.
+
+        self.files_dir = files_dir or socket_dir
         self.tcp_base_port = tcp_base_port
         self.detach = detach
         self.threads = threads
@@ -1362,6 +1458,8 @@ class Host:
         self.concurrency = concurrency
         self.max_requests = max_requests
         self.max_lifetime = max_lifetime
+        self.max_surge = max_surge
+        self.max_unavailable = max_unavailable
         self.soft_timeout = soft_timeout
         self.hard_timeout = hard_timeout
         self.hard_drain_grace = hard_drain_grace
@@ -1481,6 +1579,24 @@ class Host:
         self.routed: dict[int, str | None] = {}
         self.replacing: dict[int, Replacement] = {}
 
+        # Section 7.8: the voluntary swaps of each group waiting their
+        # turn, by the group's name, in the order they came.
+
+        self.swaps: dict[str, deque[Swap]] = {}
+
+        # Section 7.9: the surge allowance the daemon last granted each
+        # group, by its name, with what left it short of the group's
+        # max_surge (traffic, workers, memory or cpu) or nothing. It is
+        # kept while the daemon is away; a group never granted one has
+        # its max_surge.
+
+        self.allowances: dict[str, tuple[int, str]] = {}
+
+        # Section 10.14: the restart of every worker under way, if one is.
+        # The host holds it, so it carries on while the daemon is away.
+
+        self.restart: RestartAll | None = None
+
         # Section 7.4: indices forked by a scale-out and not yet ready, and
         # indices a scale-in emptied, to be used again by the next one.
 
@@ -1499,6 +1615,19 @@ class Host:
         self.version = 0
         self.acked = 0
 
+        # Issue 981: the sockets the edge routes by, as far as the host
+        # knows: those of the last announcement a supervisor acknowledged,
+        # by worker index, with the announcements sent and not yet
+        # acknowledged, by version. With no supervisor connected nobody
+        # can give the edge a new socket, so a worker that enters routing
+        # then is made reachable at the path the edge has, by a second
+        # name for its socket: the path the edge has, by worker index,
+        # with the socket it names now.
+
+        self.edge_routes: dict[int, str] = {}
+        self.announcements: dict[int, dict[int, str]] = {}
+        self.aliases: dict[int, tuple[str, str]] = {}
+
         # Section 6.18: the load's import report, sent to each supervisor
         # that connects.
 
@@ -1509,6 +1638,20 @@ class Host:
 
         self.loaded: dict[str, Any] | None = None
         self.loaded_sent = False
+
+        # Section 11.5 (issue 982): the events no supervisor has said it
+        # recorded, oldest first, each with the time it happened, and how
+        # many more were dropped as the bound was passed, up to which
+        # number. The host numbers its events from 1 and names itself by
+        # the time it started, so a supervisor tells an event sent again
+        # from one it has, and the events of the host that replaces this
+        # one from this one's.
+
+        self.held_events: deque[dict[str, Any]] = deque()
+        self.events_dropped = 0
+        self.events_dropped_through = 0
+        self.event_stream = time.time_ns()
+        self.event_seq = 0
 
         # Section 6.7: the interfaces the workers settled themselves, by
         # mount, for an application imported in each worker or made by a
@@ -1550,6 +1693,10 @@ class Host:
             memory=self.memory if group.memory is None else group.memory,
             max_requests=self.max_requests if group.max_requests is None else group.max_requests,
             max_lifetime=self.max_lifetime if group.max_lifetime is None else group.max_lifetime,
+            max_surge=self.max_surge if group.max_surge is None else group.max_surge,
+            max_unavailable=(
+                self.max_unavailable if group.max_unavailable is None else group.max_unavailable
+            ),
         )
 
     def group_of(self, index: int) -> Group:
@@ -1622,10 +1769,11 @@ class Host:
     def socket_path(self, index: int) -> str:
         """Return the Unix socket path, or the TCP address, a worker listens on.
 
-        A named group's sockets carry its name, so the daemon can tell
-        them apart; the default group's are numbered plainly. A
-        replacement's socket carries its generation, so it never collides
-        with the socket of the worker it replaces.
+        A named group's sockets carry its place among the named groups,
+        from 1, and never its name, so that no socket's path grows with a
+        name; the default group's are numbered plainly. A replacement's
+        socket carries its generation, so it never collides with the
+        socket of the worker it replaces.
         """
 
         if self.tcp_base_port is not None:
@@ -1637,7 +1785,8 @@ class Host:
         if group.name == "default":
             return os.path.join(self.socket_dir, f"worker-{within}{suffix}.sock")
 
-        return os.path.join(self.socket_dir, f"worker-{group.name}-{within}{suffix}.sock")
+        place = next(at for at, known in enumerate(self.groups) if known.name == group.name)
+        return os.path.join(self.socket_dir, f"worker-{place}-{within}{suffix}.sock")
 
     def spawn(self, index: int, replacing: bool = False) -> int:
         """Fork one worker and return its pid. The child never returns.
@@ -2469,14 +2618,110 @@ class Host:
         self.supervisor = connection
         self.supervisor_buffer = b""
         self.selector.register(connection, selectors.EVENT_READ)
-        self.send_to_supervisor(self.workers_message())
+        self.send_workers()
         self.send_imports()
+
+        # Section 10.14: a supervisor that connects while every worker is
+        # being restarted is told how far that has got, and one that
+        # connects while none is under way is told that (issue 983): its
+        # last word from this host may be of a restart that has since
+        # finished, which the connection it had did not live to say.
+
+        if self.restart is not None:
+            self.restart.told = None
+            self.tell_restart()
+        else:
+            self.send_to_supervisor(
+                {"type": "restart", "total": 0, "left": 0, "started_unix_ms": 0, "group": ""}
+            )
 
         if self.loaded is not None:
             self.send_to_supervisor(
                 {"type": "loaded", **self.loaded, "first": not self.loaded_sent}
             )
             self.loaded_sent = True
+
+        self.send_held_events()
+
+    def hold_event(self, event: dict[str, Any]) -> None:
+        """Keep an event until a supervisor says it is recorded, with the time it happened.
+
+        Only events are held: the workers, the load, the import report and
+        the progress of a restart are state, which a supervisor is sent
+        whole when it connects. At most `HELD_EVENTS` are held, the oldest
+        going first, each without its evidence, which belongs to request
+        records only a supervisor that was connected keeps. A host with no
+        control socket has no supervisor to come and holds nothing.
+        """
+
+        if self.control_listener is None:
+            return
+
+        held = {key: value for key, value in event.items() if key != "evidence"}
+        held["time_unix_ms"] = int(time.time() * 1000)
+
+        if len(self.held_events) >= HELD_EVENTS:
+            oldest = self.held_events.popleft()
+
+            if self.events_dropped == 0:
+                log(
+                    f"more than {HELD_EVENTS} events wait to be recorded, with nothing "
+                    "connected that records them: the oldest are dropped from here on"
+                )
+
+            self.events_dropped += 1
+            self.events_dropped_through = oldest["seq"]
+
+        self.held_events.append(held)
+
+    def send_held_events(self) -> None:
+        """Send a supervisor that has connected the events held for it, oldest first.
+
+        An event saying how many were dropped goes ahead of them, since
+        the ones dropped were the oldest; it takes the number of the last
+        one dropped. The events stay held until the supervisor says they
+        are recorded, so what a failed send leaves is sent to the next.
+        """
+
+        dropped = self.events_dropped
+
+        if dropped:
+            sent = self.send_to_supervisor(
+                {
+                    "type": "event",
+                    "kind": "host.events_dropped",
+                    "level": "warning",
+                    "message": (
+                        f"{dropped} event{'' if dropped == 1 else 's'} that nothing had "
+                        f"recorded {'was' if dropped == 1 else 'were'} dropped, the oldest: "
+                        f"{HELD_EVENTS} are held at most, and the release's log has a line "
+                        "for each"
+                    ),
+                    "dropped": dropped,
+                    "stream": self.event_stream,
+                    "seq": self.events_dropped_through,
+                }
+            )
+
+            if not sent:
+                return
+
+        for held in list(self.held_events):
+            if not self.send_to_supervisor(held):
+                return
+
+    def events_recorded(self, seq: int) -> None:
+        """Take the supervisor's word that the events up to a number are recorded.
+
+        Issue 982: they are held no longer. The count of events dropped
+        goes once the event that says it is among them.
+        """
+
+        while self.held_events and self.held_events[0]["seq"] <= seq:
+            self.held_events.popleft()
+
+        if self.events_dropped and self.events_dropped_through <= seq:
+            self.events_dropped = 0
 
     def send_imports(self) -> None:
         """Send the load's import report to the supervisor, in parts, if there is one."""
@@ -2510,6 +2755,12 @@ class Host:
 
         self.supervisor.close()
         self.supervisor = None
+
+        # Issue 981: what was announced and not acknowledged may never
+        # have reached the edge, and nobody is left to tell it.
+
+        self.announcements.clear()
+        self.alias_routes()
 
     def close_control(self) -> None:
         """Close the control sockets, in a worker after fork."""
@@ -2698,7 +2949,7 @@ class Host:
             self.relay.close()
 
     def read_supervisor(self) -> None:
-        """Read the supervisor's acknowledgements."""
+        """Read the supervisor's acknowledgements and requests."""
 
         assert self.supervisor is not None
 
@@ -2725,14 +2976,21 @@ class Host:
 
             if message.get("type") == "applied":
                 self.acked = max(self.acked, int(message.get("version", 0)))
+                self.edge_applied()
+            elif message.get("type") == "recorded":
+                self.events_recorded(int(message.get("seq", 0)))
             elif message.get("type") == "request":
                 self.take_request(message)
 
-    def send_to_supervisor(self, message: dict[str, Any]) -> None:
-        """Send one message as a JSON line, dropping the connection if that fails."""
+    def send_to_supervisor(self, message: dict[str, Any]) -> bool:
+        """Send one message as a JSON line, dropping the connection if that fails.
+
+        Returns whether it was sent: not when no supervisor is connected,
+        and not when the send failed.
+        """
 
         if self.supervisor is None:
-            return
+            return False
 
         # Blocking for the send, with a bound, so an answer larger than
         # the socket's buffer (an inspect of many modules) gets through.
@@ -2742,9 +3000,10 @@ class Host:
             self.supervisor.sendall(json.dumps(message).encode() + b"\n")
         except OSError:
             self.drop_supervisor()
-            return
+            return False
 
         self.supervisor.setblocking(False)
+        return True
 
     def workers_message(self) -> dict[str, Any]:
         """Build the announcement of the sockets the edge should route to, by group."""
@@ -2836,8 +3095,131 @@ class Host:
         """Tell the supervisor the worker sockets changed; return the version."""
 
         self.version += 1
-        self.send_to_supervisor(self.workers_message())
+        self.send_workers()
         return self.version
+
+    def send_workers(self) -> None:
+        """Send the supervisor the worker sockets, and keep what it was told until it answers."""
+
+        if self.send_to_supervisor(self.workers_message()):
+            self.announcements[self.version] = {
+                index: path for index, path in self.routed.items() if path is not None
+            }
+
+    def edge_applied(self) -> None:
+        """Take the edge to route by the newest announcement acknowledged.
+
+        Issue 981: a second name made for a worker's socket while no
+        supervisor was connected goes once the edge has the socket's own.
+        """
+
+        known = [version for version in self.announcements if version <= self.acked]
+
+        if not known:
+            return
+
+        self.edge_routes = self.announcements[max(known)]
+
+        for version in known:
+            del self.announcements[version]
+
+        live = {state.path for state in self.states.values()}
+
+        for index, (alias, _path) in list(self.aliases.items()):
+            if self.edge_routes.get(index) == alias:
+                continue
+
+            del self.aliases[index]
+
+            if alias not in live:
+                with contextlib.suppress(OSError):
+                    os.unlink(alias)
+
+    def alias_routes(self, unanswered: bool = False) -> None:
+        """Make each worker in routing reachable at the path the edge has for it.
+
+        Issue 981: with no supervisor connected nobody tells the edge a
+        new socket, and it goes on connecting to the paths of the last
+        snapshot it was given. A worker that entered routing on another
+        socket has that socket given the edge's path as a second name (a
+        hard link, moved into place in one step), so the edge reaches it
+        and the worker before it, which still holds its own socket open,
+        finishes what it has. The supervisor that connects next is told
+        the sockets' own paths, and the second names go once it has
+        acknowledged them.
+
+        `unanswered` says a supervisor is connected and has not
+        acknowledged an announcement in the time it is given (issue 983),
+        which is treated the same: the second name does no harm if the
+        edge was told after all, since the socket keeps its own.
+        """
+
+        if self.tcp_base_port is not None or self.stopping:
+            return
+
+        if self.supervisor is not None and not unanswered:
+            return
+
+        for index, path in self.routed.items():
+            alias = self.edge_routes.get(index)
+
+            if path is None or alias is None or alias == path:
+                continue
+
+            # A rename onto another name of the same file does nothing
+            # and leaves both, so a path that names the socket already is
+            # left alone.
+
+            with contextlib.suppress(OSError):
+                if os.path.samefile(path, alias):
+                    self.aliases[index] = (alias, path)
+                    continue
+
+            partial = f"{alias}.alias"
+
+            try:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(partial)
+
+                os.link(path, partial)
+                os.rename(partial, alias)
+            except OSError as error:
+                log(
+                    f"worker {self.worker_name(index)}: its socket could not be given "
+                    f"the path the edge routes by: {error}"
+                )
+                continue
+
+            if self.aliases.get(index) != (alias, path):
+                why = (
+                    "no supervisor is connected to give it"
+                    if self.supervisor is None
+                    else "the supervisor has not said the edge has"
+                )
+                log(
+                    f"worker {self.worker_name(index)} is reached by the edge at "
+                    f"{os.path.basename(alias)}: {why} {os.path.basename(path)}"
+                )
+
+            self.aliases[index] = (alias, path)
+
+    def edge_reaches(self, index: int) -> bool:
+        """Say whether the edge reaches the worker in routing at an index with no supervisor.
+
+        True when no supervisor is connected and the path the edge has
+        names the worker's socket, its own or a second name for it.
+        """
+
+        if self.supervisor is not None:
+            return False
+
+        path = self.routed.get(index)
+        route = self.edge_routes.get(index)
+
+        if path is None or route is None:
+            return False
+
+        return route == path or self.aliases.get(index) == (route, path)
 
     def emit(
         self,
@@ -2857,10 +3239,23 @@ class Host:
         kind, except for the start-up lines every worker has. `evidence`
         names the requests the event is about, with the stacks of the
         threads serving them, for a development run's records (issue 706).
+        The event is numbered and held until a supervisor says it is
+        recorded, and sent again to the one that connects next if none
+        does (section 11.5, issue 982): a send that succeeds says only
+        that the event is in a socket's buffer, which a supervisor that
+        is stopping never reads.
         """
 
         log(message if kind in UNNAMED_EVENTS else f"{kind}: {message}")
-        event: dict[str, Any] = {"type": "event", "kind": kind, "level": level, "message": message}
+        self.event_seq += 1
+        event: dict[str, Any] = {
+            "type": "event",
+            "kind": kind,
+            "level": level,
+            "message": message,
+            "stream": self.event_stream,
+            "seq": self.event_seq,
+        }
 
         if group is not None:
             event["group"] = group
@@ -2871,6 +3266,7 @@ class Host:
         if evidence is not None:
             event["evidence"] = evidence
 
+        self.hold_event(event)
         self.send_to_supervisor(event)
 
     # Section 11.7: the supervisor's questions, answered by the host or
@@ -2899,6 +3295,18 @@ class Host:
 
         if op == "recycle":
             self.recycle_worker(request_id, wanted, asked, args)
+            return
+
+        if op == "surge":
+            self.take_surge(request_id, args)
+            return
+
+        if op == "restart_all":
+            self.restart_all(request_id, args)
+            return
+
+        if op == "restart_cancel":
+            self.cancel_restart(request_id)
             return
 
         if op == "status":
@@ -3150,6 +3558,235 @@ class Host:
                 "workers": [{**self.worker_fields(state.index), "pid": state.pid, "ok": True}],
             }
         )
+
+    # Section 10.14: every worker of the release, or of one group, is
+    # replaced on request, each in its turn in its group's queue of swaps.
+
+    def restart_all(self, request_id: int, args: dict[str, Any]) -> None:
+        """Mark every worker started before now, of every group or of one, to be replaced.
+
+        The answer names the workers marked. A restart already under way
+        takes the workers started since it began as well.
+        """
+
+        name = str(args.get("group") or "")
+        error = ""
+
+        if name and all(group.name != name for group in self.groups):
+            error = f"no worker group {name}"
+        elif self.control_listener is None:
+            error = "workers cannot be replaced without a control socket"
+
+        if error:
+            self.send_to_supervisor(
+                {"type": "response", "id": request_id, "workers": [], "error": error}
+            )
+            return
+
+        known = set() if self.restart is None else self.restart.pending | self.restart.under_way
+        marked = [
+            state
+            for state in sorted(self.states.values(), key=lambda state: state.index)
+            if not state.replaced
+            and state.pid not in known
+            and (not name or self.group_of(state.index).name == name)
+        ]
+
+        if marked:
+            if self.restart is None:
+                self.restart = RestartAll(set(), started_at=time.time(), group=name)
+
+            restart = self.restart
+            restart.pending.update(state.pid for state in marked)
+            restart.total += len(marked)
+            restart.cancelled = None
+            workers = len(marked)
+            self.emit(
+                "restart.started",
+                "notice",
+                f"{workers} worker{'' if workers == 1 else 's'} "
+                + (f"of the group {name} " if name else "")
+                + "started before now "
+                + ("is" if workers == 1 else "are")
+                + " to be replaced, each in its turn",
+                group=name or None,
+            )
+            self.advance_restart()
+
+        self.send_to_supervisor(
+            {
+                "type": "response",
+                "id": request_id,
+                "workers": [
+                    {**self.worker_fields(state.index), "pid": state.pid, "ok": True}
+                    for state in marked
+                ],
+            }
+        )
+
+    def cancel_restart(self, request_id: int) -> None:
+        """Clear the marks of a restart of every worker: those not yet replaced stay.
+
+        A replacement that has started is finished. The answer names the
+        workers left as they were.
+        """
+
+        restart = self.restart
+        left: list[WorkerState] = []
+
+        if restart is not None:
+            left = [self.states[pid] for pid in sorted(restart.pending) if pid in self.states]
+
+            # Their swaps leave the queues too.
+
+            for queue in self.swaps.values():
+                for swap in [swap for swap in queue if swap.cause == RESTART_CAUSE]:
+                    queue.remove(swap)
+
+            for state in left:
+                state.queued = False
+
+            restart.cancelled = len(left)
+            restart.pending.clear()
+            self.advance_restart()
+
+        self.send_to_supervisor(
+            {
+                "type": "response",
+                "id": request_id,
+                "workers": [
+                    {**self.worker_fields(state.index), "pid": state.pid, "ok": True}
+                    for state in left
+                ],
+                **({} if restart is not None else {"error": "no restart is under way"}),
+            }
+        )
+
+    def advance_restart(self) -> None:
+        """Move a restart of every worker along, and say when it has finished.
+
+        Each marked worker joins its group's queue of swaps once it is
+        ready. One that goes another way (a crash, a recycle, a scale-in)
+        is no longer marked, and one being debugged waits for its last
+        session to end.
+        """
+
+        restart = self.restart
+
+        if restart is None:
+            return
+
+        # The marked workers take their turns in the order of their
+        # indices, whatever order their pids come in.
+
+        def place(pid: int) -> int:
+            state = self.states.get(pid)
+            return -1 if state is None else state.index
+
+        for pid in sorted(restart.pending, key=place):
+            state = self.states.get(pid)
+
+            if state is None:
+                restart.pending.discard(pid)
+                continue
+
+            # A worker whose replacement keeps failing to start is left.
+
+            if self.start_failures.get(state.index, 0) >= MAX_START_FAILURES:
+                restart.pending.discard(pid)
+                continue
+
+            if state.ready and not state.replaced:
+                self.swap(state, "restarted on request", "worker.restarted", RESTART_CAUSE)
+
+            # Its swap may have started at once, and it may have been
+            # replaced for another reason or scaled in.
+
+            if state.replaced:
+                restart.pending.discard(pid)
+                leaving = self.replacing.get(state.index)
+
+                if leaving is not None and leaving.old_pid == pid and not leaving.retire:
+                    restart.under_way.add(pid)
+
+        restart.under_way = {pid for pid in restart.under_way if pid in self.workers}
+        self.tell_restart()
+
+        if restart.pending or restart.under_way:
+            return
+
+        self.restart = None
+        replaced = restart.total - (restart.cancelled or 0)
+        scope = f" of the group {restart.group}" if restart.group else ""
+
+        if restart.cancelled is None:
+            message = (
+                f"the {restart.total} worker{'' if restart.total == 1 else 's'}{scope} marked "
+                "have each been replaced or have gone"
+            )
+        else:
+            message = (
+                f"cancelled: {replaced} of the {restart.total} marked workers{scope} were "
+                f"replaced or have gone, and {restart.cancelled} stay as they were"
+            )
+
+        self.emit(
+            "restart.finished",
+            "notice",
+            message,
+            group=restart.group or None,
+            reason="cancelled" if restart.cancelled is not None else None,
+        )
+
+    def tell_restart(self) -> None:
+        """Tell the supervisor how far a restart of every worker has got, when that is news."""
+
+        restart = self.restart
+
+        if restart is None:
+            return
+
+        left = len(restart.pending) + len(restart.under_way)
+
+        if restart.told == (restart.total, left):
+            return
+
+        restart.told = (restart.total, left)
+        self.send_to_supervisor(
+            {
+                "type": "restart",
+                "total": restart.total,
+                "left": left,
+                "started_unix_ms": int(restart.started_at * 1000),
+                "group": restart.group,
+            }
+        )
+
+    # Section 7.9: the daemon grants each group a surge allowance that
+    # fits the node's budget, and says again when it changes.
+
+    def take_surge(self, request_id: int, args: dict[str, Any]) -> None:
+        """Take the surge allowances the supervisor grants, by group.
+
+        A swap that waited for an allowance starts at once when one is
+        granted. A surge under way is left alone when its allowance is
+        withdrawn.
+        """
+
+        granted = args.get("groups")
+
+        if isinstance(granted, dict):
+            for group in self.groups:
+                given = granted.get(group.name)
+
+                if isinstance(given, dict):
+                    self.allowances[group.name] = (
+                        max(0, int(given.get("allowance", 0))),
+                        str(given.get("short", "")),
+                    )
+
+        self.send_to_supervisor({"type": "response", "id": request_id, "workers": []})
+        self.run_swaps()
 
     def active_indices(self, group: Group) -> list[int]:
         """Return the group's indices with a worker that serves or is starting, in order."""
@@ -3618,7 +4255,7 @@ class Host:
             self.signal(state.pid, signal.SIGUSR2)
             return
 
-        self.replace(
+        self.swap(
             state,
             f"{policy.measure} {format_size(value)} stayed over the soft limit of "
             f"{format_size(soft)} for {now - state.over_soft_since:.0f} s"
@@ -3683,6 +4320,9 @@ class Host:
                     for replacement in self.replacing.values()
                     if replacement.cause in MEMORY_CAUSES
                 ],
+                "swaps_waiting": {
+                    group.name: len(self.swaps.get(group.name, ())) for group in self.groups
+                },
             }
         )
 
@@ -3728,6 +4368,13 @@ class Host:
 
             self.announce()
 
+        # Issue 981: with no supervisor, the edge is not told the socket,
+        # so the socket takes the path the edge has. A worker started
+        # again on the path it had has a new socket there, which the
+        # second name is moved to.
+
+        self.alias_routes()
+
     def check_requests(self, state: WorkerState) -> None:
         """Replace a worker that has served its share of requests."""
 
@@ -3738,7 +4385,7 @@ class Host:
             state.recycle_after_requests is not None
             and state.requests >= state.recycle_after_requests
         ):
-            self.replace(
+            self.swap(
                 state,
                 f"served {state.requests} requests "
                 f"(max_requests {self.group_of(state.index).max_requests})",
@@ -3906,7 +4553,7 @@ class Host:
                     },
                 )
             elif state.recycle_at is not None and now >= state.recycle_at:
-                self.replace(
+                self.swap(
                     state,
                     f"lived {now - state.started_at:.0f} s (max_lifetime {group.max_lifetime:g} s)",
                     "worker.recycled",
@@ -3915,6 +4562,9 @@ class Host:
 
         for replacement in list(self.replacing.values()):
             self.advance(replacement, now)
+
+        self.advance_restart()
+        self.run_swaps()
 
         # A profile sampled from outside is answered by its thread, so it is
         # looked at here as well as when its time is up.
@@ -3930,6 +4580,7 @@ class Host:
         cause: str = "",
         hard: bool = False,
         abandon: dict[str, str] | None = None,
+        order: str | None = None,
     ) -> bool:
         """Start replacing a worker with a fresh one on a new socket.
 
@@ -3940,6 +4591,12 @@ class Host:
         the stuck one, or all of them when the whole worker is stalled. A
         worker being debugged is pinned: the policy applies once the last
         session ends. Return whether a replacement was started.
+
+        `order` is the order the group's queue gave a voluntary swap
+        (section 7.8): SURGE_FIRST forks the replacement beside the old
+        worker, DRAIN_FIRST once the old worker has exited. Without it
+        the replacement is involuntary, held back by no queue or slot,
+        and its order follows the group's surge allowance.
         """
 
         if state.debug_sessions:
@@ -3994,15 +4651,28 @@ class Host:
         if self.start_failures.get(index, 0) >= MAX_START_FAILURES:
             return False
 
+        # Section 7.8: an involuntary replacement is surge first while its
+        # group has a surge allowance, and otherwise the old worker has
+        # exited before its successor is forked.
+
+        group = self.group_of(index)
+        allowance = self.surge_allowance(group)
+
+        if order is None:
+            order = SURGE_FIRST if allowance >= 1 else DRAIN_FIRST
+
         # Section 13.9: two large workers alive at once is what the kernel
         # would kill for, so with no room for a second this one leaves
         # routing and stops first, and reap() forks its successor. It does
         # not while it is the last of its group in routing and another of
         # the group is out of it, being replaced or starting (issue 662):
-        # its replacement waits until that one is back.
+        # its replacement waits until that one is back. A group with no
+        # surge allowance asked for the old worker to stop first, and has
+        # no such floor (section 7.8).
 
-        short = self.short_of_memory(state) if cause in MEMORY_CAUSES else None
-        away = self.away_from_group(index) if cause in MEMORY_CAUSES else None
+        memory = cause in MEMORY_CAUSES
+        short = self.short_of_memory(state) if memory else None
+        away = self.away_from_group(index) if memory and allowance >= 1 else None
 
         if short is not None and away is not None:
             if not state.stop_first_held:
@@ -4016,6 +4686,7 @@ class Host:
             return False
 
         state.replaced = True
+        state.queued = False
         self.generation[index] = self.generation.get(index, 0) + 1
         replacement = Replacement(index, state.pid, reason, kind, cause)
         self.replacing[index] = replacement
@@ -4066,12 +4737,252 @@ class Host:
             replacement.announced_at = time.monotonic()
             return True
 
+        # Section 7.8: drain first. The worker leaves routing, unless the
+        # hard path took it out already, and stops, after the hard drain
+        # grace on that path; reap() forks its successor.
+
+        if order == DRAIN_FIRST:
+            lacking = self.surge_short(group)
+            why = (
+                f"max_surge of the group {group.name} is 0"
+                if not group.max_surge
+                else "its release takes no traffic, so it has no surge allowance"
+                if allowance < 1 and lacking == "traffic"
+                else f"the node's {BUDGET_LIMITS[lacking]} budget has no room for a surge"
+                if allowance < 1 and lacking in BUDGET_LIMITS
+                else f"the group {group.name} has no surge allowance"
+                if allowance < 1
+                else f"no surge slot of the group {group.name} is free"
+            )
+            log(
+                f"worker {self.worker_name(index)} (pid {state.pid}) "
+                f"stops before its replacement starts: {why}"
+            )
+            replacement.stop_first = True
+
+            if not hard:
+                self.routed[index] = None
+                replacement.announced = self.announce()
+                replacement.announced_at = time.monotonic()
+
+            if kind == "worker.timeout_killed":
+                self.report_timeout_kill(replacement)
+
+            return True
+
         replacement.new_pid = self.spawn(index, replacing=True)
 
         if kind == "worker.timeout_killed":
             self.report_timeout_kill(replacement)
 
         return True
+
+    # Section 7.8: the swaps of a group's workers, paced by its max_surge
+    # and max_unavailable.
+
+    def surge_allowance(self, group: Group) -> int:
+        """Return how many workers the group may run over its count during a swap.
+
+        Section 7.9: what the daemon last granted, never more than the
+        group's max_surge, and its max_surge when nothing was granted.
+        """
+
+        granted = self.allowances.get(group.name)
+        most = group.max_surge or 0
+        return most if granted is None else min(most, granted[0])
+
+    def surge_short(self, group: Group) -> str:
+        """Return what left the group's allowance short of its max_surge, or nothing."""
+
+        granted = self.allowances.get(group.name)
+
+        if granted is None or granted[0] >= (group.max_surge or 0):
+            return ""
+
+        return granted[1]
+
+    def unavailable_allowance(self, group: Group) -> int:
+        """Return how many workers the group may run under its count during a swap.
+
+        Section 7.9: a release that takes no traffic swaps drain first
+        whatever its max_unavailable, since nobody is served by the
+        worker that stops.
+        """
+
+        allowed = group.max_unavailable or 0
+        return max(allowed, 1) if self.surge_short(group) == "traffic" else allowed
+
+    def surge_in_use(self, group: Group) -> int:
+        """Return how many of the group's workers have a replacement alive beside them."""
+
+        return sum(
+            1
+            for replacement in self.replacing.values()
+            if self.group_of(replacement.index) is group
+            and not replacement.retire
+            and replacement.new_pid is not None
+        )
+
+    def in_routing(self, index: int) -> bool:
+        """Say whether a worker at the index is one the edge is told to route to."""
+
+        path = self.routed.get(index)
+        return path is not None and any(
+            state.index == index and state.path == path for state in self.states.values()
+        )
+
+    def unavailable_in_use(self, group: Group) -> int:
+        """Return how many workers of the group's count are out of routing.
+
+        Whatever took them out counts: a drain ahead of a replacement, a
+        replacement still starting, a crash to be started again and a
+        scale-out not yet ready.
+        """
+
+        return sum(1 for index in self.active_indices(group) if not self.in_routing(index))
+
+    def free_order(self, group: Group) -> str | None:
+        """Return the order the group's next voluntary swap takes, or None while it waits.
+
+        Surge first while a surge slot is free, else drain first while an
+        unavailable slot is free.
+        """
+
+        if self.surge_in_use(group) < self.surge_allowance(group):
+            return SURGE_FIRST
+
+        if self.unavailable_in_use(group) < self.unavailable_allowance(group):
+            return DRAIN_FIRST
+
+        return None
+
+    def swap(self, state: WorkerState, reason: str, kind: str, cause: str) -> None:
+        """Queue a voluntary swap of a worker, and start it when its turn has come.
+
+        Nothing is wrong with the worker yet (a recycle, a restart of
+        every worker on request), so it waits its turn in its group's
+        queue. A worker being debugged is pinned, and is asked again once
+        its last session ends.
+        """
+
+        if state.replaced or state.queued or state.index in self.replacing:
+            return
+
+        if state.debug_sessions:
+            return
+
+        # With no control socket, or a successor that keeps failing, there
+        # is nothing to wait for: replace() says why and declines.
+
+        if (
+            self.control_listener is None
+            or self.start_failures.get(state.index, 0) >= MAX_START_FAILURES
+        ):
+            self.replace(state, reason, kind, cause)
+            return
+
+        state.queued = True
+        queue = self.swaps.setdefault(self.group_of(state.index).name, deque())
+        queue.append(Swap(state.index, state.pid, reason, kind, cause))
+        self.run_swaps()
+
+    def run_swaps(self) -> None:
+        """Start the queued swaps whose turn has come, group by group, in order."""
+
+        for group in self.groups:
+            queue = self.swaps.get(group.name)
+
+            if not queue:
+                continue
+
+            for swap in list(queue):
+                state = self.states.get(swap.pid)
+
+                # A worker that went another way meanwhile (a crash, an
+                # involuntary replacement, a scale-in) leaves the queue.
+
+                if state is None or state.replaced or state.index in self.replacing:
+                    queue.remove(swap)
+
+                    if state is not None:
+                        state.queued = False
+
+                    continue
+
+                if state.debug_sessions:
+                    continue
+
+                order = self.free_order(group)
+
+                if order is None:
+                    self.note_waiting(swap, group)
+                    break
+
+                queue.remove(swap)
+                state.queued = False
+                self.replace(state, swap.reason, swap.kind, swap.cause, order=order)
+
+    def waiting_for(self, group: Group) -> tuple[str, str]:
+        """Return what a waiting swap of the group waits for, as one word and in words."""
+
+        if not group.max_surge:
+            return (
+                "unavailable",
+                f"max_unavailable {group.max_unavailable} of the group {group.name} "
+                "allows no more of its workers out of routing",
+            )
+
+        # Section 7.9: the daemon granted less than max_surge.
+
+        short = self.surge_short(group)
+        allowance = self.surge_allowance(group)
+        allowed = self.unavailable_allowance(group)
+
+        if short and not allowance and allowed:
+            return (
+                "unavailable",
+                f"the group {group.name} has no surge allowance, and {allowed} of its workers "
+                "may be out of routing at once",
+            )
+
+        if short in BUDGET_LIMITS and self.surge_in_use(group) < (group.max_surge or 0):
+            return (
+                "budget",
+                f"the node's {BUDGET_LIMITS[short]} budget has no room for another worker of the "
+                f"group {group.name} over its count",
+            )
+
+        return (
+            "surge",
+            f"max_surge {group.max_surge} and max_unavailable {group.max_unavailable} of the "
+            f"group {group.name} allow no more replacements until one under way ends",
+        )
+
+    def note_waiting(self, swap: Swap, group: Group) -> None:
+        """Raise worker.swap_waiting for a swap that cannot start, once for what it waits for."""
+
+        word, words = self.waiting_for(group)
+
+        if swap.waiting_for == word:
+            return
+
+        swap.waiting_for = word
+
+        # Section 10.14: the workers of a restart of every worker wait
+        # their turn by design, which restart.started has said; only a
+        # wait for the node's budget is news.
+
+        if swap.cause == RESTART_CAUSE and word != "budget":
+            return
+
+        self.emit(
+            "worker.swap_waiting",
+            "info",
+            f"worker {self.worker_name(swap.index)} (pid {swap.pid}) waits to be replaced "
+            f"({swap.reason}): {words}",
+            group=group.name,
+            reason=word,
+        )
 
     def away_from_group(self, index: int) -> int | None:
         """Return another worker of the group out of routing, when it is the group's last in.
@@ -4136,17 +5047,27 @@ class Host:
         within the second capture_stacks allows it.
         """
 
-        if replacement.reported or replacement.new_pid is None or not replacement.captured:
+        if replacement.reported or not replacement.captured:
+            return
+
+        # Section 7.8: a worker that stops first has no successor yet, and
+        # the fault is still reported at the decision.
+
+        if replacement.new_pid is None and not replacement.stop_first:
             return
 
         replacement.reported = True
         capture = f"; {replacement.capture}" if replacement.capture else ""
+        successor = (
+            "is replaced once it has stopped"
+            if replacement.new_pid is None
+            else f"replaced by pid {replacement.new_pid}"
+        )
         self.emit(
             replacement.kind,
             "warning",
             f"worker {self.worker_name(replacement.index)} (pid {replacement.old_pid}) "
-            "replaced by pid "
-            f"{replacement.new_pid}: {replacement.reason}{capture}",
+            f"{successor}: {replacement.reason}{capture}",
             group=self.group_of(replacement.index).name,
             reason=replacement.cause,
             evidence=replacement.evidence,
@@ -4498,8 +5419,18 @@ class Host:
         """
 
         if replacement.announced is not None and replacement.terminate_at is None:
-            acknowledged = self.acked >= replacement.announced
+            acknowledged = self.acked >= replacement.announced or self.edge_reaches(
+                replacement.index
+            )
             waited = now >= (replacement.announced_at or now) + ACK_TIMEOUT_SECONDS
+
+            # Issue 983: a supervisor that has not answered in that time
+            # may not have told the edge, which then still has the old
+            # worker's path, so the new worker is made reachable there as
+            # it is with no supervisor connected.
+
+            if waited and not acknowledged:
+                self.alias_routes(unanswered=True)
 
             if acknowledged or waited:
                 replacement.terminate_at = now + ROUTE_SETTLE_SECONDS
@@ -4567,7 +5498,11 @@ class Host:
                 continue
 
             spawned_at = self.spawned_at.pop(pid, 0.0)
-            self.states.pop(pid, None)
+            gone = self.states.pop(pid, None)
+
+            if gone is not None:
+                self.remove_socket(gone.path)
+
             self.worker_pipes_ended(pid)
             self.adopt_orphans(index, pid)
             if self.stopping:
@@ -4631,12 +5566,15 @@ class Host:
                     continue
 
                 capture = f"; {replacement.capture}" if replacement.capture else ""
+                order = (
+                    "; it stopped before its replacement started" if replacement.stop_first else ""
+                )
                 self.emit(
                     replacement.kind,
                     "info",
                     f"worker {self.worker_name(index)} (pid {pid}) "
                     f"replaced by pid {replacement.new_pid}: "
-                    f"{replacement.reason}{capture}",
+                    f"{replacement.reason}{capture}{order}",
                     group=self.group_of(index).name,
                     reason=replacement.cause,
                     evidence=replacement.evidence,
@@ -4740,6 +5678,28 @@ class Host:
                 )
 
             self.restart_after[index] = time.monotonic() + RESTART_DELAY_SECONDS
+
+    def remove_socket(self, path: str) -> None:
+        """Remove the socket file of a worker that has exited (issue 987).
+
+        A worker never removes its own, and a replacement listens on a
+        path of the next generation, so the file of each worker replaced
+        would stay until the host stops. It is left when the path is in
+        use again: by a worker that listens on it, or as the second name
+        of another worker's socket, which the edge connects to.
+        """
+
+        if self.tcp_base_port is not None:
+            return
+
+        if any(state.path == path for state in self.states.values()):
+            return
+
+        if any(alias == path for alias, _path in self.aliases.values()):
+            return
+
+        with contextlib.suppress(OSError):
+            os.unlink(path)
 
     def took_oom_kill(self, status: int) -> bool:
         """Say whether a worker's exit is one of the kernel's kills for memory.
@@ -4895,7 +5855,7 @@ class Host:
         budget = self.stop_budget()
 
         try:
-            with open(os.path.join(self.socket_dir, STOP_BY_FILE)) as stop_by:
+            with open(os.path.join(self.files_dir, STOP_BY_FILE)) as stop_by:
                 left = int(stop_by.read()) / 1000 - time.time()
         except (OSError, ValueError):
             return budget
@@ -4974,6 +5934,7 @@ class Host:
         if self.tcp_base_port is None:
             paths = {self.socket_path(index) for index in range(self.worker_count)}
             paths.update(state.path for state in self.states.values())
+            paths.update(alias for alias, _path in self.aliases.values())
 
             for path in paths:
                 try:
@@ -5250,6 +6211,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--release", default=None, help="the release's id for muru.context(); dev otherwise"
     )
     parser.add_argument("--socket-dir", required=True, help="directory for the worker sockets")
+    parser.add_argument(
+        "--files-dir",
+        default=None,
+        help="directory for the host's regular files; the socket directory otherwise",
+    )
     parser.add_argument("--processes", type=int, default=1, help="worker processes to fork")
     parser.add_argument(
         "--interface",
@@ -5470,6 +6436,28 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="replace a worker after this long, with jitter",
     )
     parser.add_argument(
+        "--max-surge",
+        type=int,
+        default=1,
+        metavar="N",
+        help="workers a group may run over its count while workers are swapped",
+    )
+    parser.add_argument(
+        "--max-unavailable",
+        type=int,
+        default=0,
+        metavar="N",
+        help="workers a group may run under its count while workers are swapped",
+    )
+    parser.add_argument(
+        "--group-swap",
+        action="append",
+        default=[],
+        type=parse_group_swap,
+        metavar="NAME=MAX_SURGE,MAX_UNAVAILABLE",
+        help="a named group's max_surge and max_unavailable; the release's without",
+    )
+    parser.add_argument(
         "--soft-timeout",
         type=float,
         default=None,
@@ -5609,7 +6597,7 @@ def imports_report() -> str | None:
 
 
 def carry_imports(run_dir: str) -> None:
-    """Leave the load's import report in the run directory, for the host started again."""
+    """Leave the load's import report among the host's files, for the host started again."""
 
     report = imports_report()
 
@@ -5626,7 +6614,7 @@ def carry_imports(run_dir: str) -> None:
 
 
 def carried_imports(run_dir: str) -> str | None:
-    """Take the import report a host that fell back left in the run directory, if any."""
+    """Take the import report a host that fell back left among its files, if any."""
 
     path = os.path.join(run_dir, IMPORTS_FILE)
 
@@ -5885,10 +6873,10 @@ def _main(argv: list[str] | None) -> int:
             instruments.finished(context, _instrumentation.FALLBACK)
             flush_streams()
 
-            # Section 6.18: the load's import report waits in the run
-            # directory for the host started again, which sends it.
+            # Section 6.18: the load's import report waits among the
+            # host's files for the host started again, which sends it.
 
-            carry_imports(args.socket_dir)
+            carry_imports(args.files_dir or args.socket_dir)
 
             # The instrumentation list goes back in the environment, so
             # the host started again gives it to each worker.
@@ -5921,14 +6909,14 @@ def _main(argv: list[str] | None) -> int:
     # Section 9.12 (issue 266): the daemon runs the release's before_fork
     # gates now, with the application imported and nothing forked.
 
-    if args.hold_before_fork and not hold_for_gates(args.socket_dir):
+    if args.hold_before_fork and not hold_for_gates(args.files_dir or args.socket_dir):
         return 1
 
     # A socket past the platform's path limit never binds, so the longest
-    # a default worker's socket can be is checked once here; a named
-    # group's sockets carry its name as well.
+    # a worker's socket can be is checked once here: a named group's,
+    # which carries the group's place and never its name.
 
-    longest = os.path.join(args.socket_dir, "worker-99-g99.sock")
+    longest = os.path.join(args.socket_dir, "worker-99-99-g99.sock")
 
     if len(longest.encode()) >= SOCKET_PATH_LIMIT:
         log(
@@ -5939,6 +6927,15 @@ def _main(argv: list[str] | None) -> int:
         return 1
 
     os.makedirs(args.socket_dir, exist_ok=True)
+
+    if args.max_surge < 0 or args.max_unavailable < 0:
+        log("max_surge and max_unavailable must be at least 0")
+        return 1
+
+    if args.max_surge + args.max_unavailable == 0:
+        log("max_surge and max_unavailable are both 0, so no worker could be replaced")
+        return 1
+
     host = Host(
         release,
         args.socket_dir,
@@ -5948,12 +6945,14 @@ def _main(argv: list[str] | None) -> int:
         sync_threads=args.sync_threads,
         concurrency=args.concurrency,
         detach=args.detach,
+        files_dir=args.files_dir,
         groups=[
             replace(
                 group,
                 **dict(args.group_timeouts).get(group.name, {}),
                 memory=dict(args.group_memory).get(group.name),
                 **dict(args.group_recycle).get(group.name, {}),
+                **dict(args.group_swap).get(group.name, {}),
                 optional=group.name in args.optional_group,
                 mounts=dict(args.group_mounts).get(group.name, ()),
             )
@@ -5965,6 +6964,8 @@ def _main(argv: list[str] | None) -> int:
         control=args.control,
         max_requests=args.max_requests,
         max_lifetime=args.max_lifetime,
+        max_surge=args.max_surge,
+        max_unavailable=args.max_unavailable,
         soft_timeout=args.soft_timeout,
         hard_timeout=args.hard_timeout,
         hard_drain_grace=args.hard_drain_grace,
@@ -5997,7 +6998,7 @@ def _main(argv: list[str] | None) -> int:
             "imports": imports_summary(),
         }
 
-    host.imports = imports_report() or carried_imports(args.socket_dir)
+    host.imports = imports_report() or carried_imports(args.files_dir or args.socket_dir)
 
     # Section 2.1: the host says which release it is; each worker it
     # forks says so too, with its group and index.

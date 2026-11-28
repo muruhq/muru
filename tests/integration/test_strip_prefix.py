@@ -149,7 +149,7 @@ def test_a_route_strips_its_prefix_for_releases_upstreams_and_fallbacks(tmp_path
         # The route list and the export show the key.
 
         assert "[strip_prefix /app]" in daemon.muructl("route", "list").stdout
-        exported = daemon.muructl("config", "export").stdout
+        exported = daemon.muructl("deployment", "export").stdout
         assert 'strip_prefix = "/app"' in exported, exported
 
         # A part that is not a leading part of the route's path on

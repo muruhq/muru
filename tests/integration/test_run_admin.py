@@ -114,6 +114,40 @@ def test_a_debug_reply_larger_than_the_default_limit_arrives(runtime: Path) -> N
         server.stop()
 
 
+def test_a_control_connection_that_ends_is_made_again(runtime: Path) -> None:
+    """Issue 988: a run connects again to a host that closed its control
+    connection, and asks its workers things as before."""
+
+    server = start(runtime)
+
+    try:
+        # A host has one supervisor, so another connection to its control
+        # socket has it close the run's, as it does when a send to a run
+        # that has stalled does not complete.
+
+        [control] = runtime.rglob("control.sock")
+        other = socket.socket(socket.AF_UNIX)
+        other.connect(str(control))
+        again = "the control connection to the host ended and was made again"
+        assert server.wait_for_log(again), server.log()
+        other.close()
+
+        answer = muructl(
+            runtime,
+            "debug",
+            "exec",
+            "plain-wsgi",
+            "--worker",
+            "0",
+            "--",
+            "print(6 * 7)",
+            cwd=support.FIXTURES,
+        ).stdout
+        assert "42" in answer, answer
+    finally:
+        server.stop()
+
+
 def test_the_commands_reach_a_development_run(runtime: Path) -> None:
     server = start(runtime, args=["--timeout", "deadline=2s"])
 
@@ -225,6 +259,14 @@ def test_the_commands_reach_a_development_run(runtime: Path) -> None:
         ).stdout
         assert "worker 1" in restarted and "is being replaced by pid" in restarted
         assert server.wait_for_log(": worker.restarted: worker 1")
+
+        # Section 10.14: every worker in turn is one call here too, which
+        # the run's host carries out.
+
+        rolling = muructl(runtime, "restart", "plain-wsgi", "--all", cwd=support.FIXTURES).stdout
+        assert "workers of plain-wsgi@r1 marked to be replaced" in rolling, rolling
+        assert "the restart of plain-wsgi@r1 has finished" in rolling, rolling
+        assert server.wait_for_log(": restart.finished: the ")
 
         # A change to what the access log writes goes into the run's edge
         # at once and is printed as the daemon records it.
@@ -764,14 +806,24 @@ def test_the_dashboard_has_the_worker_pages(runtime: Path) -> None:
         assert server.wait_for_log(f"dashboard on http://127.0.0.1:{port}/")
         assert 'href="workers?release=plain-wsgi@r1"' in read("/fragment/overview")
 
-        # Issue 764: the run's process id is printed, and written beside
-        # its admin socket.
+        # Issue 764: the run's process id is printed, and written among
+        # the run's files, in a directory named as the one of its sockets
+        # is, under the state location: the run directory holds sockets
+        # and nothing else (issue 948).
 
         written = re.search(r"pid (\d+), written to (\S+)", server.log())
         assert written, server.log()
         assert int(written.group(1)) == server.process.pid
         assert Path(written.group(2)).read_text() == f"{server.process.pid}\n"
-        assert Path(written.group(2)).parent == server.admin_socket().parent
+        files = Path(written.group(2)).parent
+        sockets = server.admin_socket().parent
+        assert files.name == sockets.name and files.parent.name == "run"
+        assert files != sockets
+        assert (sockets / "h" / "1" / "worker-0.sock").is_socket()
+        assert (files / "h" / "1" / "relay.toml").is_file()
+        assert [
+            path for path in sockets.rglob("*") if not path.is_socket() and not path.is_dir()
+        ] == []
         page = read("/workers?release=plain-wsgi@r1")
         assert "<title>Muru: plain-wsgi@r1 workers</title>" in page
         assert '<a href="./">run</a>' in page
@@ -1028,12 +1080,26 @@ def test_a_run_killed_outright_leaves_a_stale_entry_that_is_not_reached(runtime:
 
     server = start(runtime)
     socket_path = server.admin_socket()
+
+    # Issue 948: the registry is the machine's own, and may hold entries
+    # of other instances whose record cannot be read, which are passed
+    # over as discovery passes them over.
+
+    def pid_of(entry: Path) -> int | None:
+        try:
+            return int(json.loads((entry / "instance.json").read_text())["pid"])
+        except (OSError, ValueError, KeyError):
+            return None
+
     entries = [
         entry
         for entry in support.user_registry().iterdir()
-        if not entry.name.startswith(".")
-        and json.loads((entry / "instance.json").read_text())["pid"] == server.process.pid
+        if not entry.name.startswith(".") and pid_of(entry) == server.process.pid
     ]
+
+    if len(entries) != 1:
+        server.stop()
+
     assert len(entries) == 1, entries
     record = json.loads((entries[0] / "instance.json").read_text())
     assert record["kind"] == "run" and record["app"] == "plain-wsgi"

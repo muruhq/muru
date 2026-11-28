@@ -73,6 +73,18 @@ service Admin {
   // edge, or serve it as usual again.
   rpc SetMaintenance(SetMaintenanceRequest) returns (MaintenanceStatus);
 
+  // Replace every worker of a release, or of one of its worker groups,
+  // that was started before the call, each in its turn under the
+  // group's max_surge and max_unavailable. The release's host takes the
+  // turns, so the restart carries on while the daemon is stopped or
+  // upgrading. The call returns once the workers are marked, or with
+  // `wait` once they have all been replaced. The events restart.started,
+  // worker.restarted and restart.finished follow it.
+  rpc RestartRelease(RestartReleaseRequest) returns (RestartReleaseResponse);
+  // Clear the marks of a restart under way: the workers not yet
+  // replaced stay, and a replacement already started is finished.
+  rpc CancelRestart(CancelRestartRequest) returns (RestartReleaseResponse);
+
   // Change which requests the access log writes for a
   // period, put the changes back, or list those in force.
   rpc OverrideAccessLog(OverrideAccessLogRequest) returns (AccessLogOverrides);
@@ -102,6 +114,9 @@ service Admin {
   // one with desired state, or export desired state as one.
   rpc ApplyConfig(ApplyConfigRequest) returns (ConfigReport);
   rpc DiffConfig(DiffConfigRequest) returns (ConfigReport);
+  // The deployments, each with what it holds (issue 936). default is
+  // always among them.
+  rpc ListDeployments(ListDeploymentsRequest) returns (ListDeploymentsResponse);
   rpc ExportConfig(ExportConfigRequest) returns (ExportConfigResponse);
 
   // Logs: a release's output or the access log,
@@ -146,6 +161,11 @@ service Admin {
   // The daemon answers, then re-executes; the hosts and
   // the edge keep serving and the new image takes them over.
   rpc UpgradeDaemon(UpgradeDaemonRequest) returns (UpgradeDaemonResponse);
+
+  // Re-exec the daemon from the binary it runs, so that it reads its
+  // configuration file afresh. The edge is left as it is. Refused when
+  // the installed binary is of another version, which is an upgrade.
+  rpc RestartDaemon(RestartDaemonRequest) returns (RestartDaemonResponse);
 
   // Ask a release's workers something: status, stacks,
   // tasks, inspect or logging, through the host's control connection.
@@ -193,28 +213,34 @@ service Admin {
   // Change what a detour takes: preview, all, share=N or class=NAME,
   // until changed or until a time, when it takes preview again.
   rpc SetDetourTraffic(SetDetourTrafficRequest) returns (Detour);
-  // One-time entry links to a detour's preview, valid for a minute, and
-  // the Muru-Preview header value.
-  rpc PreviewDetour(PreviewDetourRequest) returns (DetourPreview);
+  // One-time entry links to a release's preview, a detour's or any
+  // other release the edge routes to, and the Muru-Preview header value.
+  // Nothing else the API answers carries a release's preview secret.
+  rpc PreviewRelease(PreviewReleaseRequest) returns (ReleasePreview);
 }
 
-message PreviewDetourRequest {
+message PreviewReleaseRequest {
   string app = 1;
-  string release = 2;
+  string release = 2;               // the release, a detour's ID or `detour` for the application's one detour; when empty, the application's open detour, else its one held release
   string host = 3;                  // a link for this host alone; the best address when empty
   bool all = 4;                     // a link for each of the application's addresses
   string name = 5;                  // the name to build the links from, which a host routing the application must take; its own names when empty
+  uint64 valid_for_ms = 6;          // how long the links last, at most an hour; a minute when 0
+  bool new_secret = 7;              // give the release a new preview secret first, so every link, cookie and header made before stops previewing it
 }
 
-message DetourPreview {
-  repeated DetourLink links = 1;    // best first; none when the application has no address
+message ReleasePreview {
+  repeated PreviewLink links = 1;   // best first; none when the application has no address
   string header = 2;                // the Muru-Preview header's value, RELEASE.SECRET, always given
   uint32 others = 3;                // the application's addresses no link was made for
   string unreachable = 4;           // why there are no links, when there are none
+  string app = 5;                   // the application previewed
+  string release = 6;               // the release previewed, as chosen when the request named none
+  uint64 valid_for_ms = 7;          // how long the links last
 }
 
-message DetourLink {
-  string url = 1;                   // the entry link
+message PreviewLink {
+  string url = 1;                   // the entry link, which works once
   string address = 2;               // where it leads
   string name = 3;                  // the name in it
   string bound = 4;                 // the address the listener it reaches is bound on
@@ -446,6 +472,10 @@ message Status {
   string instance_id = 24;          // the instance's ID, 32 hex digits, as its registry entry has it, so a client can check it reached the instance it meant
   string hostname = 25;             // the machine's hostname
   string name = 26;                 // the instance's name: user, system or a named instance's; empty for a run, a serve or a daemon whose locations were given by flags
+  repeated string start_flags = 27; // the flags the daemon was started with that stand over its configuration file: --listen, --metrics, --dashboard, --user (issue 894)
+  uint64 snapshot_version = 28;     // the version of the routing the daemon last gave its edge, which the edge's own status repeats once it has applied it (issue 950); 0 for a run
+  optional uint64 budget_memory = 29; // the memory limit of the node's budget in bytes; absent when the node has none
+  string budget_memory_from = 30;   // where that limit comes from: file (the daemon's configuration file) or cgroup (the daemon's own cgroup); empty with none
 }
 
 message ListWebSocketsRequest {
@@ -759,6 +789,7 @@ message App {
   int32 priority = 10;              // the node's budget admits higher priorities' scale-ups first
   string maintenance_overlay = 11;  // the active overlay whose maintenance setting is in force, if one is (issue 757)
   AppSettings settings = 12;        // the release settings every release deployed from now takes (issue 899)
+  string deployment = 13;           // the deployment that owns it (issue 943)
 }
 
 // An application's own release settings (issue 899): what every release
@@ -787,6 +818,9 @@ message AppSettings {
   optional bool memory_reclaim_first = 19;
   optional uint64 memory_hard_limit = 20;    // bytes
   optional uint64 memory_check_interval_ms = 21;
+  string notice = 22;                        // on a change's answer: what its caller should be told, as that applied files last wrote these settings (issue 936)
+  optional uint32 max_surge = 23;            // workers a group may run over its count while workers are swapped
+  optional uint32 max_unavailable = 24;      // workers a group may run under its count while workers are swapped
 }
 
 // Set some of an application's settings and remove others. The settings
@@ -866,6 +900,10 @@ message DeployRequest {
   optional bool build_compile_bytecode = 58; // compile bytecode at build time; the table's, else true, when absent
   optional uint64 exit_grace_ms = 59;      // how long a worker has for its shutdown work after its requests have had theirs
   map<string, string> metadata = 60;        // where the code came from (commit, ref, url, description, dirty and any other key), kept with the release
+  optional uint32 max_surge = 61;           // workers a group may run over its count while workers are swapped; the table's, else 1, when absent
+  optional uint32 max_unavailable = 62;     // workers a group may run under its count while workers are swapped; the table's, else 0, when absent
+  optional uint32 initial_processes = 63;   // the workers each group starts with and keeps while the release takes no traffic, where that is fewer than its processes (issue 964); its processes when absent
+  map<string, uint32> group_initial_processes = 64; // the same for one named worker group, over initial_processes
 }
 
 // What a deploy would do. With refusals nothing would be deployed.
@@ -999,6 +1037,7 @@ message RemoveReleaseRequest {
   string release = 2;
   bool keep_logs = 3;               // leave its log and archives
   bool dry_run = 4;                 // only say what it would free
+  bool force = 5;                   // take it although applied files declare it (issue 926)
 }
 
 // A release a removal took, or would take.
@@ -1045,6 +1084,7 @@ message StartRolloutRequest {
   uint64 max_worker_faults = 10;    // a gate: the candidate's worker crashes and timeout kills over the step
   uint64 max_queue_wait_p95_ms = 11; // a gate: the candidate's p95 wait for a worker thread; none when 0
   repeated string probes = 12;      // a gate: http or https URLs requested through the edge from each release by preview
+  string capacity = 13;             // own (the default, when empty): each release runs at its own size; shared: the two share the baseline's worker count, each sized by its share of the traffic
 }
 
 message RolloutStep {
@@ -1072,6 +1112,11 @@ message Rollout {
   uint64 max_worker_faults = 17;
   uint64 max_queue_wait_p95_ms = 18;
   repeated string probes = 19;
+  string capacity = 20;             // own or shared
+  map<string, uint32> totals = 21;  // sharing capacity: the workers the two releases share, by worker group
+  map<string, uint32> baseline_workers = 22;  // the count the rollout has each group of the baseline at
+  map<string, uint32> candidate_workers = 23; // the count the rollout has each group of the candidate at
+  bool sizing = 24;                 // a step's workers are being put in place, its traffic not yet moved
 }
 
 message GetRolloutRequest {
@@ -1279,6 +1324,14 @@ message Release {
   string traffic = 38;              // its shares of the routes that split traffic, where they differ from what serving implies (issue 759)
   Detour detour = 39;               // a detour's run and traffic, for kind detour
   map<string, string> metadata = 40; // what its deploy recorded of where its code came from
+  string notice = 41;               // on a deploy's answer: what its caller should be told, as that applied files declare the application and do not have this release (issue 933)
+  uint64 number = 42;               // its number among every release the daemon has held, which names its host's directories (issue 948); 0 for a detour
+  uint32 max_surge = 43;            // workers a group may run over its count while workers are swapped
+  uint32 max_unavailable = 44;      // workers a group may run under its count while workers are swapped
+  optional uint32 surge_allowance = 45; // the default group's surge allowance as last granted: its max_surge, or fewer; absent when no host runs
+  string surge_short = 46;          // what left that allowance short of max_surge: traffic, workers, memory or cpu; empty when nothing did
+  RestartStatus restart = 47;       // a restart of every worker under way, and how far it has got; absent when none is
+  optional uint32 initial_processes = 48; // the workers the default group starts with and keeps while the release takes no traffic; absent when that is its processes
 }
 
 // A gate a release passed: a run of a command at a point in its life.
@@ -1324,6 +1377,11 @@ message ReleaseGroup {
   repeated string hosts = 9;            // the hosts the group takes, every host when empty
   repeated string methods = 10;         // the methods, upper case, every method when empty
   repeated string mounts = 11;          // the named mounts its workers serve, every mount when empty
+  uint32 max_surge = 12;                // workers the group may run over its count while workers are swapped, its own or the release's
+  uint32 max_unavailable = 13;          // workers the group may run under its count while workers are swapped
+  optional uint32 surge_allowance = 14; // its surge allowance as last granted: its max_surge, or fewer; absent when no host runs
+  string surge_short = 15;              // what left that allowance short of max_surge: traffic, workers, memory or cpu
+  optional uint32 initial_processes = 16; // the workers the group starts with and keeps while the release takes no traffic; absent when that is its processes
 }
 
 message Worker {
@@ -1362,6 +1420,36 @@ message ShutdownRequest {
 }
 
 message ShutdownResponse {}
+
+// A restart of every worker of a release (RestartRelease).
+message RestartReleaseRequest {
+  string app = 1;                   // the one application of a run or a serve when empty
+  string release = 2;               // the application's serving release when empty
+  string group = 3;                 // one worker group; every group when empty
+  bool wait = 4;                    // answer once every marked worker has been replaced, or the wait is over
+  uint64 wait_timeout_ms = 5;       // how long to wait; ten minutes when 0
+}
+
+message CancelRestartRequest {
+  string app = 1;
+  string release = 2;               // the application's serving release when empty
+}
+
+// The answer to RestartRelease and CancelRestart.
+message RestartReleaseResponse {
+  string app = 1;
+  string release = 2;
+  repeated Worker workers = 3;      // the workers this call marked; for a cancel, those left as they were
+  RestartStatus restart = 4;        // the restart under way as the answer is given; absent when none is
+}
+
+// A restart of every worker under way: how far it has got.
+message RestartStatus {
+  uint32 total = 1;                 // the workers marked
+  uint32 left = 2;                  // those not yet replaced
+  uint64 started_unix_ms = 3;
+  string group = 4;                 // the one group it restarts; every group when empty
+}
 
 message DebugRequest {
   string app = 1;
@@ -1416,6 +1504,7 @@ message OverlayInfo {
   uint64 starts_unix_ms = 8;        // when its schedule's window begins, if that is to come; 0 otherwise
   string condition = 9;             // the named condition it follows, if any
   string condition_state = 10;      // that condition's state: firing, resolved or unknown
+  string deployment = 11;           // the deployment that owns it; none for one a detour or a command made for a time (issue 943)
 }
 
 message ControlOverlayRequest {
@@ -1447,6 +1536,12 @@ message UpgradeDaemonResponse {
   string version = 2;               // the version that binary reports
 }
 
+message RestartDaemonRequest {}
+
+message RestartDaemonResponse {
+  string executable = 1;            // the binary the daemon re-executes from
+}
+
 // A document as muructl apply reads it: TOML with [app.NAME.release.ID]
 // tables, source paths already absolute.
 message ApplyConfigRequest {
@@ -1458,10 +1553,29 @@ message ApplyConfigRequest {
   bool no_wait = 6;                 // return once those releases are recorded, without waiting for them to serve
   optional uint64 retain_ms = 7;    // how long a release the apply replaces stays warm; 30 minutes when absent
   optional uint32 retain_workers = 8; // the workers each of its groups keeps meanwhile; when absent 1, or 0 for a group whose min_workers is 0
+  repeated string documents = 9;    // the files a deployment to a document, each with its deployment key, in place of document (issue 936)
+  bool prune_all = 10;              // with prune: reach every deployment, those the documents do not name among them
+  bool remove_data = 11;            // also remove the data directory of each application the apply removes (issue 943)
+}
+
+message ListDeploymentsRequest {}
+
+// A named set of objects applied, pruned and removed together.
+message Deployment {
+  string name = 1;
+  repeated string apps = 2;         // the applications it owns
+  uint32 hosts = 3;
+  uint32 routes = 4;
+  uint32 others = 5;                // its upstreams, overlays, client classes, rate limits and conditions
+}
+
+message ListDeploymentsResponse {
+  repeated Deployment deployments = 1;
 }
 
 message DiffConfigRequest {
   string document = 1;
+  repeated string documents = 2;    // a deployment to a document, in place of document
 }
 
 // What an apply would do, or did. With errors nothing is applied.
@@ -1486,6 +1600,8 @@ message ExportConfigRequest {
   string app = 1;                   // one application, else all
   bool effective = 3;               // routes as the active overlays leave them
   bool resolve_rollouts = 4;        // each rollout under way as where it stands
+  string deployment = 5;            // only what this deployment owns, with its deployment key (issue 937)
+  string as_deployment = 6;         // write this deployment key at the top, for an application moving out of default
 }
 
 message ExportConfigResponse {
@@ -1525,6 +1641,7 @@ message Host {
   string access_log_format = 18;      // how the host's access records are written, when it says: json or combined
   string access_log_file = 19;        // the file in the log directory that takes the host's access records, when it names one
   string access_log_query = 20;       // what the host's access records keep of the query string, when it says: keep, mask or drop
+  string deployment = 21;             // the deployment that owns it (issue 943)
 }
 
 message ListRoutesRequest {}
@@ -1556,6 +1673,7 @@ message Route {
   string request_headers = 20;      // what the route removes from and sets on requests, as one phrase
   string response_headers = 21;     // what the route removes from, sets on and adds to responses, as one phrase
   string strip_prefix = 22;         // the leading part of the path the application lives under, as configured; none when empty
+  string deployment = 23;           // the deployment that owns it (issue 943)
 }
 
 message ListUpstreamsRequest {}
@@ -1572,6 +1690,7 @@ message Upstream {
   bool tls = 4;
   string health_path = 5;           // the path probed, when one is
   bool trust_muru_headers = 6;
+  string deployment = 7;            // the deployment that owns it (issue 943)
 }
 
 // One release's share of a route's requests, in percent.
@@ -1898,4 +2017,5 @@ message ReloadConfigRequest {}
 
 message ReloadConfigResponse {
   string message = 1;               // what was reloaded
+  repeated string stale = 2;        // settings read at start that differ from what the daemon started with
 }

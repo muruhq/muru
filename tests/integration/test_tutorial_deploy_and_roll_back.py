@@ -92,7 +92,7 @@ def test_the_deploy_and_roll_back_tutorial(tmp_path: Path) -> None:
 
         # The configuration as a file.
 
-        exported = daemon.muructl("config", "export").stdout
+        exported = daemon.muructl("deployment", "export").stdout
         assert "[app.hello.release.r1]" in exported
         assert 'entrypoint = "app:application"' in exported
 

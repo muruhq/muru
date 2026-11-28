@@ -127,7 +127,7 @@ these two routes and a third for `/api`, a crawler's request for
 `/api/items` takes the `/api` route.
 
 A traffic policy's `classes` gives a class a release of its own, such as
-an older, cheaper one kept running for it. A preview header or cookie
+an older, cheaper one kept running for it. A [preview](traffic.md#previews)
 still comes first, but the class's release comes before a sticky cookie
 and the split:
 
@@ -244,7 +244,7 @@ one route or on every route of an application.
 gives the edge changed classes and limits without a restart.
 
 Classes and limits in applied files reach the edge when they are
-applied, and `muructl config export` writes them out. An applied class's
+applied, and `muructl deployment export` writes them out. An applied class's
 rule keeps its place among the applied rules when it changes, and a new
 one goes after them; with `--prune` they take the file's order, and
 those the file leaves out are removed. A name the daemon's file defines

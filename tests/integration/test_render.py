@@ -7,6 +7,7 @@ where it is, and `muructl deploy --dry-run` says what a deploy would do.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -25,8 +26,19 @@ def render(*arguments: str, cwd: Path | None = None) -> subprocess.CompletedProc
     if muructl is None:
         support.unavailable("muructl is not built (cargo build -p muructl)")
 
+    # A release is named, since render has no default for it, and nothing
+    # is filled from git unless a test asks, so that a table is the same
+    # whatever checkout the tests run in. Both go before a managed
+    # server's command.
+
+    given = list(arguments)
+    defaults = [] if "--release" in given or "--no-release" in given else ["--release", "r1"]
+    defaults += [] if "--git-metadata" in given else ["--no-git-metadata"]
+    given = [argument for argument in given if argument not in ("--no-release", "--git-metadata")]
+    given[1:1] = defaults
+
     return subprocess.run(
-        [str(muructl), "render", *arguments],
+        [str(muructl), "render", *given],
         capture_output=True,
         text=True,
         check=False,
@@ -74,9 +86,9 @@ def test_a_command_line_is_written_as_the_release_it_describes(tmp_path: Path) -
     assert completed.returncode == 0, completed.stderr
     printed = completed.stdout
     assert printed.startswith(
-        "# The release this command line describes, in the daemon's format.\n"
-        "# Save it as muru.daemon.toml and give it to the daemon with:\n"
-        "#   muructl apply -f muru.daemon.toml\n"
+        "# The release this command line describes, as a table for muructl apply.\n"
+        "# Save it as muru.deploy.toml and give it to the daemon with:\n"
+        "#   muructl apply -f muru.deploy.toml\n"
     ), printed
     assert f"[tool.muru] in {SHOP.resolve() / 'pyproject.toml'}" in printed
     assert "name this one with --release" not in printed
@@ -102,11 +114,54 @@ def test_a_command_line_is_written_as_the_release_it_describes(tmp_path: Path) -
         "static": [{"path": "/files/", "dir": "shop"}],
     }
 
-    # With no release named it is r1, and with no source the current
-    # directory, in full; a source given is written as given.
+    # Issue 932: the release is named by whoever writes the file, and
+    # render has no default for it.
+
+    unnamed = render("shop", "--no-release", cwd=SHOP)
+    assert unnamed.returncode != 0
+    assert (
+        "muru: error: name the release with --release ID: an id of your choosing, such as a "
+        "date (--release 2026-11-26) or a commit"
+    ) in unnamed.stderr, unnamed.stderr
+
+    # What a deploy records of where the code came from is written too:
+    # the flags, over what the source's git checkout says. The checkout
+    # is one made here, so the test does not depend on the tree it runs
+    # from being one (issue 967).
+
+    checkout = tmp_path / "shop"
+    shutil.copytree(SHOP, checkout, ignore=shutil.ignore_patterns("__pycache__"))
+    identity = ["-c", "user.name=Muru", "-c", "user.email=m@example.com"]
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(checkout), *identity, "-c", "commit.gpgsign=false", *arguments],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("add", ".")
+    git("commit", "-q", "-m", "shop")
+
+    recorded = rendered(
+        "shop",
+        str(checkout),
+        "--git-metadata",
+        "--metadata",
+        "description=the first",
+        "--metadata",
+        "ref=",
+    )["app"]["shop"]["release"]["r1"]["metadata"]  # type: ignore[index]
+    assert recorded["description"] == "the first" and "ref" not in recorded, recorded
+    assert recorded["commit"] == git("rev-parse", "HEAD"), recorded
+
+    # With no source it is the current directory, in full; a source given
+    # is written as given.
 
     plain = render("shop", cwd=SHOP)
-    assert "# The release is written as r1." in plain.stdout
     release = tomllib.loads(plain.stdout)["app"]["shop"]["release"]["r1"]
     assert release["source"] == str(SHOP.resolve())
     relative = render("shop", ".", cwd=SHOP)
@@ -227,7 +282,7 @@ def test_a_rendered_release_is_applied_held_and_a_deploy_is_planned(
     # A rendered release applied with --hold starts beside the one that
     # serves, and the plan and the report both say it is held.
 
-    config = tmp_path / "muru.daemon.toml"
+    config = tmp_path / "muru.deploy.toml"
     flags = ["--threads", "1", "--max-requests", "500"]
     config.write_text(render("shop", str(SHOP), "--release", "next", *flags, *python).stdout)
     planned = daemon.muructl("apply", "-f", str(config), "--hold", "--dry-run", check=False)

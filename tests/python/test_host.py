@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -76,6 +79,22 @@ def test_socket_paths_carry_the_generation_of_a_replacement(tmp_path: Path) -> N
     instance.generation[1] = 2
     assert instance.socket_path(1) == str(tmp_path / "worker-1-g2.sock")
     assert instance.socket_path(0) == str(tmp_path / "worker-0.sock")
+
+
+def test_a_named_groups_sockets_carry_its_place_and_never_its_name(tmp_path: Path) -> None:
+    # No socket's path grows with a name (design specification section
+    # 13.8): the first named group is 1, the second 2.
+
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    groups = [host.Group("api", 2, 1, 1, 1), host.Group("a-long-name-for-a-group", 1, 1, 1, 1)]
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1, groups=groups)
+
+    assert instance.socket_path(0) == str(tmp_path / "worker-0.sock")
+    assert instance.socket_path(2) == str(tmp_path / "worker-1-1.sock")
+    assert instance.socket_path(3) == str(tmp_path / "worker-2-0.sock")
+    instance.generation[3] = 4
+    assert instance.socket_path(3) == str(tmp_path / "worker-2-0-g4.sock")
+    assert instance.files_dir == str(tmp_path)
 
 
 def test_a_group_recycles_by_its_own_settings_else_the_releases(tmp_path: Path) -> None:
@@ -905,3 +924,876 @@ def test_development_is_what_the_environment_says(monkeypatch: pytest.MonkeyPatc
     assert host.is_development()
     monkeypatch.setenv("MURU_DEVELOPMENT", "0")
     assert not host.is_development()
+
+
+# Section 7.8: swapping workers within max_surge and max_unavailable.
+
+
+def swapping_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workers: int = 2, **settings: int
+) -> tuple[host.Host, list[host.WorkerState], list[dict[str, Any]], list[tuple[int, int]]]:
+    """A host whose workers are ready and routed to, with forks, signals and exits stood in for.
+
+    It returns the host, its workers' states in index order, what it sent
+    its supervisor, and each fork as (index, pid). A forked worker has a
+    state as a real one has, and is ready once `ready()` says so.
+    """
+
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=workers, threads=1, **settings)
+    sent: list[dict[str, Any]] = []
+    forks: list[tuple[int, int]] = []
+    states = []
+
+    for index in range(workers):
+        state = host.WorkerState(index, 4000 + index, 0, f"w{index}.sock", time.monotonic(), -1)
+        state.ready = True
+        state.last_report_at = time.monotonic()
+        instance.states[state.pid] = state
+        instance.workers[state.pid] = index
+        instance.routed[index] = state.path
+        states.append(state)
+
+    def spawn(index: int, replacing: bool = False) -> int:
+        pid = 5000 + len(forks)
+        forks.append((index, pid))
+        generation = instance.generation.get(index, 0)
+        path = f"w{index}-g{generation}.sock"
+        fresh = host.WorkerState(index, pid, generation, path, time.monotonic(), -1)
+        fresh.last_report_at = time.monotonic()
+        instance.states[pid] = fresh
+        instance.workers[pid] = index
+
+        if not replacing:
+            instance.routed[index] = path
+
+        return pid
+
+    monkeypatch.setattr(_outside, "WHOLE", False)
+    monkeypatch.setattr(os, "kill", lambda _pid, _signal: None)
+    instance.control_listener = object()  # type: ignore[assignment]
+    instance.send_to_supervisor = sent.append  # type: ignore[method-assign]
+    instance.ask = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    instance.spawn = spawn  # type: ignore[method-assign]
+    instance.own_memory = lambda: {}  # type: ignore[method-assign]
+    return instance, states, sent, forks
+
+
+def ready(instance: host.Host, pid: int) -> None:
+    """Have the worker with this pid report for the first time."""
+
+    state = instance.states[pid]
+    state.ready = True
+    instance.worker_ready(state)
+
+
+def waiting(sent: list[dict[str, Any]]) -> list[tuple[object, object]]:
+    return [
+        (message["group"], message["reason"])
+        for message in sent
+        if message.get("kind") == "worker.swap_waiting"
+    ]
+
+
+def test_voluntary_swaps_of_a_group_take_turns_within_max_surge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, sent, forks = swapping_host(tmp_path, monkeypatch)
+
+    # Both workers are due at once. The first is replaced surge first: its
+    # successor is forked while it serves. The second waits for the slot.
+
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    instance.swap(states[1], "served 11 requests", "worker.recycled", "max_requests")
+    instance.swap(states[1], "served 12 requests", "worker.recycled", "max_requests")
+    assert forks == [(0, 5000)]
+    assert instance.routed[0] == "w0.sock"
+    assert waiting(sent) == [("default", "surge")]
+    assert len(instance.swaps["default"]) == 1
+
+    instance.send_status()
+    assert sent[-1]["swaps_waiting"] == {"default": 1}
+
+    # Nothing changes until the old worker has gone, however often asked.
+
+    ready(instance, 5000)
+    instance.run_swaps()
+    assert forks == [(0, 5000)]
+    assert waiting(sent) == [("default", "surge")]
+
+    exits(monkeypatch, (4000, 0))
+    instance.reap()
+    instance.run_swaps()
+    assert forks == [(0, 5000), (1, 5001)]
+    assert not instance.swaps["default"]
+    recycled = [message for message in sent if message.get("kind") == "worker.recycled"]
+    assert recycled[0]["message"] == (
+        "worker 0 (pid 4000) replaced by pid 5000: served 10 requests"
+    )
+
+
+def test_a_group_with_no_surge_swaps_drain_first_within_max_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, sent, forks = swapping_host(
+        tmp_path, monkeypatch, max_surge=0, max_unavailable=1
+    )
+    instance.swap(states[0], "lived 60 s", "worker.recycled", "max_lifetime")
+    instance.swap(states[1], "lived 61 s", "worker.recycled", "max_lifetime")
+
+    # The first worker leaves routing and nothing is forked; the second
+    # waits, since one worker of the group is out of routing already.
+
+    assert forks == []
+    assert instance.routed[0] is None
+    assert instance.replacing[0].stop_first
+    assert waiting(sent) == [("default", "unavailable")]
+
+    # Its successor is forked once it has exited, and the second swap
+    # still waits until that successor is in routing.
+
+    exits(monkeypatch, (4000, 0))
+    instance.reap()
+    instance.run_swaps()
+    assert forks == [(0, 5000)]
+    assert instance.routed[1] == "w1.sock"
+    recycled = [message for message in sent if message.get("kind") == "worker.recycled"]
+    assert recycled[0]["message"] == (
+        "worker 0 (pid 4000) replaced by pid 5000: lived 60 s; "
+        "it stopped before its replacement started"
+    )
+
+    ready(instance, 5000)
+    instance.run_swaps()
+    assert instance.routed[1] is None
+    assert forks == [(0, 5000)]
+
+
+def test_a_group_of_one_with_no_surge_has_no_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, _sent, forks = swapping_host(
+        tmp_path, monkeypatch, workers=1, max_surge=0, max_unavailable=1
+    )
+    instance.swap(states[0], "lived 60 s", "worker.recycled", "max_lifetime")
+    assert instance.routed[0] is None
+    assert forks == []
+
+
+def test_an_involuntary_replacement_skips_the_queue_and_keeps_the_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With a surge allowance: a hard timeout is not held back by the swap
+    # under way, and its successor is forked at once.
+
+    instance, states, _sent, forks = swapping_host(tmp_path, monkeypatch)
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    assert instance.replace(states[1], "ran too long", "worker.timeout_killed", "hard_timeout")
+    assert forks == [(0, 5000), (1, 5001)]
+
+    # With none: it is not held back by the worker already out of
+    # routing either, but its successor waits for it to exit, and the
+    # fault is reported at the decision all the same.
+
+    instance, states, sent, forks = swapping_host(
+        tmp_path / "none", monkeypatch, max_surge=0, max_unavailable=1
+    )
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    assert instance.replace(states[1], "ran too long", "worker.timeout_killed", "hard_timeout")
+    assert forks == []
+    assert instance.routed == {0: None, 1: None}
+    replacement = instance.replacing[1]
+    assert replacement.stop_first and replacement.terminate_at is not None
+
+    replacement.captured = True
+    instance.report_timeout_kill(replacement)
+    killed = [message for message in sent if message.get("kind") == "worker.timeout_killed"]
+    assert (
+        killed[0]["message"] == "worker 1 (pid 4001) is replaced once it has stopped: ran too long"
+    )
+
+    exits(monkeypatch, (4001, 0))
+    instance.reap()
+    assert forks == [(1, 5000)]
+
+
+def test_a_queued_swap_is_dropped_when_its_worker_goes_another_way(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, _sent, forks = swapping_host(tmp_path, monkeypatch, workers=3)
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    instance.swap(states[1], "served 11 requests", "worker.recycled", "max_requests")
+    instance.swap(states[2], "served 12 requests", "worker.recycled", "max_requests")
+
+    # The second worker is scaled in while it waits, and a worker being
+    # debugged is passed over and keeps its place.
+
+    instance.retire(states[1], "scaled in")
+    states[2].debug_sessions = 1
+    ready(instance, 5000)
+    exits(monkeypatch, (4000, 0))
+    instance.reap()
+    instance.run_swaps()
+    assert forks == [(0, 5000)]
+    assert [swap.pid for swap in instance.swaps["default"]] == [4002]
+
+    states[2].debug_sessions = 0
+    instance.run_swaps()
+    assert forks == [(0, 5000), (2, 5001)]
+
+
+def test_a_groups_swap_settings_are_its_own_or_the_releases(tmp_path: Path) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    reports = host.Group("reports", 1, 1, 1, 1, max_surge=0, max_unavailable=1)
+    plain = host.Group("plain", 1, 1, 1, 1)
+    instance = host.Host(
+        release, str(tmp_path), workers=1, threads=1, groups=[reports, plain], max_surge=2
+    )
+    settings = {group.name: (group.max_surge, group.max_unavailable) for group in instance.groups}
+    assert settings == {"default": (2, 0), "reports": (0, 1), "plain": (2, 0)}
+
+    assert host.parse_group_swap("reports=0,1") == (
+        "reports",
+        {"max_surge": 0, "max_unavailable": 1},
+    )
+
+    for refused in ("reports=0,0", "reports=1", "=1,0", "reports=-1,2", "reports=a,b"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            host.parse_group_swap(refused)
+
+
+def test_swaps_are_surge_first_only_within_the_allowance_the_daemon_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 7.9: the host keeps the allowance it was last granted."""
+
+    instance, states, sent, forks = swapping_host(tmp_path, monkeypatch)
+    default = instance.groups[0]
+    assert instance.surge_allowance(default) == 1
+
+    # No room in the budget and nothing allowed under the count: the swap
+    # waits, and says which limit it waits on.
+
+    instance.take_request(
+        {
+            "type": "request",
+            "id": 7,
+            "op": "surge",
+            "args": {"groups": {"default": {"allowance": 0, "short": "memory"}}},
+        }
+    )
+    assert sent[-1] == {"type": "response", "id": 7, "workers": []}
+    assert instance.surge_allowance(default) == 0
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    assert forks == []
+    assert waiting(sent) == [("default", "budget")]
+    event = next(message for message in sent if message.get("kind") == "worker.swap_waiting")
+    assert event["message"].endswith(
+        "the node's memory budget has no room for another worker of the group default over "
+        "its count"
+    )
+
+    # An involuntary replacement is not held back, and keeps the order:
+    # its successor is forked once it has exited.
+
+    assert instance.replace(states[1], "ran too long", "worker.timeout_killed", "hard_timeout")
+    assert forks == []
+    assert instance.replacing[1].stop_first
+
+    # The swap that waited starts as soon as an allowance is granted, and
+    # never more is taken than the group's max_surge.
+
+    surge = {"groups": {"default": {"allowance": 3, "short": ""}}}
+    instance.take_request({"type": "request", "id": 8, "op": "surge", "args": surge})
+    assert instance.surge_allowance(default) == 1
+    assert forks == [(0, 5000)]
+
+
+def test_a_release_with_no_traffic_swaps_drain_first_whatever_its_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, sent, forks = swapping_host(tmp_path, monkeypatch, workers=1)
+    surge = {"groups": {"default": {"allowance": 0, "short": "traffic"}}}
+    instance.take_request({"type": "request", "id": 3, "op": "surge", "args": surge})
+    instance.swap(states[0], "lived 60 s", "worker.recycled", "max_lifetime")
+    assert forks == []
+    assert instance.routed[0] is None
+    assert instance.replacing[0].stop_first
+    assert waiting(sent) == []
+
+
+# Section 10.14: every worker restarted on request, through the queue.
+
+
+def ask(instance: host.Host, op: str, **args: object) -> None:
+    instance.take_request({"type": "request", "id": 9, "op": op, "args": args})
+
+
+def restart_progress(sent: list[dict[str, Any]]) -> list[tuple[object, object]]:
+    return [
+        (message["total"], message["left"]) for message in sent if message.get("type") == "restart"
+    ]
+
+
+def test_every_worker_is_restarted_in_turn_through_the_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, _states, sent, forks = swapping_host(tmp_path, monkeypatch)
+    ask(instance, "restart_all")
+
+    # Both workers are marked and the answer names them; the first is
+    # replaced at once and the second waits its turn.
+
+    response = next(message for message in sent if message.get("type") == "response")
+    assert [worker["pid"] for worker in response["workers"]] == [4000, 4001]
+    assert kinds(sent)[0] == "restart.started"
+    assert forks == [(0, 5000)]
+    assert len(instance.swaps["default"]) == 1
+    assert restart_progress(sent) == [(2, 2)]
+
+    # A second ask marks only what has started since: the replacement.
+
+    ask(instance, "restart_all")
+    assert instance.restart is not None and instance.restart.total == 3
+
+    ready(instance, 5000)
+    exits(monkeypatch, (4000, 0))
+    instance.reap()
+    instance.tick()
+    assert forks == [(0, 5000), (1, 5001)]
+    assert restart_progress(sent)[-1] == (3, 2)
+
+    ready(instance, 5001)
+    exits(monkeypatch, (4001, 0))
+    instance.reap()
+    instance.tick()
+    assert forks == [(0, 5000), (1, 5001), (0, 5002)]
+
+    ready(instance, 5002)
+    exits(monkeypatch, (5000, 0))
+    instance.reap()
+    instance.tick()
+    assert instance.restart is None
+    assert restart_progress(sent)[-1] == (3, 0)
+    finished = [message for message in sent if message.get("kind") == "restart.finished"]
+    assert finished[0]["message"] == "the 3 workers marked have each been replaced or have gone"
+    restarted = [message for message in sent if message.get("kind") == "worker.restarted"]
+    assert len(restarted) == 3 and restarted[0]["reason"] == "restart"
+    assert restarted[0]["message"] == (
+        "worker 0 (pid 4000) replaced by pid 5000: restarted on request"
+    )
+
+
+def test_a_cancelled_restart_leaves_the_workers_not_yet_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, sent, forks = swapping_host(tmp_path, monkeypatch, workers=3)
+    ask(instance, "restart_cancel")
+    assert sent[-1]["error"] == "no restart is under way"
+
+    ask(instance, "restart_all")
+    assert forks == [(0, 5000)]
+    ask(instance, "restart_cancel")
+
+    # The replacement under way is finished; the two that waited stay,
+    # and are no longer queued.
+
+    assert [worker["pid"] for worker in sent[-1]["workers"]] == [4001, 4002]
+    assert not instance.swaps["default"]
+    assert not states[1].queued and not states[2].queued
+    assert instance.restart is not None
+
+    ready(instance, 5000)
+    exits(monkeypatch, (4000, 0))
+    instance.reap()
+    instance.tick()
+    assert instance.restart is None
+    assert forks == [(0, 5000)]
+    finished = next(message for message in sent if message.get("kind") == "restart.finished")
+    assert finished["reason"] == "cancelled"
+    assert finished["message"] == (
+        "cancelled: 1 of the 3 marked workers were replaced or have gone, and 2 stay as they were"
+    )
+
+
+def test_a_restart_of_one_group_marks_only_its_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    reports = host.Group("reports", 1, 1, 1, 1)
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1, groups=[reports])
+    sent: list[dict[str, Any]] = []
+    instance.control_listener = object()  # type: ignore[assignment]
+    instance.send_to_supervisor = sent.append  # type: ignore[method-assign]
+    instance.spawn = lambda index, replacing=False: 5000 + index  # type: ignore[method-assign]
+
+    for index in range(2):
+        state = host.WorkerState(index, 4000 + index, 0, f"w{index}.sock", time.monotonic(), -1)
+        state.ready = True
+        instance.states[state.pid] = state
+        instance.workers[state.pid] = index
+        instance.routed[index] = state.path
+
+    ask(instance, "restart_all", group="nosuch")
+    assert sent[-1]["error"] == "no worker group nosuch"
+
+    ask(instance, "restart_all", group="reports")
+    assert sent[-1]["workers"] == [{"index": 0, "group": "reports", "pid": 4001, "ok": True}]
+    assert list(instance.replacing) == [1]
+    started = next(message for message in sent if message.get("kind") == "restart.started")
+    assert started["group"] == "reports"
+    assert started["message"] == (
+        "1 worker of the group reports started before now is to be replaced, each in its turn"
+    )
+
+    # A supervisor that connects meanwhile is told how far it has got.
+
+    assert instance.restart is not None
+    instance.restart.told = None
+    instance.tell_restart()
+    assert sent[-1]["type"] == "restart" and (sent[-1]["total"], sent[-1]["left"]) == (1, 1)
+
+
+# Section 11.5: events raised with no supervisor connected are held.
+
+
+def unsupervised_host(tmp_path: Path) -> host.Host:
+    """A host with a control socket and no supervisor connected to it."""
+
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+    instance.control_listener = object()  # type: ignore[assignment]
+    return instance
+
+
+def connect(instance: host.Host) -> socket.socket:
+    """Stand a supervisor's connection in, and return the supervisor's end."""
+
+    ours, theirs = socket.socketpair()
+    instance.supervisor = ours
+    return theirs
+
+
+def received(connection: socket.socket) -> list[dict[str, Any]]:
+    """Read every line the host has sent on a connection."""
+
+    connection.setblocking(False)
+    data = b""
+
+    while True:
+        try:
+            chunk = connection.recv(65536)
+        except BlockingIOError:
+            break
+
+        if not chunk:
+            break
+
+        data += chunk
+
+    return [json.loads(line) for line in data.splitlines()]
+
+
+def test_events_raised_with_no_supervisor_are_held_and_sent_with_their_times(
+    tmp_path: Path,
+) -> None:
+    instance = unsupervised_host(tmp_path)
+    before = int(time.time() * 1000)
+
+    instance.emit("worker.recycled", "info", "one", group="default", reason="max_requests")
+    instance.emit(
+        "worker.timeout_killed",
+        "warning",
+        "two",
+        group="default",
+        reason="hard_timeout",
+        evidence={"worker": "0", "pid": 1, "requests": ["r-1"], "threads": []},
+    )
+    instance.emit("restart.finished", "notice", "three")
+
+    # State is not held: a supervisor is sent it whole when it connects.
+
+    instance.announce()
+    after = int(time.time() * 1000)
+    assert [event["kind"] for event in instance.held_events] == [
+        "worker.recycled",
+        "worker.timeout_killed",
+        "restart.finished",
+    ]
+
+    # A supervisor that connects is sent them oldest first, each with the
+    # time it happened and its number, and none with its evidence.
+
+    supervisor = connect(instance)
+    instance.send_held_events()
+    events = received(supervisor)
+    assert [(event["type"], event["kind"], event["message"]) for event in events] == [
+        ("event", "worker.recycled", "one"),
+        ("event", "worker.timeout_killed", "two"),
+        ("event", "restart.finished", "three"),
+    ]
+    assert (events[0]["group"], events[0]["reason"]) == ("default", "max_requests")
+    assert all(before <= event["time_unix_ms"] <= after for event in events)
+    assert all("evidence" not in event for event in events)
+    assert [event["seq"] for event in events] == [1, 2, 3]
+    assert {event["stream"] for event in events} == {instance.event_stream}
+
+
+def test_an_event_is_held_until_a_supervisor_says_it_is_recorded(tmp_path: Path) -> None:
+    """Issue 982: a send that succeeds does not say the event was read."""
+
+    instance = unsupervised_host(tmp_path)
+    supervisor = connect(instance)
+
+    # With a supervisor connected an event is sent as it happens, with no
+    # time of its own, and held all the same.
+
+    instance.emit("worker.recycled", "info", "one")
+    instance.emit("worker.exited", "error", "two")
+    stream = instance.event_stream
+    assert received(supervisor) == [
+        {
+            "type": "event",
+            "kind": "worker.recycled",
+            "level": "info",
+            "message": "one",
+            "stream": stream,
+            "seq": 1,
+        },
+        {
+            "type": "event",
+            "kind": "worker.exited",
+            "level": "error",
+            "message": "two",
+            "stream": stream,
+            "seq": 2,
+        },
+    ]
+    assert [event["seq"] for event in instance.held_events] == [1, 2]
+
+    # The supervisor says the first is recorded and goes before it has
+    # said so of the second, which the next one is sent again, with the
+    # time it happened.
+
+    supervisor.sendall(b'{"type":"recorded","seq":1}\n')
+    instance.read_supervisor()
+    assert [event["seq"] for event in instance.held_events] == [2]
+    supervisor.close()
+
+    later = connect(instance)
+    instance.send_held_events()
+    [again] = received(later)
+    assert (again["message"], again["seq"], again["stream"]) == ("two", 2, stream)
+    assert "time_unix_ms" in again
+    later.sendall(b'{"type":"recorded","seq":2}\n')
+    instance.read_supervisor()
+    assert not instance.held_events
+
+
+def test_past_the_bound_the_oldest_held_events_go_and_the_supervisor_is_told(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    instance = unsupervised_host(tmp_path)
+
+    for number in range(host.HELD_EVENTS + 3):
+        instance.emit("worker.recycled", "info", f"event {number}")
+
+    assert len(instance.held_events) == host.HELD_EVENTS
+    assert instance.events_dropped == 3
+
+    # The log says so once, when the first is dropped.
+
+    said = "events wait to be recorded, with nothing connected that records them: the oldest"
+    assert capfd.readouterr().err.count(said) == 1
+
+    # The supervisor hears how many were dropped ahead of the ones kept.
+
+    # They are more than a socket's buffer takes, so the supervisor reads
+    # as the host sends, as a real one does.
+
+    supervisor = connect(instance)
+    events: list[dict[str, Any]] = []
+
+    def read() -> None:
+        lines = supervisor.makefile("rb")
+
+        while len(events) < host.HELD_EVENTS + 1:
+            events.append(json.loads(lines.readline()))
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    instance.send_held_events()
+    reader.join(timeout=10)
+    assert len(events) == host.HELD_EVENTS + 1
+    assert (events[0]["kind"], events[0]["level"], events[0]["dropped"]) == (
+        "host.events_dropped",
+        "warning",
+        3,
+    )
+    assert events[0]["message"] == (
+        "3 events that nothing had recorded were dropped, the oldest: "
+        f"{host.HELD_EVENTS} are held at most, and the release's log has a line for each"
+    )
+
+    # The warning takes the number of the last event dropped, so it is
+    # recorded once and ahead of the events kept.
+
+    assert (events[0]["seq"], events[1]["seq"]) == (3, 4)
+    assert events[1]["message"] == "event 3"
+    assert events[-1]["message"] == f"event {host.HELD_EVENTS + 2}"
+
+    # A supervisor that has recorded the warning is not told again, and
+    # the next is sent only what has not been recorded.
+
+    supervisor.sendall(b'{"type":"recorded","seq":3}\n')
+    instance.read_supervisor()
+    assert instance.events_dropped == 0
+    assert len(instance.held_events) == host.HELD_EVENTS
+    supervisor.sendall(b'{"type":"recorded","seq":%d}\n' % (host.HELD_EVENTS + 3))
+    instance.read_supervisor()
+    instance.emit("worker.recycled", "info", "sent")
+    assert [event["message"] for event in received(supervisor)] == ["sent"]
+    assert [event["message"] for event in instance.held_events] == ["sent"]
+
+
+def test_a_host_with_no_control_socket_holds_no_events(tmp_path: Path) -> None:
+    release = host.Release("plain_wsgi:application", None, host.Context(app="plain_wsgi"))
+    instance = host.Host(release, str(tmp_path), workers=1, threads=1)
+
+    instance.emit("worker.recycled", "info", "nobody is coming")
+    assert not instance.held_events
+
+
+# Issue 981: with no supervisor connected, a worker that enters routing
+# is reachable at the path the edge has.
+
+
+def listener(path: str) -> socket.socket:
+    """A Unix socket listening at a path, as a worker's is."""
+
+    listening = socket.socket(socket.AF_UNIX)
+    listening.bind(path)
+    listening.listen(4)
+    listening.setblocking(False)
+    return listening
+
+
+def reached(path: str, listening: socket.socket) -> bool:
+    """Say whether a connection to the path arrives at this listener."""
+
+    client = socket.socket(socket.AF_UNIX)
+
+    try:
+        client.connect(path)
+    except OSError:
+        return False
+    finally:
+        client.close()
+
+    try:
+        accepted, _ = listening.accept()
+    except BlockingIOError:
+        return False
+
+    accepted.close()
+    return True
+
+
+def acknowledge(instance: host.Host, supervisor: socket.socket) -> None:
+    """Have the supervisor acknowledge the host's latest announcement."""
+
+    assert instance.supervisor is not None
+    instance.supervisor.setblocking(False)
+    supervisor.sendall(
+        json.dumps({"type": "applied", "version": instance.version}).encode() + b"\n"
+    )
+    instance.read_supervisor()
+
+
+def test_a_worker_that_enters_routing_with_no_supervisor_takes_the_path_the_edge_has() -> None:
+    # A directory of its own with a short name: a Unix socket's path is
+    # limited to about a hundred characters.
+
+    with tempfile.TemporaryDirectory(prefix="muru-", dir="/tmp") as directory:
+        instance = unsupervised_host(Path(directory))
+        first = os.path.join(directory, "worker-0.sock")
+        second = os.path.join(directory, "worker-0-g1.sock")
+        old = listener(first)
+        instance.routed[0] = first
+
+        # The supervisor acknowledges the first socket, so the edge has it.
+
+        supervisor = connect(instance)
+        instance.send_workers()
+        acknowledge(instance, supervisor)
+        assert instance.edge_routes == {0: first}
+        assert not instance.edge_reaches(0)
+
+        # It goes away, and a replacement becomes ready on a socket of
+        # its own, which nobody can tell the edge of: the edge's path
+        # reaches the new worker, and the old one's socket stays open.
+
+        supervisor.close()
+        instance.drop_supervisor()
+        new = listener(second)
+        instance.routed[0] = second
+        instance.alias_routes()
+        assert reached(first, new) and not reached(first, old)
+        assert reached(second, new)
+        assert instance.edge_reaches(0)
+        assert sorted(os.listdir(directory)) == ["worker-0-g1.sock", "worker-0.sock"]
+
+        # A worker that crashed is started again on the path it had,
+        # which is a new socket: the edge's path follows it.
+
+        new.close()
+        os.unlink(second)
+        again = listener(second)
+        assert not reached(first, again)
+        instance.alias_routes()
+        assert reached(first, again)
+
+        # The next supervisor is told the socket's own path, and the
+        # second name goes once it has acknowledged it.
+
+        later = connect(instance)
+        instance.version += 1
+        instance.send_workers()
+        assert received(later)[-1]["sockets"] == [second]
+        assert os.path.exists(first)
+        acknowledge(instance, later)
+        assert instance.edge_routes == {0: second}
+        assert not instance.aliases
+        assert os.listdir(directory) == ["worker-0-g1.sock"]
+
+        for held in (old, again, later):
+            held.close()
+
+        instance.drop_supervisor()
+
+
+def test_an_announcement_never_acknowledged_is_not_what_the_edge_has(tmp_path: Path) -> None:
+    instance = unsupervised_host(tmp_path)
+    instance.routed[0] = "worker-0.sock"
+    supervisor = connect(instance)
+    instance.send_workers()
+    acknowledge(instance, supervisor)
+
+    # The supervisor goes before it acknowledges the next announcement,
+    # so the edge is taken to have the sockets of the last it did.
+
+    instance.routed[0] = "worker-0-g1.sock"
+    instance.announce()
+    assert instance.announcements == {1: {0: "worker-0-g1.sock"}}
+    supervisor.close()
+    instance.drop_supervisor()
+    assert instance.edge_routes == {0: "worker-0.sock"}
+    assert not instance.announcements
+
+
+# Issue 987: a worker's socket file goes when the worker has.
+
+
+def test_a_replaced_workers_socket_file_is_removed_once_it_has_exited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, states, _sent, forks = swapping_host(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)
+
+    for name in ("w0.sock", "w1.sock", "w0-g1.sock"):
+        Path(name).touch()
+
+    # The old worker's file stays while it finishes what it holds, and
+    # goes when it is reaped; the others are untouched.
+
+    instance.swap(states[0], "served 10 requests", "worker.recycled", "max_requests")
+    ready(instance, forks[0][1])
+    assert sorted(os.listdir()) == ["w0-g1.sock", "w0.sock", "w1.sock"]
+    exits(monkeypatch, (states[0].pid, 0))
+    instance.reap()
+    assert sorted(os.listdir()) == ["w0-g1.sock", "w1.sock"]
+
+    # A path that is the second name of another worker's socket, which
+    # the edge connects to with no supervisor, is left.
+
+    instance.aliases[1] = ("w1.sock", "w1-g1.sock")
+    exits(monkeypatch, (states[1].pid, 0))
+    instance.reap()
+    assert sorted(os.listdir()) == ["w0-g1.sock", "w1.sock"]
+
+
+# Issue 983: a supervisor that connects is told where a restart stands,
+# and one that does not answer is treated as one that is not there.
+
+
+def test_a_supervisor_that_connects_is_told_no_restart_is_under_way() -> None:
+    with tempfile.TemporaryDirectory(prefix="muru-", dir="/tmp") as directory:
+        instance = unsupervised_host(Path(directory))
+        instance.control_listener = listener(os.path.join(directory, "control.sock"))
+        supervisor = socket.socket(socket.AF_UNIX)
+        supervisor.connect(os.path.join(directory, "control.sock"))
+        instance.accept_supervisor()
+        assert [message["type"] for message in received(supervisor)] == ["workers", "restart"]
+
+        # A second connection takes the first one's place, and is told
+        # the same: the first may have been left believing in a restart
+        # that has finished since.
+
+        again = socket.socket(socket.AF_UNIX)
+        again.connect(os.path.join(directory, "control.sock"))
+        instance.accept_supervisor()
+        assert received(again)[1] == {
+            "type": "restart",
+            "total": 0,
+            "left": 0,
+            "started_unix_ms": 0,
+            "group": "",
+        }
+        assert supervisor.recv(1) == b""
+
+        for held in (supervisor, again, instance.control_listener):
+            held.close()
+
+        instance.drop_supervisor()
+
+
+def test_a_replacement_nobody_acknowledges_takes_the_path_the_edge_has(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="muru-", dir="/tmp") as directory:
+        instance = unsupervised_host(Path(directory))
+        first = os.path.join(directory, "worker-0.sock")
+        second = os.path.join(directory, "worker-0-g1.sock")
+        old = listener(first)
+        instance.routed[0] = first
+        supervisor = connect(instance)
+        instance.send_workers()
+        acknowledge(instance, supervisor)
+
+        # The supervisor stays connected and says nothing of the next
+        # announcement: when its time is up the old worker is told to
+        # stop, and the edge's path reaches the new one first.
+
+        monkeypatch.setattr(os, "kill", lambda _pid, _signal: None)
+        new = listener(second)
+        instance.routed[0] = second
+        replacement = host.Replacement(0, 4000, "served 10 requests", "worker.recycled")
+        replacement.announced = instance.announce()
+        replacement.announced_at = time.monotonic()
+        instance.advance(replacement, time.monotonic())
+        assert replacement.terminate_at is None and not reached(first, new)
+
+        instance.advance(replacement, time.monotonic() + host.ACK_TIMEOUT_SECONDS)
+        assert replacement.terminate_at is not None
+        assert reached(first, new) and reached(second, new)
+
+        # An acknowledgement that comes after all takes the second name
+        # away: the edge has the socket's own.
+
+        acknowledge(instance, supervisor)
+        assert os.listdir(directory) == ["worker-0-g1.sock"]
+
+        for held in (old, new, supervisor):
+            held.close()
+
+        instance.drop_supervisor()

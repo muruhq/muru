@@ -9,7 +9,7 @@
 //! previous release, drains and events. Re-adoption of hosts across daemon
 //! restarts, retention of drained releases and the rest of phase 2 follow.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,13 +21,13 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::edges::{EdgeProcess, EdgeSpec};
 use crate::events::Events;
-use crate::host::{HostControl, HostMessage, WorkerReply};
+use crate::host::{ControlEvent, HostControl, HostMessage, WorkerReply};
 use crate::host::{HostProcess, HostSpec};
-use crate::locations::Locations;
+use crate::locations::{HostDirs, Locations};
 use crate::logs::Logs;
 use crate::model::{
-    AccessLogSpec, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates, RolloutState,
-    RolloutStep, now_unix_ms, valid_name,
+    AccessLogSpec, GroupSpec, Release, ReleaseSpec, ReleaseState, Rollout, RolloutGates,
+    RolloutState, RolloutStep, SharedCapacity, now_unix_ms, valid_name,
 };
 use crate::rollouts::{Counters, Verdict, judge};
 use crate::scaling::{Decision, ScaleStatus};
@@ -36,6 +36,7 @@ use crate::servers::{Servers, ServersRecord};
 use crate::store::Store;
 
 mod detouring;
+mod previewing;
 
 /// How long a release may take from its host starting to every worker
 /// listening (section 9.1 startup timeout, provisional).
@@ -238,17 +239,152 @@ pub struct Config {
     /// The executable to spawn edges from, normally the daemon's own.
     pub executable: PathBuf,
     /// The arguments to re-execute the daemon with on an upgrade (section
-    /// 13.4): its own, with the flag that names the version it ran before.
-    pub upgrade_arguments: Vec<std::ffi::OsString>,
+    /// 13.4) or a restart: its own, without the flags that say it
+    /// re-executed, which are added then.
+    pub reexec_arguments: Vec<std::ffi::OsString>,
     /// The version this daemon ran before it re-executed itself for an
     /// upgrade, or none when it started afresh.
     pub upgraded_from: Option<String>,
+    /// Whether this daemon re-executed itself for a restart (issue 940).
+    pub restarted: bool,
     /// How often the log files are checked for a rename, when
     /// `reopen_on_rename` is on: `RENAME_CHECK` but in tests.
     pub rename_check: Duration,
     /// The locks on the state and run directories, taken before anything
     /// else and held for the life of the process (issue 804).
     pub ownership: crate::ownership::Ownership,
+    /// The files to apply once the daemon is up (`--apply`, ADR 0081), or
+    /// none.
+    pub start_apply: Option<StartApply>,
+}
+
+/// The files a start applies (section 13.13): what `muructl apply -f`
+/// would send for them, read before the daemon starts.
+#[derive(Debug, Clone)]
+pub struct StartApply {
+    /// The paths, as the messages name them.
+    pub paths: String,
+    /// The files, a deployment to a document, or why they could not be
+    /// read.
+    pub documents: Result<Vec<String>, String>,
+    /// How far the apply's removals reach.
+    pub prune: crate::deployments::Prune,
+}
+
+/// An error on one line, for an event and a log line: a TOML parse
+/// error's excerpt of the file, with its line numbers and its caret, is
+/// left out, and what it says before and after is kept.
+fn on_one_line(error: &str) -> String {
+    error
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            let excerpt = line.starts_with('|')
+                || line.starts_with('^')
+                || line
+                    .split_once(" |")
+                    .is_some_and(|(number, _)| number.chars().all(|c| c.is_ascii_digit()));
+            !line.is_empty() && !excerpt
+        })
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+impl StartApply {
+    /// What the apply will do, planned against the store before anything
+    /// is restored, as the pending event says it; and whether it can be
+    /// applied at all.
+    fn pending(
+        &self,
+        store: &Store,
+        defined: &crate::config::Defined,
+        provisioning: &crate::provision::Provisioning,
+    ) -> (bool, String) {
+        let declared = match self
+            .documents
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|texts| {
+                let parsed = texts
+                    .iter()
+                    .map(|text| muru_config::Document::parse(text))
+                    .collect::<Result<Vec<_>, _>>()?;
+                crate::deployments::fold(parsed)
+            }) {
+            Ok(declared) => declared,
+            Err(error) => return (false, format!("cannot be applied: {}", on_one_line(&error))),
+        };
+
+        let plan = crate::config::plan_declared(
+            store,
+            &declared,
+            self.prune,
+            false,
+            defined,
+            provisioning,
+        );
+
+        if !plan.errors.is_empty() {
+            return (
+                false,
+                format!("cannot be applied: {}", plan.errors.join("; ")),
+            );
+        }
+
+        if plan.changes.is_empty() {
+            return (true, "nothing to change".to_owned());
+        }
+
+        let changes: Vec<String> = plan
+            .changes
+            .iter()
+            .map(|change| format!("{} {}", change.action.name(), change.subject()))
+            .collect();
+        (true, changes.join(", "))
+    }
+
+    /// Apply the files to the daemon at `socket`, as `muructl apply`
+    /// does, and say what came of it: the summary of a success, or the
+    /// report of a failure.
+    async fn run(self, socket: PathBuf) -> Result<String, String> {
+        let documents = self.documents.map_err(|error| on_one_line(&error))?;
+        let mut client = crate::client::connect(&crate::client::Endpoint::unix(&socket))
+            .await
+            .map_err(|error| error.to_string())?;
+        let report = client
+            .apply_config(muru_proto::admin::v1::ApplyConfigRequest {
+                documents,
+                prune: self.prune.any(),
+                prune_all: self.prune == crate::deployments::Prune::All,
+                ..muru_proto::admin::v1::ApplyConfigRequest::default()
+            })
+            .await
+            .map_err(|status| status.message().to_owned())?
+            .into_inner();
+
+        let failed: Vec<String> = report
+            .changes
+            .iter()
+            .filter(|change| change.outcome.starts_with("failed"))
+            .map(|change| format!("{} {}", change.subject, change.outcome))
+            .collect();
+        let mut errors = report.errors.clone();
+        errors.extend(failed);
+
+        if !report.snapshot_error.is_empty() {
+            errors.push(report.snapshot_error.clone());
+        }
+
+        if !errors.is_empty() {
+            return Err(format!("nothing applied: {}", errors.join("; ")));
+        }
+
+        Ok(if report.changes.is_empty() {
+            "nothing to change".to_owned()
+        } else {
+            format!("{} changes applied", report.changes.len())
+        })
+    }
 }
 
 /// How often the daemon checks whether a log file was renamed away
@@ -269,6 +405,23 @@ pub struct CertificateChanges {
     pub refused: Option<String>,
 }
 
+/// What a reload did (section 13.3).
+#[derive(Debug, Clone)]
+pub struct Reloaded {
+    /// The report, as one sentence.
+    pub message: String,
+    /// The settings read at start that differ from what the daemon
+    /// started with, which a restart applies (issue 940).
+    pub stale: Vec<String>,
+}
+
+/// The flag a daemon re-executes itself with for an upgrade, followed by
+/// the version it ran before.
+pub const UPGRADED_FROM_FLAG: &str = "--upgraded-from";
+
+/// The flag a daemon re-executes itself with for a restart.
+pub const RESTARTED_FLAG: &str = "--restarted";
+
 /// An upgrade the daemon is about to carry out (section 13.4).
 #[derive(Debug, Clone)]
 pub struct Upgrade {
@@ -276,6 +429,9 @@ pub struct Upgrade {
     pub executable: PathBuf,
     /// The version that binary reports.
     pub version: String,
+    /// Whether this is a restart (issue 940): the same version again,
+    /// with the edge left as it is.
+    pub restart: bool,
 }
 
 /// What to do with an active rollout (section 9.3).
@@ -308,6 +464,17 @@ struct RolloutRun {
 /// Section 7.3: the shortest time the workers' signals are measured
 /// over.
 const SIGNAL_WINDOW: Duration = Duration::from_secs(4);
+
+/// Section 9.16: how long a rollout that shares capacity waits for the
+/// workers its baseline gave up, when the baseline's own stop budget
+/// cannot be read, and how long past that budget it allows for the host
+/// to kill and reap them.
+const DRAIN_WAIT: Duration = Duration::from_secs(60);
+const DRAIN_MARGIN: Duration = Duration::from_secs(5);
+
+/// Section 7.9: how often a host is told its surge allowances again when
+/// they have not changed, in case a message was lost with a connection.
+const SURGE_RETELL: Duration = Duration::from_secs(30);
 
 /// How long `muructl logs reopen` waits for the edge and the relays to say
 /// they have reopened their files before it answers anyway.
@@ -386,6 +553,9 @@ pub enum Command {
         gates: RolloutGates,
         /// Whether each step after the first waits for approval.
         approve_each_step: bool,
+        /// Whether the two releases share the baseline's worker count
+        /// (section 9.16).
+        shared: bool,
         /// Where the outcome goes.
         done: oneshot::Sender<Result<Rollout, String>>,
     },
@@ -541,7 +711,7 @@ pub enum Command {
     /// (section 13.3).
     Reload {
         /// Answered with what was reloaded, or why it was refused.
-        done: oneshot::Sender<Result<String, String>>,
+        done: oneshot::Sender<Result<Reloaded, String>>,
     },
     /// Reopen every log file after an external rotation (section 11.3):
     /// the daemon's own, the edge's access log and each host's, and with
@@ -590,6 +760,13 @@ pub enum Command {
         /// re-executes, or why it will not.
         done: oneshot::Sender<Result<Upgrade, String>>,
     },
+    /// Re-execute the daemon from the binary it runs, so that it reads
+    /// its configuration file afresh (issue 940).
+    Restart {
+        /// Answered with what is about to happen, before the daemon
+        /// re-executes, or why it will not.
+        done: oneshot::Sender<Result<Upgrade, String>>,
+    },
     /// A host's control connection is up (section 5.9).
     HostAttached {
         /// The application.
@@ -598,6 +775,19 @@ pub enum Command {
         id: String,
         /// The connection, for acknowledgements.
         control: HostControl,
+    },
+    /// A host's control connection ended (issue 983). Answered with
+    /// whether the release still runs under that host, in which case
+    /// the connection is made again.
+    HostDetached {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// The pid of the host the connection was to.
+        pid: Option<u32>,
+        /// Whether to connect again.
+        again: oneshot::Sender<bool>,
     },
     /// A host said something over its control connection.
     HostMessage {
@@ -750,12 +940,12 @@ pub enum Command {
         /// Answered with the detour as it is now, or why not.
         done: oneshot::Sender<Result<muru_proto::admin::v1::Detour, String>>,
     },
-    /// Section 4.21: mint entry links to a detour's preview.
-    PreviewDetour {
-        /// Which detour, and which of its application's addresses.
-        request: muru_proto::admin::v1::PreviewDetourRequest,
+    /// Section 4.22: mint entry links to a release's preview.
+    PreviewRelease {
+        /// Which release, and which of its application's addresses.
+        request: muru_proto::admin::v1::PreviewReleaseRequest,
         /// Answered with the links, or why not.
-        done: oneshot::Sender<Result<muru_proto::admin::v1::DetourPreview, String>>,
+        done: oneshot::Sender<Result<muru_proto::admin::v1::ReleasePreview, String>>,
     },
     /// Section 9.13: a detour's stream ended, from its run's side or the
     /// daemon's.
@@ -960,6 +1150,8 @@ pub struct Info {
     pub started_unix_ms: u64,
     /// The edge process's pid, for status.
     pub edge_pid: std::sync::atomic::AtomicU32,
+    /// The version of the snapshot the edge was last given.
+    pub snapshot_version: Arc<std::sync::atomic::AtomicU64>,
     /// Where the Prometheus exposition is served, or nowhere.
     pub metrics: Option<SocketAddr>,
     /// Where the dashboard is served, or nowhere.
@@ -1018,6 +1210,8 @@ pub struct Info {
     pub instance_id: crate::registry::InstanceId,
     /// Section 9.13: the open detours, as the daemon last published them.
     pub detours: std::sync::Mutex<Vec<muru_proto::admin::v1::Detour>>,
+    /// The flags the daemon was started with that stand over its file.
+    pub start_flags: Vec<String>,
 }
 
 /// What runs for one release now, for the API.
@@ -1032,6 +1226,24 @@ pub struct LiveRelease {
     /// For a retained release, when it is stopped, in Unix milliseconds;
     /// otherwise 0.
     pub retained_until_unix_ms: u64,
+    /// Each group's surge allowance as last granted (section 7.9).
+    pub surge: BTreeMap<String, crate::budget::Surge>,
+    /// The restart of every worker under way, if one is (section 10.14).
+    pub restart: Option<RestartProgress>,
+}
+
+/// How far a restart of every worker of a release has got (section
+/// 10.14), as its host last said.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestartProgress {
+    /// The workers marked.
+    pub total: u32,
+    /// Those not yet replaced.
+    pub left: u32,
+    /// When it began, in Unix milliseconds.
+    pub started_unix_ms: u64,
+    /// The one group it restarts; every group when empty.
+    pub group: String,
 }
 
 /// What each release's entrypoints run as (section 6.7): the interface
@@ -1186,10 +1398,10 @@ impl Backend {
     }
 
     /// The record a previous daemon reads to take the release over.
-    fn record_path(&self, run_dir: &Path) -> PathBuf {
+    fn record_path(&self, files: &Path) -> PathBuf {
         match self {
-            Self::Host(_) | Self::Dormant => run_dir.join("host.toml"),
-            Self::Servers(_) => run_dir.join("servers.toml"),
+            Self::Host(_) | Self::Dormant => files.join(HOST_RECORD),
+            Self::Servers(_) => files.join(SERVERS_RECORD),
         }
     }
 
@@ -1277,6 +1489,17 @@ struct Running {
     /// The workers the host is replacing for memory, for the memory
     /// guard (section 13.9).
     memory_replacements: Vec<crate::host::MemoryReplacement>,
+    /// The voluntary swaps waiting their turn in the host, by group
+    /// (section 7.8).
+    swaps_waiting: BTreeMap<String, u32>,
+    /// Section 7.9: each group's surge allowance as last granted, and
+    /// what the host was last told and when, so that it is told again
+    /// when they change and now and then besides.
+    surge: BTreeMap<String, crate::budget::Surge>,
+    surge_told: Option<(Instant, BTreeMap<String, crate::budget::Surge>)>,
+    /// Section 10.14: the restart of every worker its host has under
+    /// way, as the host last said how far it had got.
+    restart: Option<RestartProgress>,
     /// Section 11.1: workers the host replaced, by group and reason, and
     /// workers that exited, likewise, since the release started.
     recycles: BTreeMap<(String, String), u64>,
@@ -1369,7 +1592,14 @@ impl Running {
     /// each group at the larger of the workers it has and the count its
     /// autoscaler is bringing it to, at what a worker costs, and the
     /// host's own memory; a managed server's instances count as workers.
+    /// A group's surge allowance counts as workers held (section 7.9).
     fn usage(&self, fallback: Option<u64>) -> crate::budget::Usage {
+        self.usage_with(fallback, true)
+    }
+
+    /// What the release holds, with or without its surge allowances,
+    /// which are granted over what the node holds without any.
+    fn usage_with(&self, fallback: Option<u64>, surge: bool) -> crate::budget::Usage {
         let mut usage = crate::budget::Usage::default();
 
         if matches!(self.backend, Backend::Servers(_)) {
@@ -1384,7 +1614,18 @@ impl Running {
                 count = count.max(group.scaler.desired());
             }
 
-            usage.add(count, self.worker_cost(group, fallback));
+            let cost = self.worker_cost(group, fallback);
+            usage.add(count, cost);
+
+            // Section 7.9: the room held for the group's swaps.
+
+            if surge {
+                let allowance = self
+                    .surge
+                    .get(&group.name)
+                    .map_or(0, |surge| surge.allowance);
+                usage.add_surge(allowance, cost);
+            }
         }
 
         usage.memory += self.host_pss.unwrap_or(0);
@@ -1426,7 +1667,7 @@ struct StartPrep {
     release: Release,
     env: Vec<(String, String)>,
     identity: Option<crate::host::Identity>,
-    run_dir: PathBuf,
+    dirs: HostDirs,
     started: Instant,
     /// Once built: the runtime library the host was started with.
     library: Option<muru_provision::Provided>,
@@ -1451,10 +1692,9 @@ struct Starting {
 struct Stop {
     /// When the stop's task gives up waiting for the processes.
     until: Instant,
-    /// The release's run directory and the record in it, removed once it
-    /// has stopped.
-    run_dir: PathBuf,
-    record: PathBuf,
+    /// The directories of the release's host, removed once it has
+    /// stopped.
+    dirs: HostDirs,
     /// What follows the stop, carried out when it has ended.
     waiters: Vec<AfterStop>,
 }
@@ -1491,6 +1731,7 @@ enum AfterStart {
         steps: Vec<RolloutStep>,
         gates: RolloutGates,
         approve_each_step: bool,
+        shared: bool,
         done: oneshot::Sender<Result<Rollout, String>>,
     },
     /// A promotion: its before_promote gates, then the switch.
@@ -1951,6 +2192,9 @@ struct Daemon {
     /// again has none.
     detours_enabled: bool,
     detours: BTreeMap<(String, String), crate::detours::Detour>,
+    /// Section 4.22: the releases the edge was last told to route to,
+    /// which are the ones that can be previewed.
+    routed: BTreeSet<(String, String)>,
     detour_serial: u64,
     /// When the detours' runs were last checked in the registry.
     detours_checked: Instant,
@@ -1975,6 +2219,9 @@ struct Daemon {
     access_overrides: Vec<muru_edge::access::Override>,
     /// The command line's settings, laid over the file on every reload.
     overrides: crate::settings::Overrides,
+    /// The settings read only at start, as this daemon started with
+    /// them, which a reload compares the file's with.
+    read_at_start: Vec<(&'static str, String)>,
     /// The event sinks delivering (section 11.5), reconciled on reload.
     sinks: crate::sinks::Sinks,
     /// Section 4.2: each TLS host's last good certificate chain and key
@@ -2004,6 +2251,11 @@ struct Daemon {
     probe_failures: ProbeFailures,
     /// When each application's rollout probes were last sent.
     probed: HashMap<String, Instant>,
+    /// Section 9.16: the workers a rollout's baseline gave up that a
+    /// step waits to see exit, by application and group: the count of
+    /// workers scaled in at which they have all gone, and when the wait
+    /// is over whatever has.
+    shared_drains: HashMap<(String, String), (u64, Instant)>,
     /// The client probes are sent with.
     probe_client: crate::rollouts::ProbeClient,
     /// The release each application's traffic goes to, as the edge has
@@ -2048,6 +2300,15 @@ struct Daemon {
     booted: bool,
 }
 
+/// The listeners as a start says them: each as a URL, joined with `and`.
+fn serving_on_text(listeners: &[(SocketAddr, bool)]) -> String {
+    listeners
+        .iter()
+        .map(|(address, tls)| format!("{}://{address}", if *tls { "https" } else { "http" }))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 /// Run the daemon until it is told to stop: bind the edge, serve the admin
 /// API, start the releases that were serving, then reconcile commands as
 /// they arrive.
@@ -2056,6 +2317,25 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .locations
         .check_run_dir()
         .map_err(|error| anyhow::anyhow!(error))?;
+
+    // Section 13.8 (issue 948): an edge and hosts recorded in the run
+    // directory are an earlier version's, which this one cannot take
+    // over. Starting beside them would leave them running unseen and
+    // fail on the listener they hold, so the start says what to do.
+
+    let run = &config.locations.run.path;
+
+    if crate::locations::earlier_daemon_left(run) {
+        anyhow::bail!(
+            "the run directory {} holds the records of an edge or releases that an earlier \
+             version of Muru started, and this version keeps those records in the state \
+             directory, so it cannot take them over; start the daemon with the version that \
+             started them and stop it with muructl daemon stop --shutdown, or stop its \
+             processes (muructl instance list --orphans lists them) and remove edge.toml and \
+             apps from the directory",
+            run.display()
+        );
+    }
 
     // Section 9.13: a system daemon's edge serves real traffic, which a
     // detour would send to a process owned by whoever opened it.
@@ -2081,9 +2361,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let sinks = std::mem::take(&mut settings.sinks);
     let locations = config.locations;
 
-    for location in [&locations.state, &locations.run, &locations.logs] {
-        std::fs::create_dir_all(&location.path)
-            .with_context(|| format!("creating {}", location.path.display()))?;
+    for path in [
+        locations.state.path.clone(),
+        locations.run.path.clone(),
+        locations.logs.path.clone(),
+        locations.files(),
+    ] {
+        std::fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
     }
 
     // Section 13.8: the daemon registers in the instance registry, under
@@ -2157,7 +2441,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     prepare_spool(&spool, service)
         .with_context(|| format!("preparing the upload spool {}", spool.display()))?;
 
-    let adopted = match read_record::<EdgeRecord>(&locations.run.path.join("edge.toml")) {
+    let buckets = locations.edge_files().join(crate::edges::BUCKETS_FILE);
+
+    let adopted = match read_record::<EdgeRecord>(&locations.edge_record()) {
         Some(record) => EdgeProcess::adopt(
             record.pid,
             config.executable.clone(),
@@ -2172,6 +2458,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             edge_log.clone(),
             config.access_log.clone(),
             spool.clone(),
+            buckets.clone(),
             service,
             locations.scope(),
         )
@@ -2182,6 +2469,47 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     };
 
     let booted = adopted.is_none();
+    let wanted_listeners = settings.listeners.clone();
+    let read_at_start = settings.at_start();
+    let provisioning =
+        crate::provision::Provisioning::for_daemon(&settings.tools, &locations.state.path);
+    let defined = crate::config::Defined {
+        budget: crate::budget::View {
+            budget: settings.budget,
+            ..crate::budget::View::default()
+        },
+        conditions: settings.conditions.clone(),
+        ..client_rules.defined()
+    };
+
+    // Issue 945: files that cannot be applied are known before anything
+    // is started. With no edge left running and nothing in the store
+    // serving there is nothing to restore first, so the start fails here,
+    // before a listener is bound: an edge with nothing behind it would
+    // only hold the address and answer errors.
+
+    if let Some(apply) = config
+        .start_apply
+        .as_ref()
+        .filter(|_| booted && config.upgraded_from.is_none() && !config.restarted)
+        && !store.apps()?.iter().any(|app| app.current.is_some())
+        && let (false, what) = apply.pending(&store, &defined, &provisioning)
+    {
+        events.emit(
+            "config.apply_pending",
+            "config",
+            "error",
+            &format!("start apply of {}: {what}", apply.paths),
+        );
+        let message = format!(
+            "start apply of {} failed: {}; the daemon exits, and nothing was serving, so its \
+             edge is not started",
+            apply.paths,
+            what.strip_prefix("cannot be applied: ").unwrap_or(&what)
+        );
+        events.emit("daemon.start_failed", "daemon", "error", &message);
+        anyhow::bail!(message);
+    }
 
     let edge = match adopted {
         Some(edge) => {
@@ -2200,7 +2528,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             }
 
             let (control, listener_socket) =
-                crate::edges::socket_paths(&crate::edges::directory(&locations.run.path), 1);
+                crate::edges::socket_paths(&locations.edge_sockets(), 1);
             EdgeProcess::spawn(EdgeSpec {
                 executable: config.executable.clone(),
                 listeners,
@@ -2210,6 +2538,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 log: edge_log,
                 access_log: config.access_log,
                 spool,
+                buckets,
                 identity: service,
                 scope: locations.scope(),
             })
@@ -2221,10 +2550,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Section 8.4: uv as found and how it is run, said once at start.
 
-    let provisioning =
-        crate::provision::Provisioning::for_daemon(&settings.tools, &locations.state.path);
     tracing::info!("{}", provisioning.describe_uv());
-    write_edge_record(&locations.run.path, &edge);
+    write_edge_record(&locations, &edge);
 
     if let Some(entry) = &registered {
         entry.update(|record| {
@@ -2248,17 +2575,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         limits: std::sync::RwLock::new(settings.limits.clone()),
         started_unix_ms: crate::model::now_unix_ms(),
         edge_pid: std::sync::atomic::AtomicU32::new(edge.pid().unwrap_or(0)),
+        snapshot_version: edge.sent_version(),
         metrics,
         dashboard,
         dashboard_sessions: dashboard_sessions.clone(),
-        defined: std::sync::RwLock::new(crate::config::Defined {
-            budget: crate::budget::View {
-                budget: settings.budget,
-                ..crate::budget::View::default()
-            },
-            conditions: settings.conditions.clone(),
-            ..client_rules.defined()
-        }),
+        defined: std::sync::RwLock::new(defined),
         python_logging: std::sync::RwLock::new(settings.python_logging.clone()),
         interfaces: Interfaces::default(),
         websockets: std::sync::Mutex::new(HashMap::new()),
@@ -2276,12 +2597,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         cgroup_limits: std::sync::Mutex::new(None),
         instance_id,
         detours: std::sync::Mutex::new(Vec::new()),
+        start_flags: config.overrides.flags(),
     });
     let underway = crate::commands::Underway::default();
     let runs = crate::runs::Runs::new(
         Arc::clone(&store),
         events.clone(),
         locations.logs.path.clone(),
+        locations.run.path.join(COMMANDS_DIR),
         settings.keep_command_runs,
     );
     let handle = Handle {
@@ -2384,11 +2707,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     };
 
     let mut api = tokio::spawn(api);
-    let serving_on = listeners
-        .iter()
-        .map(|(address, tls)| format!("{}://{address}", if *tls { "https" } else { "http" }))
-        .collect::<Vec<_>>()
-        .join(" and ");
+    let serving_on = serving_on_text(&listeners);
 
     match &config.upgraded_from {
         Some(before) => events.emit(
@@ -2398,6 +2717,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             &format!(
                 "re-executed as version {} (was {before}) from {}, pid {}; serving on {serving_on}",
                 env!("CARGO_PKG_VERSION"),
+                config.executable.display(),
+                std::process::id()
+            ),
+        ),
+        None if config.restarted => events.emit(
+            "daemon.restarted",
+            "daemon",
+            "info",
+            &format!(
+                "re-executed from {}, pid {}; serving on {serving_on}",
                 config.executable.display(),
                 std::process::id()
             ),
@@ -2458,6 +2787,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         debug_exec: settings.debug_exec,
         detours_enabled: settings.detours,
         detours: BTreeMap::new(),
+        routed: BTreeSet::new(),
         detour_serial: 0,
         detours_checked: Instant::now(),
         runs: runs.clone(),
@@ -2469,6 +2799,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         access_log: settings.access_log.clone(),
         access_overrides: Vec::new(),
         overrides: config.overrides,
+        read_at_start,
         sinks,
         certificates: HashMap::new(),
         budget_table: settings.budget,
@@ -2480,6 +2811,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         worker_faults: HashMap::new(),
         probe_failures: Arc::default(),
         probed: HashMap::new(),
+        shared_drains: HashMap::new(),
         probe_client: crate::rollouts::probe_client(),
         serving: HashMap::new(),
         no_host: BTreeSet::new(),
@@ -2513,6 +2845,40 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }
     }
 
+    // ADR 0081: the files a start applies are planned against the store
+    // before anything is restored, and what is pending is said first, so
+    // the log shows why a release starts only to be replaced, or that the
+    // files cannot be applied and the daemon will exit once what the
+    // store holds is back.
+
+    let start_apply = config
+        .start_apply
+        .filter(|_| config.upgraded_from.is_none() && !config.restarted);
+
+    if let Some(apply) = &start_apply {
+        let defined = daemon
+            .info
+            .defined
+            .read()
+            .expect("defined names poisoned")
+            .clone();
+        let (possible, what) = apply.pending(&daemon.store, &defined, &daemon.info.provisioning);
+        daemon.events.emit(
+            "config.apply_pending",
+            "config",
+            if possible { "notice" } else { "error" },
+            &format!(
+                "start apply of {}: {what}; {}",
+                apply.paths,
+                if possible {
+                    "applied once what the store holds is restored"
+                } else {
+                    "what the store holds is restored before the daemon exits"
+                }
+            ),
+        );
+    }
+
     daemon.restore().await;
     daemon.reconcile_traffic().await;
     daemon.run_at_boot().await;
@@ -2524,13 +2890,37 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tracing::warn!(%error, "pushing the first snapshot failed");
     }
 
+    // Issue 930: a start and a reload read the file the same way. An
+    // edge re-adopted after a detach has the listeners it was started
+    // with, so a file that now names others takes a new edge, as a reload
+    // gives it, where the old listeners served until the next reload.
+
+    let relisten = if daemon.booted {
+        None
+    } else {
+        daemon
+            .bind_listeners(&wanted_listeners)
+            .map_err(anyhow::Error::msg)?
+    };
+
     // Section 13.4: an upgraded daemon replaces the edge with one from
     // its own image once the hosts are re-adopted and the snapshot is
     // whole again.
 
-    if config.upgraded_from.is_some() {
-        let _ = daemon.replace_edge(None, "the same listeners").await;
+    match relisten {
+        Some((listeners, what)) => {
+            daemon
+                .replace_edge(Some(listeners), &what)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
+        None if config.upgraded_from.is_some() => {
+            let _ = daemon.replace_edge(None, "the same listeners").await;
+        }
+        None => {}
     }
+
+    let serving_on = serving_on_text(&daemon.edge.listeners());
 
     // Section 7.4: the edge says when a request waits for a group with
     // no workers.
@@ -2538,11 +2928,32 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let (wake_sender, mut wakes) = mpsc::channel(64);
     daemon.edge.watch_wakes(wake_sender);
 
-    crate::notify::ready(&format!("serving on {serving_on}"));
-    daemon
-        .info
-        .started
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    // ADR 0081: readiness waits for the files a start applies. They are
+    // applied through the daemon's own admin API once the loop below is
+    // carrying out commands, as muructl apply would apply them.
+
+    let (applied_tx, mut applied) = oneshot::channel::<Result<String, String>>();
+    let mut applying = start_apply.is_some();
+    let apply_paths = start_apply
+        .as_ref()
+        .map(|apply| apply.paths.clone())
+        .unwrap_or_default();
+
+    match start_apply {
+        Some(apply) => {
+            let socket = daemon.locations.admin_socket();
+            tokio::spawn(async move {
+                let _ = applied_tx.send(apply.run(socket).await);
+            });
+        }
+        None => {
+            crate::notify::ready(&format!("serving on {serving_on}"));
+            daemon
+                .info
+                .started
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 
     // Commands are carried out one at a time; a host dying in between is
     // noticed by the next pass. SIGTERM and SIGINT detach, as a service
@@ -2605,11 +3016,63 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         let _ = done.send(Err(error));
                     }
                 },
+                Some(Command::Restart { done }) => match daemon.prepare_restart().await {
+                    Ok(restart) => {
+                        let _ = done.send(Ok(restart.clone()));
+                        upgrade_to = Some(restart);
+                        drain_on_exit = false;
+                        break Ok(());
+                    }
+                    Err(error) => {
+                        let _ = done.send(Err(error));
+                    }
+                },
                 Some(command) => daemon.carry_out(command).await,
                 None => break Ok(()),
             },
             Some(wake) = wakes.recv() => {
                 daemon.wake(wake).await;
+            }
+            result = &mut applied, if applying => {
+                applying = false;
+
+                match result.unwrap_or_else(|_| Err("the apply did not finish".to_owned())) {
+                    Ok(what) => {
+                        tracing::info!("start apply of {apply_paths}: {what}");
+                        crate::notify::ready(&format!("serving on {serving_on}"));
+                        daemon
+                            .info
+                            .started
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        // A failed start apply fails the start: the daemon
+                        // exits, leaving what serves detached for the next
+                        // daemon, as muructl daemon stop leaves it. With
+                        // nothing serving there is nothing to leave, and
+                        // an edge left behind would hold the address and
+                        // answer every request with an error, so
+                        // everything stops.
+
+                        let serving = daemon
+                            .store
+                            .apps()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|app| app.current.is_some());
+                        let message = format!(
+                            "start apply of {apply_paths} failed: {error}; the daemon exits, and {}",
+                            if serving {
+                                "what was serving is left serving"
+                            } else {
+                                "nothing was serving, so its edge stops with it"
+                            }
+                        );
+                        daemon.events.emit("daemon.start_failed", "daemon", "error", &message);
+                        drain_on_exit = !serving;
+                        break Err(anyhow::anyhow!(message));
+                    }
+                }
             }
             served = &mut api => {
                 break served.map_err(anyhow::Error::from).and_then(|result| result);
@@ -2639,6 +3102,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 daemon.sample_history(samples.as_deref()).await;
                 daemon.evaluate_conditions(samples.as_deref());
                 daemon.advance_rollouts(samples.as_deref()).await;
+                daemon.grant_surges();
                 daemon.autoscale(samples.as_deref()).await;
                 daemon.guard_memory();
                 daemon.refresh_client_lists().await;
@@ -2669,8 +3133,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // the same way and then re-executes itself, so the next daemon is
     // this process with the installed binary's image.
 
-    if upgrade_to.is_some() {
-        crate::notify::notify("RELOADING=1\nSTATUS=upgrading");
+    if let Some(upgrade) = &upgrade_to {
+        crate::notify::notify(if upgrade.restart {
+            "RELOADING=1\nSTATUS=restarting"
+        } else {
+            "RELOADING=1\nSTATUS=upgrading"
+        });
     } else {
         crate::notify::stopping();
     }
@@ -2835,7 +3303,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // The locks on the directories are kept through the exec, so
         // there is no moment when another daemon could take them.
 
-        let mut arguments = config.upgrade_arguments.clone();
+        let mut arguments = config.reexec_arguments.clone();
+
+        if upgrade.restart {
+            arguments.push(RESTARTED_FLAG.into());
+        } else {
+            arguments.push(UPGRADED_FROM_FLAG.into());
+            arguments.push(env!("CARGO_PKG_VERSION").into());
+        }
+
         let held = config.ownership.keep_across_exec();
 
         if !held.is_empty() {
@@ -2907,6 +3383,7 @@ fn daemon_record(
     record.name = locations.instance_name();
     record.scope = locations.mode_word().to_owned();
     record.state_dir = Some(locations.state.path.clone());
+    record.files_dir = Some(locations.files());
     record.config = Some(locations.config.path.clone());
     record.log_dir = Some(locations.logs.path.clone());
     record.dashboard = dashboard.map(|address| format!("http://{address}/"));
@@ -2996,24 +3473,51 @@ fn remove_pid_file(locations: &Locations) {
 /// record the next daemon would adopt it by, and the rate limits' shared
 /// buckets, with the edges' directory when that leaves it empty.
 fn forget_edge(locations: &Locations) {
-    let run_dir = &locations.run.path;
-    let edges = crate::edges::directory(run_dir);
-    let _ = std::fs::remove_file(run_dir.join("edge.toml"));
-    let _ = std::fs::remove_file(edges.join(crate::edges::BUCKETS_FILE));
-    let _ = std::fs::remove_dir(edges);
+    let files = locations.edge_files();
+    let _ = std::fs::remove_file(locations.edge_record());
+    let _ = std::fs::remove_file(files.join(crate::edges::BUCKETS_FILE));
+    let _ = std::fs::remove_dir(files);
+    let _ = std::fs::remove_dir(locations.edge_sockets());
 }
 
-/// Remove a release's record, its host's secret files and the
-/// directories that leaves empty: the release's own and then its
-/// application's.
-fn forget_release_dir(run_dir: &Path, record: &Path) {
-    let _ = std::fs::remove_file(record);
-    let _ = std::fs::remove_dir_all(run_dir.join("secrets"));
+/// The record of a release's host among its files, which the next
+/// daemon re-adopts it from.
+pub const HOST_RECORD: &str = "host.toml";
 
-    if std::fs::remove_dir(run_dir).is_ok()
-        && let Some(app_dir) = run_dir.parent()
-    {
-        let _ = std::fs::remove_dir(app_dir);
+/// The record of a managed server release's instances, as the host's.
+pub const SERVERS_RECORD: &str = "servers.toml";
+
+/// The directory of a host's secrets delivered as files, among its files.
+const SECRETS_DIR: &str = "secrets";
+
+/// The directories, in the runtime location and in the runtime files,
+/// that hold one directory per detached command run.
+pub const COMMANDS_DIR: &str = "c";
+
+/// Remove what a stopped release's host kept: its sockets, its record,
+/// its secret files and whatever else is in its two directories.
+fn forget_release_dir(dirs: &HostDirs) {
+    dirs.remove();
+}
+
+/// Section 13.8 (issue 948): the runtime files outlive what the runtime
+/// location holds, since a reboot empties the one and not the other. Once
+/// the releases still running have been taken over, a host's files with
+/// no host behind them are stale and are removed, with the sockets of the
+/// same number. `kept` are the numbers of the releases this daemon runs.
+fn remove_stale_hosts(locations: &Locations, kept: &BTreeSet<u64>) {
+    for base in [locations.files(), locations.run.path.clone()] {
+        let Ok(entries) = std::fs::read_dir(base.join(crate::locations::HOSTS_DIR)) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let number = entry.file_name().to_string_lossy().parse::<u64>().ok();
+
+            if number.is_some_and(|number| !kept.contains(&number)) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 }
 
@@ -3147,9 +3651,9 @@ fn share_sockets(
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o2750))
 }
 
-fn write_edge_record(run_dir: &Path, edge: &EdgeProcess) {
+fn write_edge_record(locations: &Locations, edge: &EdgeProcess) {
     write_record(
-        &run_dir.join("edge.toml"),
+        &locations.edge_record(),
         &EdgeRecord {
             pid: edge.pid().unwrap_or(0),
             control: edge.control().to_path_buf(),
@@ -3241,6 +3745,25 @@ async fn prepare_upgrade() -> Result<Upgrade, String> {
     Ok(Upgrade {
         executable,
         version,
+        restart: false,
+    })
+}
+
+/// The restart that re-executing from `found` would be for a daemon of
+/// version `running`, or why it would not be one.
+fn restart_of(found: Upgrade, running: &str) -> Result<Upgrade, String> {
+    if found.version != running {
+        return Err(format!(
+            "{} is version {}, and the daemon runs version {running}, so a restart would \
+             upgrade it: use muructl daemon upgrade",
+            found.executable.display(),
+            found.version
+        ));
+    }
+
+    Ok(Upgrade {
+        restart: true,
+        ..found
     })
 }
 
@@ -3632,12 +4155,23 @@ fn command_mentions(pid: u32, path: &Path, title: &str) -> bool {
 fn names(command: &str, path: &Path, title: &str) -> bool {
     let command = command.trim();
 
-    command.contains(&path.display().to_string())
+    mentions(command, &path.display().to_string())
         || command == title
         || command
             .strip_prefix(title)
             .and_then(|rest| rest.strip_prefix(" ("))
             .is_some_and(|tag| tag.ends_with(')') && !tag.contains(' '))
+}
+
+/// Whether `command` has `path` as a whole path or the start of one: a
+/// host's directory is named by a number, and `h/14` is not `h/142`.
+fn mentions(command: &str, path: &str) -> bool {
+    command.match_indices(path).any(|(at, _)| {
+        command[at + path.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next == '/' || next.is_whitespace())
+    })
 }
 
 impl Daemon {
@@ -4086,7 +4620,23 @@ impl Daemon {
     /// and stopped, and the rest are swapped in place. The file is
     /// checked whole and the new listeners bound before anything is
     /// applied, so a mistake applies nothing.
-    async fn reload(&mut self) -> Result<String, String> {
+    /// Issue 940: a restart re-executes from the binary the daemon runs.
+    /// An installed binary of another version would make it an upgrade,
+    /// which replaces the edge as well, so that is refused and left to
+    /// the command that says so. The file is read first as the new image
+    /// will read it, since one it refused would leave no daemon.
+    async fn prepare_restart(&self) -> Result<Upgrade, String> {
+        crate::settings::NodeSettings::read(
+            &self.locations.config.path,
+            &self.locations.state.path.join("secrets"),
+            &self.overrides,
+        )
+        .map_err(|error| format!("the daemon is not restarted: {error}"))?;
+        let found = prepare_upgrade().await?;
+        restart_of(found, env!("CARGO_PKG_VERSION"))
+    }
+
+    async fn reload(&mut self) -> Result<Reloaded, String> {
         let path = self.locations.config.path.clone();
         let settings = crate::settings::NodeSettings::read(
             &path,
@@ -4096,6 +4646,15 @@ impl Daemon {
         let clients = settings.client_rules.policies(&self.store)?;
         let listeners = self.bind_listeners(&settings.listeners)?;
         let mut report = crate::reload::Report::new(&path);
+
+        // Issue 894: what is read only at start and now differs from what
+        // this daemon started with, which a restart applies.
+
+        for ((setting, started), (_, now)) in self.read_at_start.iter().zip(settings.at_start()) {
+            if *started != now {
+                report.stale(setting);
+            }
+        }
 
         // Section 4.4: the tables the edge takes from each snapshot, and
         // the limits with them (section 4.6).
@@ -4356,7 +4915,8 @@ impl Daemon {
             if report.is_ok() { "info" } else { "warning" },
             &report.message(),
         );
-        report.outcome()
+        let stale = report.waiting();
+        report.outcome().map(|message| Reloaded { message, stale })
     }
 
     /// Section 4.2: read the certificate and key files of the applied
@@ -4592,7 +5152,12 @@ impl Daemon {
             .filter(|host| !host.is_empty() && !host.contains('*'));
         let url = format!("http://127.0.0.1:{port}{path}");
 
-        crate::rollouts::probe_host(&self.probe_client, &url, host.as_deref(), &id)
+        // Section 4.22: the probe previews the release as anything else
+        // does, with its secret.
+
+        let preview = self.preview_value(&app, &id)?;
+
+        crate::rollouts::probe_host(&self.probe_client, &url, host.as_deref(), &preview)
             .await
             .map_err(|error| {
                 crate::overlays::describe_probe_failure(
@@ -5773,6 +6338,20 @@ impl Daemon {
                 ));
             }
 
+            // Section 7.8: the swaps waiting their turn in each group.
+
+            for (group, waiting) in &running.swaps_waiting {
+                samples.push(muru_edge::metrics::Sample::new(
+                    "muru_worker_swaps_waiting",
+                    &[
+                        ("app", app.as_str()),
+                        ("release", id.as_str()),
+                        ("group", group.as_str()),
+                    ],
+                    f64::from(*waiting),
+                ));
+            }
+
             // Sections 7.6 and 7.7: workers replaced and workers gone.
 
             for (name, counts) in [
@@ -5826,6 +6405,21 @@ impl Daemon {
             }
         };
 
+        // Section 13.8 (issue 948): what a host left among the runtime
+        // files outlives a reboot, which empties the runtime location.
+        // Only a release the store says was running can have a host to
+        // take over, so every other host's directories are stale.
+
+        let may_run: BTreeSet<u64> = self
+            .store
+            .releases(None)
+            .unwrap_or_default()
+            .iter()
+            .filter(|release| release.state.is_running())
+            .map(|release| release.number)
+            .collect();
+        remove_stale_hosts(&self.locations, &may_run);
+
         for app in apps {
             // A release in a running state is taken over when its host is
             // still there and listening; otherwise it is gone with the
@@ -5836,6 +6430,13 @@ impl Daemon {
                     if self.adopt_host(&release.app, &release.id).await {
                         continue;
                     }
+
+                    // Its record names no host that is there, so its
+                    // files are stale. Its sockets are left: a process
+                    // that could not be taken over may still hold them.
+
+                    let stale = self.locations.host_files(release.number);
+                    let _ = std::fs::remove_dir_all(stale);
 
                     let _ = self.store.set_release_state(
                         &release.app,
@@ -5872,24 +6473,58 @@ impl Daemon {
     /// Take over a release's host, or a managed server's instances, from
     /// its record, if it is still there.
     async fn adopt_host(&mut self, app: &str, id: &str) -> bool {
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+        let dirs = self.host_dirs(app, id);
 
-        if let Some(record) = read_record::<ServersRecord>(&run_dir.join("servers.toml")) {
-            return self.adopt_servers(app, id, &run_dir, &record).await;
+        if let Some(record) = read_record::<ServersRecord>(&dirs.files.join(SERVERS_RECORD)) {
+            return self.adopt_servers(app, id, &dirs, &record).await;
         }
 
-        let Some(record) = read_record::<HostRecord>(&run_dir.join("host.toml")) else {
+        let Some(record) = read_record::<HostRecord>(&dirs.files.join(HOST_RECORD)) else {
             tracing::info!("release {app}@{id} could not be re-adopted: no readable host record");
             return false;
         };
 
-        if !command_mentions(record.pid, &run_dir, &format!("muru host {app}@{id}")) {
+        if !command_mentions(record.pid, &dirs.sockets, &format!("muru host {app}@{id}")) {
             tracing::info!(
                 pid = record.pid,
                 "release {app}@{id} could not be re-adopted: no process of its host has the pid"
             );
             return false;
         }
+
+        // Issue 981: the host says which sockets its workers listen on.
+        // It replaces workers and starts them again while no daemon is
+        // there, so the record, which the last daemon wrote, may name
+        // sockets of workers long gone.
+
+        let (control, messages, announced) = match HostControl::connect_announced(
+            &dirs.sockets.join("control.sock"),
+        )
+        .await
+        {
+            Ok(connected) => connected,
+            Err(error) => {
+                tracing::info!(error = %format!("{error:#}"), "release {app}@{id} could not be re-adopted");
+                return false;
+            }
+        };
+        let mut record = record;
+
+        for group in &mut record.groups {
+            group.sockets = announced
+                .groups
+                .iter()
+                .find(|(name, _)| *name == group.name)
+                .map(|(_, sockets)| sockets.clone())
+                .unwrap_or_default();
+        }
+
+        record.sockets = announced
+            .sockets
+            .iter()
+            .chain(record.groups.iter().flat_map(|group| &group.sockets))
+            .cloned()
+            .collect();
 
         let group_sockets = record
             .groups
@@ -5916,9 +6551,8 @@ impl Daemon {
             }
         };
 
-        let host_dir = run_dir.join("r1");
         let launch = match crate::host::RelayLaunch::for_release(
-            host_dir.clone(),
+            dirs.clone(),
             Some(self.host_log(app, id)),
             self.relay_settings,
             identity,
@@ -5930,16 +6564,16 @@ impl Daemon {
                 return false;
             }
         };
-        let relay_pid = read_record::<RelayRecord>(&host_dir.join(crate::relay::RECORD))
+        let relay_pid = read_record::<RelayRecord>(&dirs.files.join(crate::relay::RECORD))
             .map(|record| record.pid)
-            .filter(|pid| command_mentions(*pid, &host_dir, &format!("muru relay {subject}")));
+            .filter(|pid| command_mentions(*pid, &dirs.sockets, &format!("muru relay {subject}")));
         let watcher = self.relay_watcher(&subject);
         let adopted = HostProcess::adopt(
             record.pid,
             record.sockets.clone(),
             group_sockets,
             optional,
-            host_dir,
+            dirs,
             1,
             launch,
             relay_pid,
@@ -5992,10 +6626,14 @@ impl Daemon {
                         inspected: false,
                         sticky_until: None,
                         held: false,
-                        control: None,
+                        control: Some(control),
                         status: Vec::new(),
                         load_ms: None,
                         memory_replacements: Vec::new(),
+                        swaps_waiting: BTreeMap::new(),
+                        surge: BTreeMap::new(),
+                        surge_told: None,
+                        restart: None,
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
                         signals_from: None,
@@ -6005,7 +6643,13 @@ impl Daemon {
                         ready_at,
                     },
                 );
-                self.attach_control(app, id);
+
+                // What the host has said goes through the inbox with the
+                // rest, so its announcement is acknowledged only after
+                // the snapshot of the restored routing has gone to the
+                // edge: the host keeps the paths the edge had until then.
+
+                self.forward_control(app, id, announced.sent, messages);
                 self.events.emit(
                     "release.adopted",
                     &format!("{app}@{id}"),
@@ -6027,7 +6671,7 @@ impl Daemon {
         &mut self,
         app: &str,
         id: &str,
-        run_dir: &Path,
+        dirs: &HostDirs,
         record: &ServersRecord,
     ) -> bool {
         let Ok(release) = self.store.release(app, id) else {
@@ -6047,14 +6691,19 @@ impl Daemon {
             }
         };
 
-        let env =
-            match resolve_env(&self.secrets, &release.spec.env, &run_dir.join("secrets")).await {
-                Ok(env) => env,
-                Err(error) => {
-                    tracing::info!(%error, "release {subject} could not be re-adopted");
-                    return false;
-                }
-            };
+        let env = match resolve_env(
+            &self.secrets,
+            &release.spec.env,
+            &dirs.files.join(SECRETS_DIR),
+        )
+        .await
+        {
+            Ok(env) => env,
+            Err(error) => {
+                tracing::info!(%error, "release {subject} could not be re-adopted");
+                return false;
+            }
+        };
         let env = self.server_environment(env, app, id, &release.spec, identity);
 
         let relays = match self.server_relays(&subject) {
@@ -6067,7 +6716,7 @@ impl Daemon {
 
         let adopted = Servers::adopt(
             &http,
-            &run_dir.join("r1"),
+            dirs,
             &release.spec.source,
             env,
             identity,
@@ -6099,6 +6748,10 @@ impl Daemon {
                         status: Vec::new(),
                         load_ms: None,
                         memory_replacements: Vec::new(),
+                        swaps_waiting: BTreeMap::new(),
+                        surge: BTreeMap::new(),
+                        surge_told: None,
+                        restart: None,
                         recycles: BTreeMap::new(),
                         exits: BTreeMap::new(),
                         signals_from: None,
@@ -6408,9 +7061,12 @@ impl Daemon {
                 steps,
                 gates,
                 approve_each_step,
+                shared,
                 done,
             } => {
-                let checked = self.check_rollout(&app, &release, &steps, &gates).await;
+                let checked = self
+                    .check_rollout(&app, &release, &steps, &gates, shared)
+                    .await;
 
                 match checked {
                     Ok(()) => {
@@ -6423,6 +7079,7 @@ impl Daemon {
                                 steps,
                                 gates,
                                 approve_each_step,
+                                shared,
                                 done,
                             },
                         )
@@ -6598,7 +7255,34 @@ impl Daemon {
             Command::HostAttached { app, id, control } => {
                 if let Some(running) = self.running.get_mut(&(app, id)) {
                     running.control = Some(control);
+
+                    // Issue 983: on a connection made again the host is
+                    // told its allowances again, which it may not have
+                    // heard. It says itself how far a restart has got,
+                    // or that none is under way.
+
+                    running.surge_told = None;
                 }
+            }
+            Command::HostDetached {
+                app,
+                id,
+                pid,
+                again,
+            } => {
+                let same = self.running.get_mut(&(app, id)).is_some_and(|running| {
+                    let same = running
+                        .backend
+                        .host()
+                        .is_some_and(|host| pid.is_some() && host.pid() == pid);
+
+                    if same {
+                        running.control = None;
+                    }
+
+                    same
+                });
+                let _ = again.send(same);
             }
             Command::HostMessage { app, id, message } => {
                 self.host_message(&app, &id, message).await;
@@ -6762,13 +7446,13 @@ impl Daemon {
                         .await,
                 );
             }
-            Command::PreviewDetour { request, done } => {
-                let _ = done.send(self.preview_detour(request).await);
+            Command::PreviewRelease { request, done } => {
+                let _ = done.send(self.preview_release(request).await);
             }
             Command::CloseDetour { serial, reason } => {
                 self.close_detour(serial, &reason).await;
             }
-            Command::Shutdown { .. } | Command::Upgrade { .. } => {}
+            Command::Shutdown { .. } | Command::Upgrade { .. } | Command::Restart { .. } => {}
         }
     }
 
@@ -6855,7 +7539,7 @@ impl Daemon {
                 tracing::error!(%error, "pushing the snapshot for a held release failed");
             }
 
-            self.mark_ready(app, &release.id, "held: not serving");
+            self.mark_ready(app, &release.id, &held_message(app, &release.id));
 
             return self
                 .store
@@ -7097,16 +7781,22 @@ impl Daemon {
         // A command's secret files are its own, so that its end removes
         // them without touching those of a host still running.
 
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+        let dirs = self.host_dirs(app, id);
         let identity = self.resolve_identity(app, &subject)?;
 
         // Its name is this daemon's start and a count, so that a detached
-        // run's, which outlives the daemon, is never another run's.
+        // run's, which outlives the daemon, is never another run's. The
+        // directory is among the runtime files and apart from the
+        // release's host's, which is removed when the host stops; a
+        // detached run's relay binds its socket in the directory of the
+        // same name in the runtime location (section 13.8).
 
         let run = COMMAND_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let secrets = run_dir
-            .join("commands")
-            .join(format!("{}-{run}", self.info.started_unix_ms));
+        let secrets = self
+            .locations
+            .files()
+            .join(COMMANDS_DIR)
+            .join(crate::runs::directory_name(self.info.started_unix_ms, run));
 
         let env = match resolve_env(&self.secrets, &spec.env, &secrets).await {
             Ok(env) => env,
@@ -7117,7 +7807,7 @@ impl Daemon {
         };
 
         if let Some(identity) = identity {
-            self.own_release_dirs(identity, &run_dir, app, id)?;
+            self.own_release_dirs(identity, &dirs, app, id)?;
             own_secret_files(identity, &secrets)?;
         }
 
@@ -7260,7 +7950,7 @@ impl Daemon {
             },
         );
         let spec = &release.spec;
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
+        let dirs = self.locations.host_dirs(release.number);
 
         let identity = match self.resolve_identity(app, &subject) {
             Ok(identity) => identity,
@@ -7275,7 +7965,7 @@ impl Daemon {
         // Section 10.8: secrets are resolved now, for this start, and
         // delivered as variables or as files only the host can read.
 
-        let env = match resolve_env(&self.secrets, &spec.env, &run_dir.join("secrets")).await {
+        let env = match resolve_env(&self.secrets, &spec.env, &dirs.files.join(SECRETS_DIR)).await {
             Ok(env) => env,
             Err(message) => {
                 self.set_state(&release, ReleaseState::Failed, &message);
@@ -7292,7 +7982,7 @@ impl Daemon {
         // read its secrets and reopen its log.
 
         if let Some(identity) = identity
-            && let Err(message) = self.own_release_dirs(identity, &run_dir, app, id)
+            && let Err(message) = self.own_release_dirs(identity, &dirs, app, id)
         {
             self.set_state(&release, ReleaseState::Failed, &message);
             self.events
@@ -7320,7 +8010,7 @@ impl Daemon {
             let env = self.server_environment(env, app, id, spec, identity);
 
             return self
-                .start_servers(app, id, &release, &http, env, identity, &run_dir, started)
+                .start_servers(app, id, &release, &http, env, identity, &dirs, started)
                 .map(|()| false);
         }
 
@@ -7368,7 +8058,7 @@ impl Daemon {
                     release,
                     env,
                     identity,
-                    run_dir,
+                    dirs,
                     started,
                     library: None,
                 }),
@@ -7404,7 +8094,7 @@ impl Daemon {
             release,
             env,
             identity,
-            run_dir,
+            dirs,
             started,
             ..
         } = prep;
@@ -7464,7 +8154,7 @@ impl Daemon {
             factory: spec.factory,
             reflection: spec.reflection,
             handoff: spec.handoff,
-            processes: spec.processes as usize,
+            processes: spec.starting_processes() as usize,
             threads: spec.threads as usize,
             sync_threads: spec.sync_threads as usize,
             concurrency: spec.concurrency as usize,
@@ -7486,6 +8176,8 @@ impl Daemon {
                 .layered(&spec.logging),
             max_requests: spec.max_requests,
             max_lifetime: spec.max_lifetime_ms.map(Duration::from_millis),
+            max_surge: spec.swap().0,
+            max_unavailable: spec.swap().1,
             soft_timeout: spec.timeouts.soft_timeout_ms.map(Duration::from_millis),
             hard_timeout: spec.timeouts.hard_timeout_ms.map(Duration::from_millis),
             hard_drain_grace: Duration::from_millis(spec.timeouts.hard_drain_grace_ms),
@@ -7513,7 +8205,7 @@ impl Daemon {
                 .iter()
                 .map(|group| crate::host::HostGroup {
                     name: group.name.clone(),
-                    processes: group.processes as usize,
+                    processes: group.starting_processes() as usize,
                     threads: group.threads as usize,
                     sync_threads: group.sync_threads as usize,
                     concurrency: group.concurrency as usize,
@@ -7524,6 +8216,8 @@ impl Daemon {
                         .max_lifetime_ms
                         .or(spec.max_lifetime_ms)
                         .map(Duration::from_millis),
+                    max_surge: spec.group_swap(&group.name).0,
+                    max_unavailable: spec.group_swap(&group.name).1,
                     optional: group.optional,
                     mounts: group.mounts.clone(),
                 })
@@ -7568,7 +8262,7 @@ impl Daemon {
 
         let watcher = self.relay_watcher(&subject);
 
-        let mut host = match HostProcess::start(&host_spec, &run_dir, 1, &self.logs, watcher) {
+        let mut host = match HostProcess::start(&host_spec, &dirs, 1, &self.logs, watcher) {
             Ok(host) => host,
             Err(error) => {
                 let message = format!("the host could not be started: {error:#}");
@@ -7622,7 +8316,7 @@ impl Daemon {
                     release: release.clone(),
                     env: Vec::new(),
                     identity,
-                    run_dir,
+                    dirs,
                     started,
                     library: Some(library),
                 });
@@ -7669,7 +8363,7 @@ impl Daemon {
 
         let StartPrep {
             release,
-            run_dir,
+            dirs,
             started,
             library,
             ..
@@ -7697,7 +8391,7 @@ impl Daemon {
                 host.group_sockets
                     .iter()
                     .find(|(name, _)| name == &group.name)
-                    .is_some_and(|(_, sockets)| sockets.len() < group.processes as usize)
+                    .is_some_and(|(_, sockets)| sockets.len() < group.starting_processes() as usize)
             })
             .map(|group| format!("group {}", group.name))
             .collect();
@@ -7721,7 +8415,7 @@ impl Daemon {
             })
             .collect();
         write_record(
-            &run_dir.join("host.toml"),
+            &dirs.files.join(HOST_RECORD),
             &HostRecord {
                 pid: host.pid().unwrap_or(0),
                 sockets: host.sockets.clone(),
@@ -7755,6 +8449,10 @@ impl Daemon {
                 status: Vec::new(),
                 load_ms: None,
                 memory_replacements: Vec::new(),
+                swaps_waiting: BTreeMap::new(),
+                surge: BTreeMap::new(),
+                surge_told: None,
+                restart: None,
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
                 signals_from: None,
@@ -7849,14 +8547,14 @@ impl Daemon {
     fn own_release_dirs(
         &self,
         identity: crate::host::Identity,
-        run_dir: &Path,
+        dirs: &HostDirs,
         app: &str,
         id: &str,
     ) -> Result<(), String> {
         let owned = [
-            run_dir.to_path_buf(),
-            run_dir.join("r1"),
-            run_dir.join("secrets"),
+            dirs.sockets.clone(),
+            dirs.files.clone(),
+            dirs.files.join(SECRETS_DIR),
         ];
 
         for path in &owned {
@@ -7865,7 +8563,7 @@ impl Daemon {
 
         let mut paths: Vec<PathBuf> = owned.to_vec();
 
-        if let Ok(entries) = std::fs::read_dir(run_dir.join("secrets")) {
+        if let Ok(entries) = std::fs::read_dir(dirs.files.join(SECRETS_DIR)) {
             paths.extend(entries.flatten().map(|entry| entry.path()));
         }
 
@@ -7886,7 +8584,7 @@ impl Daemon {
         }
 
         if let Some(service) = self.service {
-            share_sockets(&run_dir.join("r1"), identity, service).map_err(|error| {
+            share_sockets(&dirs.sockets, identity, service).map_err(|error| {
                 format!("sharing the socket directory with the edge failed: {error}")
             })?;
         }
@@ -7905,7 +8603,7 @@ impl Daemon {
         http: &crate::model::HttpServerSpec,
         env: Vec<(String, String)>,
         identity: Option<crate::host::Identity>,
-        run_dir: &Path,
+        dirs: &HostDirs,
         started: Instant,
     ) -> Result<(), String> {
         let subject = format!("{app}@{id}");
@@ -7919,8 +8617,7 @@ impl Daemon {
         let context = self.context();
         let commands = self.commands.clone();
         let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
-        let (task_release, task_http, task_dir) =
-            (release.clone(), http.clone(), run_dir.to_path_buf());
+        let (task_release, task_http, task_dir) = (release.clone(), http.clone(), dirs.clone());
         let key = (app.to_owned(), id.to_owned());
 
         tokio::spawn(async move {
@@ -7930,7 +8627,7 @@ impl Daemon {
             let outcome = async {
                 let spawned = Servers::start(
                     &task_http,
-                    &task_dir.join("r1"),
+                    &task_dir,
                     &release.spec.source,
                     env,
                     identity,
@@ -7992,7 +8689,7 @@ impl Daemon {
                     release: release.clone(),
                     env: Vec::new(),
                     identity,
-                    run_dir: run_dir.to_path_buf(),
+                    dirs: dirs.clone(),
                     started,
                     library: None,
                 }),
@@ -8019,7 +8716,7 @@ impl Daemon {
 
         let StartPrep {
             release,
-            run_dir,
+            dirs,
             started,
             ..
         } = prep;
@@ -8031,7 +8728,7 @@ impl Daemon {
             .map(crate::model::HttpServerSpec::describe)
             .unwrap_or_default();
 
-        write_record(&run_dir.join("servers.toml"), &servers.record());
+        write_record(&dirs.files.join(SERVERS_RECORD), &servers.record());
         self.running.insert(
             (app.to_owned(), id.to_owned()),
             Running {
@@ -8049,6 +8746,10 @@ impl Daemon {
                 status: Vec::new(),
                 load_ms: None,
                 memory_replacements: Vec::new(),
+                swaps_waiting: BTreeMap::new(),
+                surge: BTreeMap::new(),
+                surge_told: None,
+                restart: None,
                 recycles: BTreeMap::new(),
                 exits: BTreeMap::new(),
                 signals_from: None,
@@ -8180,12 +8881,20 @@ impl Daemon {
                 steps,
                 gates,
                 approve_each_step,
+                shared,
                 done,
             } => {
                 let outcome = match started {
                     Ok(()) => {
-                        self.rollout_started(&app, &candidate, steps, gates, approve_each_step)
-                            .await
+                        self.rollout_started(
+                            &app,
+                            &candidate,
+                            steps,
+                            gates,
+                            approve_each_step,
+                            shared,
+                        )
+                        .await
                     }
                     Err(error) => Err(error),
                 };
@@ -8531,6 +9240,15 @@ impl Daemon {
             .map(|(app, id)| ((*app).clone(), (*id).clone()))
             .collect();
 
+        // Section 4.22: what the edge routes to is what can be previewed,
+        // each release by its own secret.
+
+        self.routed = included.clone();
+        let secrets = self.store.preview_secrets().unwrap_or_else(|error| {
+            tracing::warn!(%error, "reading the releases' preview secrets failed");
+            HashMap::new()
+        });
+
         // Section 9.13: a detour takes what its overlay gives it.
 
         included.extend(self.detours.keys().cloned());
@@ -8562,8 +9280,12 @@ impl Daemon {
                 };
 
                 apps.push(pb::AppWorkers {
-                    preview_secret: String::new(),
+                    preview_secret: secrets
+                        .get(&(name.clone(), id.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
                     detour_paths: Vec::new(),
+                    sticky: running.sticky_until.is_some(),
                     limits: spec.as_ref().and_then(|spec| spec.limits.message()),
                     app: name.clone(),
                     release: id.clone(),
@@ -8909,7 +9631,7 @@ impl Daemon {
                 .iter()
                 .map(muru_edge::access::Override::to_message)
                 .collect(),
-            detours: self.detours_enabled && self.locations.mode != crate::locations::Mode::System,
+            previews: true,
         }
     }
 
@@ -9161,8 +9883,7 @@ impl Daemon {
                 "stopping the host"
             },
         );
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
-        let record = running.backend.record_path(&run_dir);
+        let dirs = self.locations.host_dirs(release.number);
         let grace = release.spec.timeouts.stop_budget();
         let wait = stop_wait(grace);
         let backend = running.backend;
@@ -9192,8 +9913,7 @@ impl Daemon {
             (app.to_owned(), id.to_owned()),
             Stop {
                 until: Instant::now() + wait,
-                run_dir,
-                record,
+                dirs,
                 waiters: Vec::new(),
             },
         );
@@ -9208,7 +9928,7 @@ impl Daemon {
             return;
         };
 
-        forget_release_dir(&stop.run_dir, &stop.record);
+        forget_release_dir(&stop.dirs);
         let _ = self.store.remove_scale_pins(app, id, None);
 
         if let Ok(release) = self.store.release(app, id) {
@@ -9247,6 +9967,7 @@ impl Daemon {
         candidate: &str,
         steps: &[RolloutStep],
         gates: &RolloutGates,
+        shared: bool,
     ) -> Result<(), String> {
         let record = self.store.app(app).map_err(|error| error.to_string())?;
         let Some(baseline) = record.current.clone() else {
@@ -9257,9 +9978,28 @@ impl Daemon {
             return Err(format!("{app}@{candidate} already serves"));
         }
 
-        self.store
+        let release = self
+            .store
             .release(app, candidate)
             .map_err(|error| error.to_string())?;
+
+        // Section 9.16: a managed server's instances are not scaled, so
+        // a baseline of one cannot shrink and a candidate cannot grow.
+
+        if shared {
+            let serving = self
+                .store
+                .release(app, &baseline)
+                .map_err(|error| error.to_string())?;
+
+            for (id, spec) in [(&baseline, &serving.spec), (&release.id, &release.spec)] {
+                if spec.http.is_some() {
+                    return Err(format!(
+                        "{app}@{id} runs a managed HTTP server, whose instances are not scaled, so it cannot share capacity; a canary without --capacity shared runs it at its own size"
+                    ));
+                }
+            }
+        }
 
         if let Some(active) = self
             .store
@@ -9306,6 +10046,7 @@ impl Daemon {
         steps: Vec<RolloutStep>,
         gates: RolloutGates,
         approve_each_step: bool,
+        shared: bool,
     ) -> Result<Rollout, String> {
         let baseline = self
             .store
@@ -9313,6 +10054,7 @@ impl Daemon {
             .map_err(|error| error.to_string())?
             .current
             .ok_or_else(|| format!("{app} has no serving release to roll out against"))?;
+        let shared = shared.then(|| self.share_capacity(app, &baseline, candidate));
 
         if let Some(running) = self
             .running
@@ -9330,7 +10072,8 @@ impl Daemon {
                 .map_err(|error| error.to_string())?,
             candidate: candidate.to_owned(),
             baseline: baseline.clone(),
-            message: step_message(&steps, 0),
+            message: step_message(&steps, 0)
+                + &shared.as_ref().map_or_else(String::new, total_note),
             steps,
             gates,
             approve_each_step,
@@ -9339,6 +10082,7 @@ impl Daemon {
             step_started_unix_ms: now,
             created_unix_ms: now,
             updated_unix_ms: now,
+            shared,
         };
         self.store
             .put_rollout(&rollout)
@@ -9348,16 +10092,542 @@ impl Daemon {
             &format!("{app}@{candidate}"),
             "notice",
             &format!(
-                "rollout {} against {baseline}: {}",
+                "rollout {} against {baseline}: {}{}",
                 rollout.id,
-                describe_steps(&rollout.steps)
+                describe_steps(&rollout.steps),
+                rollout.shared.as_ref().map_or_else(String::new, total_note)
             ),
         );
+
+        // Section 9.16: the two releases are the rollout's to size from
+        // here, at the counts they have until the first step's workers
+        // are in place.
+
+        if let Some(shared) = &rollout.shared {
+            for (id, counts) in [
+                (&baseline, &shared.baseline),
+                (&rollout.candidate, &shared.candidate),
+            ] {
+                for (group, count) in counts {
+                    self.pin_for_rollout(app, id, group, *count);
+                }
+            }
+        }
+
         let pushed = self.push_snapshot().await;
         self.mark_ready(app, candidate, "");
         pushed?;
         self.begin_rollout_run(&rollout).await;
         Ok(rollout)
+    }
+
+    /// Section 9.16: the total a rollout's two releases share, the
+    /// baseline's worker count now in each of its groups, with the
+    /// counts both are at. A group with no workers, scaled to zero, is
+    /// left out, and so is one the candidate does not have on its side.
+    fn share_capacity(&self, app: &str, baseline: &str, candidate: &str) -> SharedCapacity {
+        let counts = |id: &str| -> BTreeMap<String, u32> {
+            self.running
+                .get(&(app.to_owned(), id.to_owned()))
+                .map(|running| {
+                    running
+                        .scalers
+                        .iter()
+                        .map(|group| {
+                            let ready = running
+                                .group_sockets(&group.name)
+                                .map_or(0, <[PathBuf]>::len)
+                                as u32;
+                            (group.name.clone(), ready.max(group.scaler.desired()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let totals: BTreeMap<String, u32> = counts(baseline)
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        let candidate = counts(candidate)
+            .into_iter()
+            .filter(|(group, _)| totals.contains_key(group))
+            .collect();
+
+        SharedCapacity {
+            baseline: totals.clone(),
+            totals,
+            candidate,
+            sizing: true,
+            finishing: false,
+        }
+    }
+
+    /// Section 9.16: pin a group of a release to the count a rollout
+    /// gives it, as an operator's pin does, so the autoscaler stands
+    /// aside and the count outlives the daemon. Returns the count the
+    /// group was being brought to, or none when the release does not
+    /// run or has no such group.
+    fn pin_for_rollout(&mut self, app: &str, id: &str, group: &str, count: u32) -> Option<u32> {
+        let now = Instant::now();
+        let scaling = self
+            .running
+            .get_mut(&(app.to_owned(), id.to_owned()))?
+            .scalers
+            .iter_mut()
+            .find(|scaling| scaling.name == group)?;
+        let before = scaling.scaler.desired();
+        scaling.scaler.pin(count, now);
+        scaling.requested = Some(count);
+
+        if let Err(error) = self.store.put_scale_pin(app, id, group, count) {
+            tracing::warn!(%error, "release {app}@{id}: a rollout's pin could not be kept");
+        }
+
+        self.ask_scale(app, id, group, count);
+        Some(before)
+    }
+
+    /// Section 9.16: lift the pins a rollout set on its two releases,
+    /// now that it has ended, so the release that serves is sized by
+    /// its own count or policy again.
+    fn release_rollout_pins(&mut self, rollout: &Rollout) {
+        let Some(shared) = &rollout.shared else {
+            return;
+        };
+
+        let now = Instant::now();
+
+        for id in [&rollout.baseline, &rollout.candidate] {
+            if let Some(running) = self.running.get_mut(&(rollout.app.clone(), id.clone())) {
+                for scaling in &mut running.scalers {
+                    if shared.totals.contains_key(&scaling.name)
+                        && scaling.scaler.pinned().is_some()
+                    {
+                        scaling.scaler.unpin(now);
+                    }
+                }
+            }
+
+            for group in shared.totals.keys() {
+                let _ = self.store.remove_scale_pins(&rollout.app, id, Some(group));
+            }
+        }
+
+        self.shared_drains.retain(|(app, _), _| app != &rollout.app);
+    }
+
+    /// Section 9.16: how many more workers of a group of a release fit
+    /// the node's budget, over what the releases hold without the room
+    /// held for swaps, which gives way to a rollout's workers as it
+    /// does to a pin; none when nothing limits them.
+    fn rollout_room(&self, app: &str, id: &str, group: &str) -> Option<u32> {
+        let budget = self.budget();
+
+        if !budget.is_set() {
+            return None;
+        }
+
+        let fallback = self.node_mean_pss();
+        let mut used = crate::budget::Usage::default();
+
+        for running in self.running.values() {
+            used.add_usage(&running.usage_with(fallback, false));
+        }
+
+        for starting in self.starting.values() {
+            used.memory += starting.reserved;
+        }
+
+        let running = self.running.get(&(app.to_owned(), id.to_owned()))?;
+        let scaling = running
+            .scalers
+            .iter()
+            .find(|scaling| scaling.name == group)?;
+        let cost = running.worker_cost(scaling, fallback);
+        crate::budget::room(&budget, &used, cost).map(|(fits, _)| fits)
+    }
+
+    /// Section 9.16: note that a rollout's baseline gave up `given`
+    /// workers of a group, which a step waits to see exit, for no longer
+    /// than their stop budget.
+    fn await_drain(&mut self, rollout: &Rollout, group: &str, given: u32) {
+        if given == 0 {
+            return;
+        }
+
+        let key = (rollout.app.clone(), rollout.baseline.clone());
+        let exited = self.scaled_in(&key, group);
+        let budget = self
+            .store
+            .release(&rollout.app, &rollout.baseline)
+            .map_or(DRAIN_WAIT, |release| release.spec.timeouts.stop_budget());
+        let entry = self
+            .shared_drains
+            .entry((rollout.app.clone(), group.to_owned()))
+            .or_insert((exited, Instant::now()));
+        entry.0 = entry.0.max(exited) + u64::from(given);
+        entry.1 = Instant::now() + budget + DRAIN_MARGIN;
+    }
+
+    /// The workers of a group of a release that have exited scaled in,
+    /// since the daemon began to hear from its host.
+    fn scaled_in(&self, key: &(String, String), group: &str) -> u64 {
+        self.running.get(key).map_or(0, |running| {
+            running
+                .exits
+                .get(&(group.to_owned(), "scaled_in".to_owned()))
+                .copied()
+                .unwrap_or(0)
+        })
+    }
+
+    /// Section 9.16: whether workers a rollout's baseline gave up in a
+    /// group are still exiting; with no group, in any.
+    fn draining_for(&mut self, rollout: &Rollout, group: Option<&str>) -> bool {
+        let key = (rollout.app.clone(), rollout.baseline.clone());
+        let now = Instant::now();
+        let waits: Vec<(String, u64, Instant)> = self
+            .shared_drains
+            .iter()
+            .filter(|((app, name), _)| {
+                app == &rollout.app && group.is_none_or(|group| group == name)
+            })
+            .map(|((_, name), (expected, until))| (name.clone(), *expected, *until))
+            .collect();
+        let mut draining = false;
+
+        for (name, expected, until) in waits {
+            if self.scaled_in(&key, &name) >= expected || now >= until {
+                self.shared_drains.remove(&(rollout.app.clone(), name));
+            } else {
+                draining = true;
+            }
+        }
+
+        draining
+    }
+
+    /// Section 9.16: move a rollout that shares capacity along while a
+    /// step's workers are being put in place, or the candidate grown to
+    /// the total ahead of its promotion. Each group is taken toward the
+    /// step's counts by `shared::plan`; once every group is there the
+    /// traffic moves and the baseline drains to its counts, or the
+    /// candidate is promoted. Returns whether the rollout was in such a
+    /// phase, in which case its gates are not judged this tick.
+    async fn size_rollout(&mut self, rollout: &mut Rollout) -> bool {
+        let Some(mut shared) = rollout.shared.clone() else {
+            return false;
+        };
+
+        if !shared.sizing && !shared.finishing {
+            return false;
+        }
+
+        let app = rollout.app.clone();
+        let subject = format!("{app}@{}", rollout.candidate);
+
+        let percent = if shared.finishing {
+            100
+        } else {
+            rollout
+                .steps
+                .get(rollout.step)
+                .map_or(100, |step| step.percent)
+        };
+        let swaps = self
+            .store
+            .release(&app, &rollout.baseline)
+            .map(|release| release.spec)
+            .ok();
+        let mut ready = true;
+        let mut waiting = None;
+        let mut short = Vec::new();
+
+        for (group, total) in shared.totals.clone() {
+            let Some(pinned) = shared.candidate.get(&group).copied() else {
+                continue;
+            };
+
+            let (baseline_target, candidate_target) = crate::shared::sizes(total, percent);
+            let candidate_key = (app.clone(), rollout.candidate.clone());
+
+            // The baseline keeps a worker while it takes any traffic,
+            // which it does until the promotion, and a scaled group of
+            // the candidate is never pinned over its ceiling.
+
+            let (candidate_ready, ceiling) =
+                self.running
+                    .get(&candidate_key)
+                    .map_or((0, None), |running| {
+                        let ready =
+                            running.group_sockets(&group).map_or(0, <[PathBuf]>::len) as u32;
+                        let ceiling = running
+                            .scalers
+                            .iter()
+                            .find(|scaling| scaling.name == group)
+                            .filter(|scaling| !scaling.scaler.spec().is_static())
+                            .map(|scaling| scaling.scaler.ceiling());
+                        (ready, ceiling)
+                    });
+            let state = crate::shared::Group {
+                baseline: shared.baseline.get(&group).copied().unwrap_or(total),
+                candidate: pinned,
+                baseline_target: baseline_target.max(1),
+                candidate_target: ceiling
+                    .map_or(candidate_target, |ceiling| candidate_target.min(ceiling)),
+                candidate_ready,
+                baseline_draining: self.draining_for(rollout, Some(&group)),
+                room: self.rollout_room(&app, &rollout.candidate, &group),
+                max_unavailable: swaps.as_ref().map_or(0, |spec| spec.group_swap(&group).1),
+            };
+
+            match crate::shared::plan(&state) {
+                crate::shared::Move::Trim(to) => {
+                    ready = false;
+                    self.pin_for_rollout(&app, &rollout.candidate, &group, to);
+                    shared.candidate.insert(group.clone(), to);
+                    self.events.emit(
+                        "rollout.capacity",
+                        &subject,
+                        "notice",
+                        &format!(
+                            "{} {group}: drained from {pinned} to {}, its share at {percent}%",
+                            rollout.candidate,
+                            workers(to)
+                        ),
+                    );
+                }
+                crate::shared::Move::Grow(to) => {
+                    ready = false;
+                    self.pin_for_rollout(&app, &rollout.candidate, &group, to);
+                    shared.candidate.insert(group.clone(), to);
+                    self.events.emit(
+                        "rollout.capacity",
+                        &subject,
+                        "notice",
+                        &format!(
+                            "{} {group}: grown from {pinned} to {}, {}",
+                            rollout.candidate,
+                            workers(to),
+                            match (to >= state.candidate_target, shared.finishing) {
+                                (true, true) =>
+                                    "the whole total, ahead of its promotion".to_owned(),
+                                (true, false) =>
+                                    format!("its share at {percent}%, ahead of the traffic"),
+                                (false, _) => format!(
+                                    "of the {} it is to have at {percent}%: what the node's budget has room for",
+                                    state.candidate_target
+                                ),
+                            }
+                        ),
+                    );
+                }
+                crate::shared::Move::Shrink(to) => {
+                    ready = false;
+                    self.pin_for_rollout(&app, &rollout.baseline, &group, to);
+                    shared.baseline.insert(group.clone(), to);
+                    self.await_drain(rollout, &group, state.baseline - to);
+                    self.events.emit(
+                        "rollout.capacity",
+                        &subject,
+                        "notice",
+                        &format!(
+                            "{} {group}: drained from {} to {}, ahead of the traffic: the node's budget has no room for the workers of {} until it has",
+                            rollout.baseline,
+                            state.baseline,
+                            workers(to),
+                            rollout.candidate
+                        ),
+                    );
+                }
+                crate::shared::Move::Starting => {
+                    ready = false;
+                    waiting.get_or_insert(format!(
+                        "waiting for the {} of {} ({group}) to be ready",
+                        workers(pinned),
+                        rollout.candidate
+                    ));
+                }
+                crate::shared::Move::Draining => {
+                    ready = false;
+                    waiting.get_or_insert(format!(
+                        "waiting for the workers {} gave up ({group}) to exit",
+                        rollout.baseline
+                    ));
+                }
+                crate::shared::Move::NoRoom => {
+                    ready = false;
+                    waiting.get_or_insert(format!(
+                        "waiting for room in the node's budget for the workers of {} ({group}): max_unavailable 0 lets {} give up none before its traffic moves",
+                        rollout.candidate, rollout.baseline
+                    ));
+                }
+                crate::shared::Move::Ready { short: true } => {
+                    short.push(format!(
+                        "{group} at {} of {}",
+                        pinned,
+                        workers(state.candidate_target)
+                    ));
+                }
+                crate::shared::Move::Ready { short: false } => {}
+            }
+        }
+
+        let now = now_unix_ms();
+
+        let phase = if shared.finishing {
+            "every step passed its gates".to_owned()
+        } else {
+            step_message(&rollout.steps, rollout.step)
+        };
+
+        if !ready {
+            let message = match waiting {
+                Some(waiting) => format!("{phase}: {waiting}"),
+                None => format!("{phase}{SIZING}"),
+            };
+
+            if rollout.message != message || rollout.shared.as_ref() != Some(&shared) {
+                rollout.message = message;
+                rollout.updated_unix_ms = now;
+                rollout.shared = Some(shared);
+                let _ = self.store.put_rollout(rollout);
+            }
+
+            return true;
+        }
+
+        if !short.is_empty() {
+            self.events.emit(
+                "rollout.capacity",
+                &subject,
+                "warning",
+                &format!(
+                    "{} goes on short of its share at {percent}%, the node's budget having no room: {}",
+                    rollout.candidate,
+                    short.join(", ")
+                ),
+            );
+        }
+
+        // Every group of the candidate has its workers, ready. Ahead of
+        // a promotion that is all: the promotion moves the traffic and
+        // retains the baseline.
+
+        if shared.finishing {
+            rollout.shared = Some(shared);
+            rollout.updated_unix_ms = now;
+            let _ = self.store.put_rollout(rollout);
+            self.promote_rollout(rollout.clone(), "every step passed its gates", None)
+                .await;
+            return true;
+        }
+
+        // The traffic moves, and then the baseline drains to its counts.
+
+        shared.sizing = false;
+        rollout.shared = Some(shared.clone());
+        rollout.step_started_unix_ms = now;
+        rollout.updated_unix_ms = now;
+        rollout.message = phase;
+        let _ = self.store.put_rollout(rollout);
+
+        if let Err(error) = self.push_snapshot().await {
+            tracing::error!(%error, "pushing the snapshot for a rollout step failed");
+        }
+
+        for (group, total) in &shared.totals {
+            let target = crate::shared::sizes(*total, percent).0.max(1);
+            let held = shared.baseline.get(group).copied().unwrap_or(*total);
+
+            if target >= held {
+                continue;
+            }
+
+            self.pin_for_rollout(&app, &rollout.baseline, group, target);
+            shared.baseline.insert(group.clone(), target);
+            self.await_drain(rollout, group, held - target);
+            self.events.emit(
+                "rollout.capacity",
+                &subject,
+                "notice",
+                &format!(
+                    "{} {group}: drained from {held} to {}, its share with {} at {percent}%",
+                    rollout.baseline,
+                    workers(target),
+                    rollout.candidate
+                ),
+            );
+        }
+
+        rollout.shared = Some(shared);
+        let _ = self.store.put_rollout(rollout);
+        self.begin_rollout_run(rollout).await;
+        true
+    }
+
+    /// Section 9.16: a rollback's first move, before the traffic goes
+    /// back: the baseline is grown toward the total, as far as the
+    /// budget has room, without waiting for the workers.
+    fn grow_baseline_back(&mut self, rollout: &mut Rollout) {
+        let Some(mut shared) = rollout.shared.clone() else {
+            return;
+        };
+
+        let subject = format!("{}@{}", rollout.app, rollout.candidate);
+
+        for (group, total) in shared.totals.clone() {
+            let held = shared.baseline.get(&group).copied().unwrap_or(total);
+
+            if held >= total {
+                continue;
+            }
+
+            let room = self.rollout_room(&rollout.app, &rollout.baseline, &group);
+            let to = room.map_or(total, |room| total.min(held.saturating_add(room)));
+
+            if to > held {
+                self.pin_for_rollout(&rollout.app, &rollout.baseline, &group, to);
+                shared.baseline.insert(group.clone(), to);
+                self.events.emit(
+                    "rollout.capacity",
+                    &subject,
+                    "notice",
+                    &format!(
+                        "{} {group}: grown back from {held} to {} of its {total}, before it takes the traffic again",
+                        rollout.baseline,
+                        workers(to)
+                    ),
+                );
+            }
+        }
+
+        rollout.shared = Some(shared);
+    }
+
+    /// Section 9.16: ahead of a promotion by hand, the candidate is
+    /// grown toward the total, as far as the budget has room, without
+    /// waiting for the workers.
+    fn grow_candidate_now(&mut self, rollout: &mut Rollout) {
+        let Some(mut shared) = rollout.shared.clone() else {
+            return;
+        };
+
+        for (group, total) in shared.totals.clone() {
+            let Some(held) = shared.candidate.get(&group).copied() else {
+                continue;
+            };
+
+            let room = self.rollout_room(&rollout.app, &rollout.candidate, &group);
+            let to = room.map_or(total, |room| total.min(held.saturating_add(room)));
+
+            if to > held {
+                self.pin_for_rollout(&rollout.app, &rollout.candidate, &group, to);
+                shared.candidate.insert(group, to);
+            }
+        }
+
+        rollout.shared = Some(shared);
     }
 
     /// Section 9.3: a release's counters for the gates, the edge's with
@@ -9405,14 +10675,25 @@ impl Daemon {
         let failures = self.probe_failures.clone();
         let urls = rollout.gates.probes.clone();
         let app = rollout.app.clone();
-        let releases = [rollout.candidate.clone(), rollout.baseline.clone()];
+
+        // Section 4.22: each release is probed by its preview, its ID
+        // and its secret; one whose secret cannot be read fails its
+        // probes, which says why.
+
+        let releases = [rollout.candidate.clone(), rollout.baseline.clone()]
+            .map(|release| (self.preview_value(&rollout.app, &release), release));
 
         tokio::spawn(async move {
             let mut failed = Vec::new();
 
-            for release in releases {
+            for (preview, release) in releases {
                 for url in &urls {
-                    if let Err(error) = crate::rollouts::probe(&client, url, &release).await {
+                    let probed = match &preview {
+                        Ok(preview) => crate::rollouts::probe(&client, url, preview).await,
+                        Err(error) => Err(error.clone()),
+                    };
+
+                    if let Err(error) = probed {
                         tracing::debug!(%app, %release, %error, "a rollout probe failed");
                         failed.push((release.clone(), error));
                     }
@@ -9500,6 +10781,7 @@ impl Daemon {
                 rollout.state = RolloutState::Running;
                 rollout.step_started_unix_ms = now_unix_ms();
                 rollout.message = step_message(&rollout.steps, rollout.step);
+                let sizing = rollout.shared.as_ref().is_some_and(|shared| shared.sizing);
 
                 if approved {
                     self.events.emit(
@@ -9508,6 +10790,11 @@ impl Daemon {
                         "notice",
                         &format!("approved: {}", rollout.message),
                     );
+
+                    if sizing {
+                        rollout.message.push_str(SIZING);
+                    }
+
                     self.store
                         .put_rollout(&rollout)
                         .map_err(|error| error.to_string())?;
@@ -9515,6 +10802,10 @@ impl Daemon {
                 } else {
                     self.events
                         .emit("rollout.resumed", &subject, "notice", &rollout.message);
+
+                    if sizing {
+                        rollout.message.push_str(SIZING);
+                    }
                 }
 
                 self.begin_rollout_run(&rollout).await;
@@ -9553,6 +10844,11 @@ impl Daemon {
         self.probed.remove(&rollout.app);
 
         let record = |rollout: &mut Rollout, store: &Store| -> Result<(), String> {
+            if let Some(shared) = &mut rollout.shared {
+                shared.sizing = false;
+                shared.finishing = false;
+            }
+
             rollout.state = state;
             rollout.message = message.to_owned();
             rollout.updated_unix_ms = now_unix_ms();
@@ -9566,6 +10862,11 @@ impl Daemon {
                 self.promote_rollout(rollout.clone(), message, None).await;
             }
             _ => {
+                // Section 9.16: the order of a step in reverse, with no
+                // waiting: the baseline grows back, takes the traffic,
+                // and the candidate drains.
+
+                self.grow_baseline_back(rollout);
                 record(rollout, &self.store)?;
                 self.push_snapshot().await?;
                 self.events.emit(
@@ -9585,6 +10886,8 @@ impl Daemon {
                     self.drain(&rollout.app, &rollout.candidate, Retention::inspection())
                         .await;
                 }
+
+                self.release_rollout_pins(rollout);
             }
         }
 
@@ -9775,6 +11078,11 @@ impl Daemon {
 
         let outcome = match promoted {
             Ok(_) => {
+                if let Some(shared) = &mut rollout.shared {
+                    shared.sizing = false;
+                    shared.finishing = false;
+                }
+
                 rollout.state = RolloutState::Promoted;
                 rollout.message = message.clone();
                 rollout.updated_unix_ms = now_unix_ms();
@@ -9791,6 +11099,11 @@ impl Daemon {
                             "notice",
                             &format!("rollout {}: {message}", rollout.id),
                         );
+
+                        // Section 9.16: the candidate serves, and is its
+                        // own count's or policy's to size from here.
+
+                        self.release_rollout_pins(&rollout);
                         Ok(rollout)
                     }
                     Err(error) => Err(error.to_string()),
@@ -9872,6 +11185,8 @@ impl Daemon {
         };
 
         let message = format!("promoted by hand at {}%", rollout.percent());
+        let mut rollout = rollout;
+        self.grow_candidate_now(&mut rollout);
         self.promote_rollout(rollout, &message, Some(done)).await;
     }
 
@@ -9949,7 +11264,7 @@ impl Daemon {
             tracing::error!(%error, "pushing the snapshot for a held release failed");
         }
 
-        self.mark_ready(app, id, "held: not serving");
+        self.mark_ready(app, id, &held_message(app, id));
         Ok(true)
     }
 
@@ -10088,6 +11403,14 @@ impl Daemon {
             let subject = format!("{app}@{}", rollout.candidate);
             let now = now_unix_ms();
 
+            // Section 9.16: while a step's workers are put in place the
+            // traffic has not moved, so there is nothing of the step to
+            // judge yet.
+
+            if self.size_rollout(&mut rollout).await {
+                continue;
+            }
+
             let run = match self.rollout_runs.get(&app) {
                 Some(run) if run.rollout == rollout.id && run.step == rollout.step => run.clone(),
                 _ => {
@@ -10162,7 +11485,39 @@ impl Daemon {
                 continue;
             }
 
+            // Section 9.16: a step is not finished until the workers
+            // the baseline gave up for it have exited, so that the next
+            // does not put the candidate's in beside them.
+
+            if rollout.shared.is_some() && self.draining_for(&rollout, None) {
+                let message = format!(
+                    "step {} at {percent}%: passed its gates; waiting for the workers {} gave up to exit",
+                    rollout.step + 1,
+                    rollout.baseline
+                );
+
+                if rollout.message != message {
+                    rollout.message = message;
+                    rollout.updated_unix_ms = now;
+                    let _ = self.store.put_rollout(&rollout);
+                }
+
+                continue;
+            }
+
             if rollout.step + 1 >= rollout.steps.len() {
+                // Sharing capacity, the candidate is grown to the whole
+                // total first, and promoted once those workers are ready.
+
+                if let Some(shared) = &mut rollout.shared {
+                    shared.finishing = true;
+                    rollout.updated_unix_ms = now;
+                    rollout.message = format!("every step passed its gates{SIZING}");
+                    let _ = self.store.put_rollout(&rollout);
+                    self.rollout_runs.remove(&app);
+                    continue;
+                }
+
                 self.promote_rollout(rollout, "every step passed its gates", None)
                     .await;
                 continue;
@@ -10172,6 +11527,15 @@ impl Daemon {
             rollout.step_started_unix_ms = now;
             rollout.updated_unix_ms = now;
             self.rollout_runs.remove(&app);
+
+            // Sharing capacity, the step's workers are put in place
+            // before its traffic moves: the step before's share stays in
+            // force until then, and `size_rollout` moves it.
+
+            let sizing = rollout.shared.as_mut().is_some_and(|shared| {
+                shared.sizing = true;
+                true
+            });
 
             if rollout.approve_each_step {
                 rollout.state = RolloutState::AwaitingApproval;
@@ -10186,9 +11550,16 @@ impl Daemon {
             }
 
             rollout.message = step_message(&rollout.steps, rollout.step);
-            let _ = self.store.put_rollout(&rollout);
             self.events
                 .emit("rollout.step", &subject, "notice", &rollout.message);
+
+            if sizing {
+                rollout.message.push_str(SIZING);
+                let _ = self.store.put_rollout(&rollout);
+                continue;
+            }
+
+            let _ = self.store.put_rollout(&rollout);
 
             if let Err(error) = self.push_snapshot().await {
                 tracing::error!(%error, "pushing the snapshot for a rollout step failed");
@@ -10367,6 +11738,7 @@ impl Daemon {
             .collect();
         let mut asks = Vec::new();
         let mut reasons: HashMap<(String, String, String), (u32, String)> = HashMap::new();
+        let small = self.starting_small();
 
         for ((app, id), running) in &mut self.running {
             // A retained release is at its warm floor (section 9.1), not
@@ -10377,8 +11749,18 @@ impl Daemon {
             }
 
             let subject = format!("{app}@{id}");
+            let held_small = small.contains(&(app.clone(), id.clone()));
 
             for index in 0..running.scalers.len() {
+                // Issue 964: a release that takes no traffic keeps each
+                // group at the count it started with, whatever its
+                // count or policy says, until it is pinned or serves.
+
+                if held_small && let Some(initial) = running.scalers[index].initial {
+                    running.scalers[index].scaler.hold_at(initial, now);
+                    continue;
+                }
+
                 let cost = running.worker_cost(&running.scalers[index], fallback);
                 let name = running.scalers[index].name.clone();
                 let Some(sockets) = running.group_sockets(&name) else {
@@ -10496,6 +11878,38 @@ impl Daemon {
             .write()
             .expect("defined names poisoned")
             .budget = view;
+    }
+
+    /// Issue 964: the running releases deployed with an initial count
+    /// that take no share of their application's traffic, whose groups
+    /// stay at that count. Empty, without reading the routes, when no
+    /// release was started small.
+    fn starting_small(&self) -> HashSet<(String, String)> {
+        let started: Vec<&(String, String)> = self
+            .running
+            .iter()
+            .filter(|(_, running)| running.retained_until.is_none())
+            .filter(|(_, running)| running.scalers.iter().any(|group| group.initial.is_some()))
+            .map(|(key, _)| key)
+            .collect();
+
+        if started.is_empty() {
+            return HashSet::new();
+        }
+
+        let routes = self.effective().0;
+        let rollouts = self.store.rollouts(None).unwrap_or_default();
+
+        started
+            .into_iter()
+            .filter(|(app, id)| {
+                self.running
+                    .get(&(app.clone(), id.clone()))
+                    .is_some_and(|running| running.held)
+                    || self.traffic_share(app, id, &routes, &rollouts) == 0
+            })
+            .cloned()
+            .collect()
     }
 
     /// Section 7.5: each window of a schedule or overlay that raises a
@@ -10669,8 +12083,8 @@ impl Daemon {
         };
 
         let backend = std::mem::replace(&mut running.backend, Backend::Dormant);
-        let run_dir = self.locations.run.path.join("apps").join(app).join(id);
-        let record = backend.record_path(&run_dir);
+        let dirs = self.host_dirs(app, id);
+        let record = backend.record_path(&dirs.files);
         let grace = self
             .store
             .release(app, id)
@@ -10693,7 +12107,7 @@ impl Daemon {
         // files again.
 
         let _ = std::fs::remove_file(record);
-        let _ = std::fs::remove_dir_all(run_dir.join("secrets"));
+        let _ = std::fs::remove_dir_all(dirs.files.join(SECRETS_DIR));
         running.control = None;
         running.status.clear();
         running.signals_from = None;
@@ -10857,12 +12271,12 @@ impl Daemon {
             return;
         }
 
-        let starting = release.spec.processes
+        let starting = release.spec.starting_processes()
             + release
                 .spec
                 .groups
                 .iter()
-                .map(|group| group.processes)
+                .map(GroupSpec::starting_processes)
                 .sum::<u32>();
         let used = self.budget_usage();
         let mut message = "a request is waiting: starting its host again".to_owned();
@@ -10947,6 +12361,113 @@ impl Daemon {
         used
     }
 
+    /// Section 7.9: grant each group of each release with a host its
+    /// surge allowance, from nothing, over what the node holds without
+    /// any, and tell each host its own when they change. A release with
+    /// no share of traffic has none.
+    fn grant_surges(&mut self) {
+        let budget = self.budget();
+        let fallback = self.node_mean_pss();
+        let routes = self.effective().0;
+        let rollouts = self.store.rollouts(None).unwrap_or_default();
+        let priorities: HashMap<String, i32> = self
+            .store
+            .apps()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|app| (app.name, app.priority))
+            .collect();
+        let mut used = crate::budget::Usage::default();
+        let mut asks = Vec::new();
+
+        for ((app, id), running) in &self.running {
+            used.add_usage(&running.usage_with(fallback, false));
+
+            if running.backend.host().is_none() {
+                continue;
+            }
+
+            let traffic = running.retained_until.is_none()
+                && !running.held
+                && self.traffic_share(app, id, &routes, &rollouts) > 0;
+
+            for group in &running.scalers {
+                asks.push(crate::budget::SurgeAsk {
+                    key: (app.clone(), id.clone(), group.name.clone()),
+                    priority: priorities.get(app).copied().unwrap_or(0),
+                    max_surge: group.max_surge,
+                    cost: running.worker_cost(group, fallback),
+                    traffic,
+                });
+            }
+        }
+
+        for starting in self.starting.values() {
+            used.memory += starting.reserved;
+        }
+
+        let mut granted: HashMap<(String, String), BTreeMap<String, crate::budget::Surge>> =
+            HashMap::new();
+
+        for ((app, id, group), surge) in crate::budget::grant_surges(&budget, used, asks) {
+            granted.entry((app, id)).or_default().insert(group, surge);
+        }
+
+        // The host keeps what it was last told while the daemon is away,
+        // so it is told at once of a change, and again now and then in
+        // case a message was lost with a connection.
+
+        let now = Instant::now();
+        let mut tell = Vec::new();
+
+        for (key, running) in &mut self.running {
+            running.surge = granted.remove(key).unwrap_or_default();
+
+            if running.control.is_none() || running.surge.is_empty() {
+                continue;
+            }
+
+            let stale = running.surge_told.as_ref().is_none_or(|(at, told)| {
+                *told != running.surge || now.saturating_duration_since(*at) >= SURGE_RETELL
+            });
+
+            if stale {
+                running.surge_told = Some((now, running.surge.clone()));
+                tell.push(key.clone());
+            }
+        }
+
+        for key in tell {
+            let Some(running) = self.running.get(&key) else {
+                continue;
+            };
+            let Some(control) = running.control.as_ref() else {
+                continue;
+            };
+            let groups: serde_json::Map<String, serde_json::Value> = running
+                .surge
+                .iter()
+                .map(|(group, surge)| {
+                    (
+                        group.clone(),
+                        serde_json::json!({
+                            "allowance": surge.allowance,
+                            "short": surge.short.map_or("", crate::budget::Short::as_str),
+                        }),
+                    )
+                })
+                .collect();
+
+            self.last_request += 1;
+            control.request(
+                self.last_request,
+                "surge",
+                None,
+                &serde_json::json!({ "groups": groups }),
+            );
+        }
+    }
+
     /// Section 7.4: the node's budget and what its releases hold, for the
     /// checks before a release starts and on schedules.
     fn budget_view(&self, used: crate::budget::Usage) -> crate::budget::View {
@@ -10956,6 +12477,7 @@ impl Daemon {
             used,
             fallback,
             sources: self.budget_sources(),
+            memory_from_cgroup: self.budget_table.memory.is_none(),
             ..crate::budget::View::default()
         };
 
@@ -11483,6 +13005,19 @@ impl Daemon {
             return Err(starting_refusal(app, id));
         }
 
+        // Section 9.16: a rollout that shares capacity sizes its two
+        // releases with pins of its own.
+
+        if let Ok(Some(rollout)) = self.store.active_rollout(app)
+            && rollout.shared.is_some()
+            && (rollout.baseline == id || rollout.candidate == id)
+        {
+            return Err(format!(
+                "release {app}@{id} is sized by rollout {}, which shares capacity between its releases; muructl rollout abort {app} or promote {app} ends it",
+                rollout.id
+            ));
+        }
+
         let Some(running) = self.running.get_mut(&key) else {
             return Err(format!("release {app}@{id} is not running"));
         };
@@ -11547,7 +13082,10 @@ impl Daemon {
                 "scaling.decision",
                 &subject,
                 "notice",
-                &format!("{group}: pinned to {count} workers by an operator"),
+                &format!(
+                    "{group}: pinned to {count} {} by an operator",
+                    if count == 1 { "worker" } else { "workers" }
+                ),
             );
             self.ask_scale(app, id, group, count);
         }
@@ -11960,6 +13498,19 @@ impl Daemon {
         self.store
             .set_app_releases(app, Some(&previous), current.as_deref())
             .map_err(|error| error.to_string())?;
+
+        // ADR 0082: an apply reads this, and does not put back in traffic
+        // the release a rollback took out of it.
+
+        if let Some(from) = &current {
+            self.store
+                .set_serving_origin(
+                    app,
+                    crate::model::ServingSetBy::Rollback { from: from.clone() },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
         self.events.emit(
             "app.rolled-back",
             app,
@@ -12239,14 +13790,10 @@ impl Daemon {
                 marks_changed |= servers.starting() != marked;
 
                 if !changes.is_empty() {
-                    let run_dir = self
-                        .locations
-                        .run
-                        .path
-                        .join("apps")
-                        .join(&key.0)
-                        .join(&key.1);
-                    write_record(&run_dir.join("servers.toml"), &servers.record());
+                    write_record(
+                        &servers.dirs().files.join(SERVERS_RECORD),
+                        &servers.record(),
+                    );
                 }
 
                 reports.extend(changes.into_iter().map(|report| (key.clone(), report)));
@@ -12440,6 +13987,8 @@ impl Daemon {
                         announced: running.announced,
                         workers: running.workers.clone(),
                         retained_until_unix_ms: running.retained_until_unix_ms,
+                        surge: running.surge.clone(),
+                        restart: running.restart.clone(),
                     },
                 )
             })
@@ -12483,7 +14032,7 @@ impl Daemon {
                     self.edge.pid().unwrap_or(0),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                write_edge_record(&self.locations.run.path, &self.edge);
+                write_edge_record(&self.locations, &self.edge);
                 self.events.emit(
                     "edge.restarted",
                     "edge",
@@ -12510,45 +14059,43 @@ impl Daemon {
             return;
         };
 
-        let path = host.control_path();
-        let commands = self.commands.clone();
-        let (app, id) = (app.to_owned(), id.to_owned());
+        tokio::spawn(keep_control(
+            self.commands.clone(),
+            app.to_owned(),
+            id.to_owned(),
+            host.pid(),
+            host.control_path(),
+            None,
+        ));
+    }
 
-        tokio::spawn(async move {
-            let (control, mut messages) = match HostControl::connect(&path).await {
-                Ok(connected) => connected,
-                Err(error) => {
-                    tracing::info!(%error, "release {app}@{id}: no host control connection");
-                    return;
-                }
-            };
+    /// Feed what a host says on a control connection already made into
+    /// the daemon's inbox, `sent` first: what it said before the
+    /// connection was handed over. The connection is made again if it
+    /// ends, as one the daemon made itself is.
+    fn forward_control(
+        &self,
+        app: &str,
+        id: &str,
+        sent: Vec<HostMessage>,
+        messages: mpsc::Receiver<HostMessage>,
+    ) {
+        let Some(host) = self
+            .running
+            .get(&(app.to_owned(), id.to_owned()))
+            .and_then(|running| running.backend.host())
+        else {
+            return;
+        };
 
-            if commands
-                .send(Command::HostAttached {
-                    app: app.clone(),
-                    id: id.clone(),
-                    control,
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-
-            while let Some(message) = messages.recv().await {
-                let sent = commands
-                    .send(Command::HostMessage {
-                        app: app.clone(),
-                        id: id.clone(),
-                        message,
-                    })
-                    .await;
-
-                if sent.is_err() {
-                    break;
-                }
-            }
-        });
+        tokio::spawn(keep_control(
+            self.commands.clone(),
+            app.to_owned(),
+            id.to_owned(),
+            host.pid(),
+            host.control_path(),
+            Some((sent, messages)),
+        ));
     }
 
     /// Act on what a host said: new worker sockets go into the record
@@ -12587,14 +14134,14 @@ impl Daemon {
                     size_scalers(&mut running.scalers, &release.spec, interface);
                 }
 
-                let Some((record, pid)) = running.backend.host().map(|host| {
-                    (
-                        host.run_dir().join("..").join("host.toml"),
-                        host.pid().unwrap_or(0),
-                    )
-                }) else {
+                let Some((record, pid)) = running
+                    .backend
+                    .host()
+                    .map(|host| (host.dirs().files.join(HOST_RECORD), host.pid().unwrap_or(0)))
+                else {
                     return;
                 };
+
                 let before: BTreeSet<PathBuf> = running.routed_sockets().into_iter().collect();
                 running.sockets = sockets;
 
@@ -12656,6 +14203,7 @@ impl Daemon {
             HostMessage::Status {
                 workers,
                 memory_replacements,
+                swaps_waiting,
                 ..
             } => {
                 if let Some(running) = self.running.get_mut(&key) {
@@ -12712,6 +14260,25 @@ impl Daemon {
 
                     running.status = workers;
                     running.memory_replacements = memory_replacements;
+                    running.swaps_waiting = swaps_waiting;
+                }
+            }
+            HostMessage::Restart {
+                total,
+                left,
+                started_unix_ms,
+                group,
+            } => {
+                // Section 10.14: the host holds the restart, and says how
+                // far it has got; none is under way once nothing is left.
+
+                if let Some(running) = self.running.get_mut(&key) {
+                    running.restart = (left > 0).then_some(RestartProgress {
+                        total,
+                        left,
+                        started_unix_ms,
+                        group,
+                    });
                 }
             }
             HostMessage::Response { id, workers, error } => {
@@ -12771,6 +14338,8 @@ impl Daemon {
                 message,
                 group,
                 reason,
+                time_unix_ms,
+                number,
                 ..
             } => {
                 let level = match level.as_str() {
@@ -12779,6 +14348,52 @@ impl Daemon {
                     "notice" => "notice",
                     _ => "info",
                 };
+
+                // Section 11.5: the event is recorded, one the host held
+                // with the time it happened. A host that numbers its
+                // events (issue 982) is told once each is recorded, and
+                // sends again what it was not told of, to this daemon or
+                // the next, so one recorded already is acknowledged
+                // again and neither recorded nor counted twice.
+
+                let new = match number {
+                    Some(number) => {
+                        let recorded = self.events.emit_from_host(&crate::store::HostEvent {
+                            app,
+                            release: id,
+                            number,
+                            kind: &kind,
+                            level,
+                            message: &message,
+                            happened_unix_ms: time_unix_ms,
+                        });
+
+                        if recorded.is_some()
+                            && let Some(control) = self
+                                .running
+                                .get(&key)
+                                .and_then(|running| running.control.as_ref())
+                        {
+                            control.recorded(number.seq);
+                        }
+
+                        recorded.unwrap_or(false)
+                    }
+                    None => {
+                        self.events.emit_at(
+                            &kind,
+                            &format!("{app}@{id}"),
+                            level,
+                            &message,
+                            time_unix_ms,
+                        );
+                        true
+                    }
+                };
+
+                if !new {
+                    return;
+                }
 
                 // Section 11.1: a replaced worker and an exit are counted
                 // by group and reason.
@@ -12815,9 +14430,6 @@ impl Daemon {
                         .entry((app.to_owned(), id.to_owned()))
                         .or_default() += 1;
                 }
-
-                self.events
-                    .emit(&kind, &format!("{app}@{id}"), level, &message);
             }
         }
     }
@@ -12841,7 +14453,7 @@ impl Daemon {
                     .edge_pid
                     .store(pid, std::sync::atomic::Ordering::Relaxed);
                 *self.info.listeners.write().expect("listeners poisoned") = self.edge.listeners();
-                write_edge_record(&self.locations.run.path, &self.edge);
+                write_edge_record(&self.locations, &self.edge);
                 self.events.emit(
                     "edge.replaced",
                     "edge",
@@ -12941,14 +14553,13 @@ impl Daemon {
                 .map(|release| release.spec.timeouts.stop_budget())
                 .unwrap_or(DRAIN_TIMEOUT);
             let kill_at = deadline.min(Instant::now() + budget + crate::host::STOP_MARGIN);
-            let run_dir = self.locations.run.path.join("apps").join(&app).join(&id);
-            let record = running.backend.record_path(&run_dir);
+            let dirs = self.host_dirs(&app, &id);
             stopping.push(async move {
                 running
                     .backend
                     .stop_until(kill_at, crate::shutdown::workers_deadline(deadline))
                     .await;
-                forget_release_dir(&run_dir, &record);
+                forget_release_dir(&dirs);
                 release
             });
         }
@@ -12961,7 +14572,19 @@ impl Daemon {
             self.set_state(&release, ReleaseState::Stopped, "the daemon stopped");
         }
 
-        let _ = std::fs::remove_dir(self.locations.run.path.join("apps"));
+        for base in [self.locations.run.path.clone(), self.locations.files()] {
+            let _ = std::fs::remove_dir(base.join(crate::locations::HOSTS_DIR));
+        }
+    }
+
+    /// The directories of a release's host (section 13.8), named by the
+    /// release's number in the store.
+    fn host_dirs(&self, app: &str, id: &str) -> HostDirs {
+        let number = self
+            .store
+            .release(app, id)
+            .map_or(0, |release| release.number);
+        self.locations.host_dirs(number)
     }
 
     /// Where a release's host writes its output, its directory created.
@@ -13784,6 +15407,71 @@ fn size_scalers(
     }
 }
 
+/// Keep a control connection to a release's host for as long as the
+/// release runs under it (section 5.9, issue 983), with
+/// `host::keep_control`: what the host says goes into the daemon's
+/// inbox, and when the connection ends the daemon is asked whether the
+/// host, by its pid, is still the release's, and the connection is made
+/// again if so. `made` is a connection already up, with what the host
+/// has said on it so far.
+async fn keep_control(
+    commands: mpsc::Sender<Command>,
+    app: String,
+    id: String,
+    pid: Option<u32>,
+    path: PathBuf,
+    made: Option<(Vec<HostMessage>, mpsc::Receiver<HostMessage>)>,
+) {
+    let wrap = move |event| match event {
+        ControlEvent::Attached { control, again } => {
+            if again {
+                tracing::info!(
+                    "release {app}@{id}: the host control connection ended and was made again"
+                );
+            }
+
+            Command::HostAttached {
+                app: app.clone(),
+                id: id.clone(),
+                control,
+            }
+        }
+        ControlEvent::Message(message) => Command::HostMessage {
+            app: app.clone(),
+            id: id.clone(),
+            message: *message,
+        },
+        ControlEvent::Ended {
+            failed,
+            again,
+            answer,
+        } => {
+            // A host that has just exited closes its connection a
+            // moment before the daemon knows it has gone, so only a
+            // first connection that fails is worth a line.
+
+            match failed {
+                Some(error) if again => {
+                    tracing::debug!(%error, "release {app}@{id}: no host control connection");
+                }
+                Some(error) => {
+                    tracing::info!(%error, "release {app}@{id}: no host control connection");
+                }
+                None => {}
+            }
+
+            Command::HostDetached {
+                app: app.clone(),
+                id: id.clone(),
+                pid,
+                again: answer,
+            }
+        }
+    };
+
+    crate::host::keep_control(commands, path, made, wrap).await;
+}
+
 /// Section 7.4: the scaling state of each group of a release that is
 /// starting or adopted, from its spec, the interface it runs as, the
 /// workers it has and the pins an operator left on it.
@@ -13810,7 +15498,9 @@ fn scalers_for(
         let current = groups
             .iter()
             .find(|record| record.name == group.name)
-            .map_or(group.processes as usize, |record| record.sockets.len());
+            .map_or(group.starting_processes() as usize, |record| {
+                record.sockets.len()
+            });
         scalers.push(GroupScaling::new(
             &group.name,
             group.scaling.clone(),
@@ -13824,6 +15514,8 @@ fn scalers_for(
     // Issue 384: a worker of a group with a hard limit counts at it.
 
     for scaling in &mut scalers {
+        scaling.max_surge = spec.group_swap(&scaling.name).0;
+        scaling.initial = spec.group_initial(&scaling.name);
         scaling.hard_limit = spec
             .groups
             .iter()
@@ -13992,6 +15684,16 @@ fn upstream_message(name: &str, table: &muru_config::Upstream) -> anyhow::Result
 }
 
 /// A policy's sticky grace: what it says, or 10 minutes.
+/// What a held release's message starts with, by which listings know
+/// one.
+pub(crate) const HELD: &str = "held: not serving";
+
+/// A held release's message: that it serves nothing, and how to try it
+/// (section 4.22). Never its preview secret.
+fn held_message(app: &str, id: &str) -> String {
+    format!("{HELD}; muructl preview {app}@{id} previews it")
+}
+
 fn sticky_grace_of(traffic: &muru_config::Traffic) -> Duration {
     traffic
         .sticky_grace
@@ -14016,6 +15718,28 @@ fn describe_steps(steps: &[RolloutStep]) -> String {
 }
 
 /// What a rollout at this step is doing: "step 2 of 3: 50% for 2m".
+/// Section 9.16: what a rollout's message says after its step while the
+/// step's workers are being moved and its traffic has not.
+const SIZING: &str = ": putting its workers in place";
+
+/// Section 9.16: what a rollout that shares capacity adds to its first
+/// message: the total its two releases share, over every group.
+fn total_note(shared: &SharedCapacity) -> String {
+    format!(
+        ", on a shared total of {}",
+        workers(shared.totals.values().sum())
+    )
+}
+
+/// A count of workers, in words.
+fn workers(count: u32) -> String {
+    if count == 1 {
+        "1 worker".to_owned()
+    } else {
+        format!("{count} workers")
+    }
+}
+
 fn step_message(steps: &[RolloutStep], step: usize) -> String {
     match steps.get(step) {
         Some(current) => format!(
@@ -14034,11 +15758,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_restart_is_refused_when_it_would_be_an_upgrade() {
+        // Issue 940: the same version again is a restart, and another
+        // version is left to muructl daemon upgrade.
+
+        let found = |version: &str| Upgrade {
+            executable: PathBuf::from("/usr/bin/muructl"),
+            version: version.to_owned(),
+            restart: false,
+        };
+
+        assert!(restart_of(found("1.2.0"), "1.2.0").unwrap().restart);
+        assert_eq!(
+            restart_of(found("1.3.0"), "1.2.0").unwrap_err(),
+            "/usr/bin/muructl is version 1.3.0, and the daemon runs version 1.2.0, so a \
+             restart would upgrade it: use muructl daemon upgrade"
+        );
+    }
+
+    #[test]
     fn a_record_names_a_process_by_its_path_or_its_title() {
-        let run_dir = Path::new("/run/muru/apps/shop/r42");
+        let run_dir = Path::new("/run/muru/h/14");
 
         assert!(super::names(
-            "python -m muru.host --socket-dir /run/muru/apps/shop/r42/r1",
+            "python -m muru.host --socket-dir /run/muru/h/14 --files-dir /var/lib/muru/run/h/14",
+            run_dir,
+            "muru host shop@r42"
+        ));
+        assert!(super::names(
+            "muructl relay run --control /run/muru/h/14/relay.sock",
+            run_dir,
+            "muru relay shop@r42"
+        ));
+        assert!(!super::names(
+            "python -m muru.host --socket-dir /run/muru/h/142",
             run_dir,
             "muru host shop@r42"
         ));
@@ -14263,5 +16016,71 @@ mod tests {
             crate::scaling::worker_size(Interface::Grpc, 4, 8, 1000),
             (1000.0, 9)
         );
+    }
+
+    // Issue 983: a control connection that ends is made again for as
+    // long as the daemon says the release runs under the host.
+
+    #[tokio::test]
+    async fn a_control_connection_that_ends_is_made_again_while_the_host_is_the_releases() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (commands, mut inbox) = mpsc::channel(8);
+        let kept = tokio::spawn(keep_control(
+            commands,
+            "shop".to_owned(),
+            "r1".to_owned(),
+            Some(7),
+            path.clone(),
+            None,
+        ));
+
+        // The host says one thing and closes, as it does when a send to
+        // its supervisor fails.
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream
+            .write_all(b"{\"type\":\"restart\",\"total\":0,\"left\":0}\n")
+            .await
+            .unwrap();
+        drop(stream);
+        assert!(matches!(
+            inbox.recv().await,
+            Some(Command::HostAttached { .. })
+        ));
+        assert!(matches!(
+            inbox.recv().await,
+            Some(Command::HostMessage {
+                message: HostMessage::Restart { left: 0, .. },
+                ..
+            })
+        ));
+
+        let Some(Command::HostDetached { pid, again, .. }) = inbox.recv().await else {
+            panic!("the end of the connection was not reported");
+        };
+
+        assert_eq!(pid, Some(7));
+        again.send(true).unwrap();
+
+        // It connects again, and stops once the release is no longer
+        // the host's.
+
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            inbox.recv().await,
+            Some(Command::HostAttached { .. })
+        ));
+        drop(stream);
+
+        let Some(Command::HostDetached { again, .. }) = inbox.recv().await else {
+            panic!("the end of the second connection was not reported");
+        };
+
+        again.send(false).unwrap();
+        kept.await.unwrap();
     }
 }

@@ -151,6 +151,36 @@ def test_failed_deploy_keeps_the_previous_release_serving(daemon: Daemon) -> Non
     assert "release.failed" in daemon.events()
 
 
+def test_a_long_application_name_and_release_id_do_not_lengthen_a_socket_path(
+    daemon: Daemon,
+) -> None:
+    # Issue 948: a host's sockets are in a directory named by the
+    # release's number, so their paths carry neither the application's
+    # name nor the release's ID. With both in the path, as they were, the
+    # longest name and a commit hash as the ID come to more than the 103
+    # bytes macOS allows a socket's path, under the run directory the
+    # tests use, and the release never started.
+
+    app = "a-name-of-24-characters0"
+    release = "0123456789abcdef0123456789abcdef01234567"
+    assert len(app) == 24 and len(release) == 40
+
+    named = Path("apps") / app / release / "r1" / "worker-0.sock"
+    assert len(str(daemon.run_dir / named)) > 103
+
+    line = daemon.deploy(app, SHOP, "--release", release, "--processes", "1")
+    assert f"release {app}@{release}" in line, line
+    assert daemon.get("/").status == 200
+    assert daemon.releases(app) == [
+        {"release": f"{app}@{release}", "state": "ready", "serving": "yes"}
+    ]
+
+    sockets = sorted(path for path in daemon.run_dir.rglob("*.sock"))
+    assert daemon.run_dir / "h" / "1" / "worker-0.sock" in sockets
+    assert all(app not in str(path) and release not in str(path) for path in sockets)
+    assert max(len(str(path)) for path in sockets) <= len(str(daemon.run_dir)) + 30
+
+
 def test_settings_come_from_the_table_and_flags(daemon: Daemon) -> None:
     # The shop project's pyproject.toml sets processes and threads; the
     # factory project's muru.toml names a factory entrypoint.
@@ -188,7 +218,19 @@ def test_a_dead_host_is_started_again(daemon: Daemon) -> None:
 
     # The host writes to its own log; its pid is in the daemon's record.
 
-    record = (daemon.run_dir / "apps" / "shop" / "r1" / "host.toml").read_text()
+    # Section 13.8: the record is among the runtime files, in the
+    # directory named by the release's number, and the host's sockets are
+    # in the directory of that number under the run directory, which
+    # holds nothing but sockets and directories.
+
+    record = (daemon.files_dir / "h" / "1" / "host.toml").read_text()
+    host_sockets = daemon.run_dir / "h" / "1"
+    assert (host_sockets / "control.sock").is_socket()
+    assert (host_sockets / "worker-0.sock").is_socket()
+    assert [
+        path for path in daemon.run_dir.rglob("*") if not path.is_socket() and not path.is_dir()
+    ] == []
+
     host_pid = int(
         next(line.split("=")[1] for line in record.splitlines() if line.startswith("pid"))
     )
@@ -218,9 +260,11 @@ def test_current_release_is_started_again_after_a_shutdown(tmp_path: Path) -> No
     # Nothing is left for the next daemon to adopt: no host or edge record,
     # no rate limit buckets, and no empty release directories.
 
-    assert not (first.run_dir / "apps").exists()
-    assert not (first.run_dir / "edge.toml").exists()
-    assert not (first.run_dir / "edge" / "rate-buckets-v1").exists()
+    assert not (first.run_dir / "h").exists()
+    assert not (first.files_dir / "h").exists()
+    assert not (first.files_dir / "edge.toml").exists()
+    assert not (first.files_dir / "edge").exists()
+    assert not (first.run_dir / "e").exists()
 
     second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
 
@@ -488,7 +532,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
         )
         assert "already running" in again.stdout
         pid = again.stdout.split("(pid ")[1].split(")")[0]
-        assert (run_dir / "daemon.pid").read_text() == pid
+        assert (tmp_path / "state" / "run" / "daemon.pid").read_text() == pid
 
         # A daemon that detaches is gone too, so its pid file goes with it.
 
@@ -500,7 +544,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
             timeout=60,
         )
         assert "detached" in detached.stdout, detached.stdout + detached.stderr
-        assert not (run_dir / "daemon.pid").exists()
+        assert not (tmp_path / "state" / "run" / "daemon.pid").exists()
         restarted = subprocess.run(
             [str(muructl), "up", *serving, *location],
             capture_output=True,
@@ -532,7 +576,7 @@ def test_background_daemon_start_status_stop(tmp_path: Path) -> None:
     assert "daemon stopped" in stopped.stdout, stopped.stdout + stopped.stderr
     assert "releases drained and stopped" in stopped.stdout
     assert (tmp_path / "logs" / "daemon.log").is_file()
-    assert not (run_dir / "daemon.pid").exists()
+    assert not (tmp_path / "state" / "run" / "daemon.pid").exists()
 
     # With the daemon stopped, its own log is read from the file, and its
     # status says where its files would be.
@@ -733,7 +777,7 @@ def test_a_relative_or_deep_run_directory_is_refused_at_start(tmp_path: Path) ->
 
     deep = start("/tmp/" + "x" * 90)
     assert deep.returncode != 0
-    assert "leaves" in deep.stderr and "bytes" in deep.stderr, deep.stderr
+    assert "a worker's socket path under it can be" in deep.stderr, deep.stderr
     assert "shorter path" in deep.stderr
 
 
@@ -791,11 +835,11 @@ def test_a_deploy_takes_nothing_from_the_release_before(daemon: Daemon) -> None:
         "shop", SHOP, "--timeout", "soft=3s", "--memory", "soft_limit=800MB", "--env", "DEBUG=1"
     )
     daemon.deploy("shop", SHOP)
-    shown = daemon.muructl("config", "show", "shop", "--effective").stdout
+    shown = daemon.muructl("deployment", "show", "--app", "shop", "--effective").stdout
     assert "#   shop@r2: timeouts.soft_timeout = off (default)" in shown
     assert "#   shop@r2: memory.soft_limit = off (default)" in shown
     assert "#   shop@r2: threads = 3 ([tool.muru])" in shown
-    exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "show", "--app", "shop").stdout)
     assert "env" not in exported["app"]["shop"]["release"]["r2"]
 
 
@@ -850,7 +894,7 @@ def test_a_deploy_records_where_its_code_came_from(daemon: Daemon, tmp_path: Pat
 
     # The export writes it, and a limit refuses a deploy before it is sent.
 
-    exported = tomllib.loads(daemon.muructl("config", "show", "shop").stdout)
+    exported = tomllib.loads(daemon.muructl("deployment", "show", "--app", "shop").stdout)
     assert exported["app"]["shop"]["release"]["r2"]["metadata"]["dirty"] == "true"
     refused = daemon.muructl(
         "deploy", "shop", str(source), "--metadata", "url=ftp://example.com", check=False

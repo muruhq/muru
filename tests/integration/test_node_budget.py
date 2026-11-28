@@ -8,6 +8,7 @@ their windows.
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
@@ -97,7 +98,7 @@ def budget_line(daemon: Daemon, expected: str | None = None, timeout: float = 20
 
 
 def test_scale_ups_are_admitted_within_the_worker_budget(tmp_path: Path) -> None:
-    daemon = start_daemon(tmp_path, config_extra="[daemon.budget]\nworkers = 2\n")
+    daemon = start_daemon(tmp_path, config_extra="[daemon.budget]\nworkers = 3\n")
     stopping = threading.Event()
 
     def load() -> None:
@@ -114,11 +115,15 @@ def test_scale_ups_are_admitted_within_the_worker_budget(tmp_path: Path) -> None
         applied = daemon.muructl("apply", "-f", str(config)).stdout
         assert "set-priority" in applied, applied
         assert "[priority 5]" in daemon.muructl("app", "list").stdout
-        assert budget_line(daemon, "1 of 2") == "budget   1 of 2 workers"
+
+        # Section 7.9: the one worker and the room held to replace it.
+
+        held = "budget   2 of 3 workers, 1 worker held for swaps"
+        assert budget_line(daemon, "2 of 3") == held
 
         # Four requests in flight against one single-threaded worker: the
-        # group asks for more than the node's two workers, and is given
-        # what fits.
+        # group asks for more than the node has room for beside what it
+        # holds for swaps, and is given what fits.
 
         for thread in threads:
             thread.start()
@@ -130,7 +135,7 @@ def test_scale_ups_are_admitted_within_the_worker_budget(tmp_path: Path) -> None
 
         time.sleep(4)
         assert ready_workers(daemon) == 2
-        assert budget_line(daemon, "2 of 2") == "budget   2 of 2 workers"
+        assert budget_line(daemon, "3 of 3") == "budget   3 of 3 workers, 1 worker held for swaps"
         assert "held at 2" in daemon.muructl("scale", "status", "shop").stdout
 
         # A floor beyond the budget is reported when applied, and once
@@ -158,6 +163,60 @@ min_workers = 4
             if thread.is_alive():
                 thread.join(timeout=10)
 
+        daemon.stop()
+
+
+def test_the_budget_holds_room_for_swaps_and_a_recycle_waits_without_it(tmp_path: Path) -> None:
+    """Section 7.9: a group's surge allowance counts as held, is withdrawn
+    when the budget has no room and for a release that takes no traffic,
+    and a recycle waits for it when nothing may stop first."""
+
+    daemon = start_daemon(tmp_path, config_extra="[daemon.budget]\nworkers = 3\n")
+
+    try:
+        config = tmp_path / "shop.toml"
+        config.write_text(
+            f"[app.shop.release.r1]\nsource = '{SHOP}'\npython = '{sys.executable}'\n"
+            "processes = 2\nthreads = 1\nmax_requests = 20\n"
+        )
+        assert daemon.muructl("apply", "-f", str(config)).returncode == 0
+        held = "budget   3 of 3 workers, 1 worker held for swaps"
+        assert budget_line(daemon, "held for swaps") == held
+        assert "surge allowance" not in daemon.muructl("release", "show", "shop@r1").stdout
+
+        # A third worker takes the room the allowance held. The workers
+        # come due for a recycle and wait, since max_unavailable is 0.
+
+        daemon.muructl("scale", "shop", "--processes", "3")
+        assert wait_until(lambda: budget_line(daemon) == "budget   3 of 3 workers")
+        shown = daemon.muructl("release", "show", "shop@r1").stdout
+        assert "no surge allowance now, since the node's worker budget has no room" in shown
+
+        for _ in range(90):
+            assert daemon.get("/").status == 200
+
+        waits = wait_for_event(daemon, "worker.swap_waiting")
+        assert waits, daemon.muructl("events").stdout
+        assert "the node's worker budget has no room for another worker" in waits[0]
+        assert not wait_for_event(daemon, "worker.recycled", timeout=3)
+
+        # Back at two workers the allowance is granted again, and the
+        # recycles that waited go ahead, one at a time.
+
+        daemon.muructl("scale", "shop", "--processes", "2")
+        assert wait_for_event(daemon, "worker.recycled")
+        assert budget_line(daemon, "held for swaps") == held
+
+        # A held release takes no traffic, so it is granted no allowance.
+
+        daemon.deploy("shop", SHOP, "--hold", "--processes", "1")
+        assert wait_until(
+            lambda: (
+                "no surge allowance now, since the release takes no traffic"
+                in daemon.muructl("release", "show", "shop@r2").stdout
+            )
+        ), daemon.muructl("release", "show", "shop@r2").stdout
+    finally:
         daemon.stop()
 
 
@@ -192,6 +251,90 @@ def test_a_release_whose_memory_does_not_fit_is_not_started(tmp_path: Path) -> N
         releases = daemon.muructl("release", "list", "shop").stdout
         assert "r2" not in releases, releases
         assert wait_for_event(daemon, "scaling.denied_by_budget")
+    finally:
+        daemon.stop()
+
+
+def workers_of(daemon: Daemon, release: str) -> str:
+    """The WORKERS column of the default group of `shop@release`."""
+
+    lines = daemon.muructl("scale", "status", f"shop@{release}").stdout.splitlines()
+    fields = next(line for line in lines[2:] if line.startswith("default")).split()
+    slots = next(index for index, field in enumerate(fields) if "/" in field)
+    return " ".join(fields[1:slots])
+
+
+def test_a_release_starts_small_to_fit_the_budget_and_takes_its_count_once_it_serves(
+    tmp_path: Path,
+) -> None:
+    """Issue 964: `--initial-processes` is the count the budget checks a
+    deploy at and the count the release keeps while it takes no traffic."""
+
+    # Room for six workers at 200MB and for the two hosts, which are
+    # counted at their own memory where it is measured.
+
+    daemon = start_daemon(tmp_path, config_extra="[daemon.budget]\nmemory = '1300MB'\n")
+    declared = ["--processes", "4", "--memory", "hard_limit=200MB"]
+
+    def held() -> int:
+        """The megabytes `daemon status` says the releases hold."""
+
+        figure = [*budget_line(daemon).split(), "", "0B"][1]
+        units = {"GB": 1024.0, "MB": 1.0, "KB": 1 / 1024, "B": 1 / 1024 / 1024}
+        unit = next(unit for unit in units if figure.endswith(unit))
+        return int(float(figure.removesuffix(unit)) * units[unit])
+
+    try:
+        # Four workers at their hard limit and the room held to replace
+        # one: a second copy at full size does not fit, and neither does
+        # an initial count over the declared one make sense.
+
+        assert (
+            daemon.deploy("shop", SHOP, *declared) == "muru: release shop@r1 is ready and serving"
+        )
+        assert wait_until(lambda: 1000 <= held() < 1100), budget_line(daemon)
+        assert "of 1.3GB memory, 1 worker held for swaps" in budget_line(daemon)
+        refused = daemon.muructl("deploy", "shop", str(SHOP), *declared, check=False)
+        assert "the release needs about" in refused.stderr, refused.stderr
+        assert "the node's memory budget of 1.3GB has" in refused.stderr, refused.stderr
+        over = daemon.muructl(
+            "deploy", "shop", str(SHOP), *declared, "--initial-processes", "5", check=False
+        )
+        assert "5 initial processes are more than the 4 the release is declared with" in (
+            over.stderr
+        ), over.stderr
+
+        # With one worker fewer in the serving release, the new one fits
+        # at one worker, declared at four.
+
+        daemon.muructl("scale", "shop", "--processes", "3")
+        assert wait_until(lambda: 800 <= held() < 900), budget_line(daemon)
+        small = daemon.deploy("shop", SHOP, *declared, "--hold", "--initial-processes", "1")
+        assert small.splitlines()[0] == "muru: release shop@r2 is ready and held: not serving"
+        shown = daemon.muructl("release", "show", "shop@r2").stdout
+        assert "4 processes of 3 threads; 1 to start with and while it takes no traffic" in shown
+        described = json.loads(daemon.muructl("release", "show", "shop@r2", "--json").stdout)
+        assert (described["processes"], described["initial_processes"]) == (4, 1), described
+
+        # It stays there while it takes no traffic. A pin moves it, and
+        # lifting the pin brings it back.
+
+        time.sleep(3)
+        assert workers_of(daemon, "r2") == "1"
+        daemon.muructl("scale", "shop@r2", "--processes", "2")
+        assert wait_until(lambda: workers_of(daemon, "r2") == "2 pinned")
+        daemon.muructl("scale", "shop@r2", "--unpin")
+        assert wait_until(lambda: workers_of(daemon, "r2") == "1")
+        status = daemon.muructl("scale", "status", "shop@r2").stdout
+        assert "held at its initial count of 1: the release takes no traffic" in status, status
+
+        # Given the traffic, it takes the count it is declared with, as
+        # the budget admits it, with no pin holding it there.
+
+        daemon.muructl("rollout", "bluegreen", "shop@r2")
+        assert wait_until(lambda: workers_of(daemon, "r2") == "4"), daemon.muructl("events").stdout
+        events = daemon.muructl("events").stdout
+        assert "back toward the static count of 4" in events, events
     finally:
         daemon.stop()
 

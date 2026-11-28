@@ -9,10 +9,13 @@
 
 mod admin;
 mod browser;
+mod daemon_config;
+mod daemon_reset;
 mod dashboard;
 mod detour;
 mod devcert;
 mod diagnostics;
+mod doctor;
 mod edge;
 mod imports;
 mod init;
@@ -21,6 +24,7 @@ mod log_format;
 mod mcp;
 mod open;
 mod places;
+mod preview;
 mod print_config;
 mod processes;
 mod project_commands;
@@ -247,13 +251,16 @@ enum Command {
         output: admin::JsonArgs,
     },
 
-    /// Apply declarative configuration from a file or a directory of files.
+    /// Apply files that say what the daemon serves: applications, their
+    /// releases, hosts, routes, upstreams and overlays. It never changes
+    /// the daemon's own settings.
     Apply(Box<admin::ApplyArgs>),
 
-    /// Export, compare or inspect declarative configuration.
-    Config {
+    /// What the daemon serves, as applied files state it: export it,
+    /// show it or compare files with it.
+    Deployment {
         #[command(subcommand)]
-        command: admin::ConfigCommand,
+        command: admin::DeploymentCommand,
     },
 
     /// Manage the file secret stores.
@@ -266,6 +273,11 @@ enum Command {
     /// instance's dashboard in the browser on this machine.
     Open(Box<open::OpenArgs>),
 
+    /// Preview a release before it takes traffic: open a one-time entry
+    /// link to it in the browser, print the link, or print the
+    /// Muru-Preview header that reaches it.
+    Preview(Box<preview::PreviewArgs>),
+
     /// Look into a release's workers (status, stacks, tasks, inspect),
     /// and collect diagnostics: a report for a bug report, a bundle of
     /// the system for triage.
@@ -273,6 +285,12 @@ enum Command {
         #[command(subcommand)]
         command: admin::DebugCommand,
     },
+
+    /// Check Muru itself: list every socket and file of an installation
+    /// with what it is for, who owns it and its condition, and check one
+    /// part against another. Reads and never changes anything, works with
+    /// no daemon running, and exits 1 when a check fails.
+    Doctor(Box<doctor::DoctorArgs>),
 
     /// The Muru instances on this machine: daemons, development runs and
     /// serves, and what they left behind.
@@ -712,6 +730,18 @@ struct RunArgs {
     #[arg(long, value_name = "DURATION", value_parser = muru_config::parse_duration)]
     max_lifetime: Option<Duration>,
 
+    /// Workers a group may run over its count while workers are swapped
+    /// (default 1): a replacement starts before the old worker stops
+    /// while the group is within it, and with 0 the old worker stops
+    /// first.
+    #[arg(long, value_name = "N")]
+    max_surge: Option<u32>,
+
+    /// Workers a group may run under its count while workers are
+    /// swapped (default 0).
+    #[arg(long, value_name = "N")]
+    max_unavailable: Option<u32>,
+
     /// A memory setting as KEY=VALUE: measure (uss, pss or rss),
     /// soft_limit (for example 800MB), soft_for (2m), reclaim_first
     /// (true), hard_limit (1200MB) or check_interval (5s). Repeatable.
@@ -1126,7 +1156,7 @@ fn running(command: &Command) -> admin::Running {
             daemon_only: args.app().is_some(),
             ..admin::Running::default()
         },
-        Command::Detour { .. } => admin::Running {
+        Command::Detour { .. } | Command::Preview(_) => admin::Running {
             daemon_only: true,
             ..admin::Running::default()
         },
@@ -1302,7 +1332,6 @@ fn main() -> anyhow::Result<()> {
         Command::Detour { command } => match command {
             detour::DetourCommand::Run(args) => runtime.block_on(detour::run(*args)),
             detour::DetourCommand::Traffic(args) => runtime.block_on(detour::traffic(args)),
-            detour::DetourCommand::Preview(args) => runtime.block_on(detour::preview(args)),
             detour::DetourCommand::List(args) => runtime.block_on(detour::list(args)),
         },
         Command::Serve(args) => runtime.block_on(serve::serve(*args)),
@@ -1318,6 +1347,9 @@ fn main() -> anyhow::Result<()> {
                     output,
                 },
         } => exit_with(runtime, admin::daemon_status(socket, files, output.json)),
+        Command::Daemon {
+            command: admin::DaemonCommand::Reset(args),
+        } => exit_with(runtime, async move { daemon_reset::reset(*args) }),
         Command::Daemon { command } => runtime.block_on(async move {
             match command {
                 admin::DaemonCommand::Run(args) => admin::daemon_run(args).await,
@@ -1336,14 +1368,25 @@ fn main() -> anyhow::Result<()> {
                     socket,
                     files,
                 } => admin::daemon_upgrade(socket, files, timeout).await,
+                admin::DaemonCommand::Restart {
+                    timeout,
+                    socket,
+                    files,
+                } => admin::daemon_restart(socket, files, timeout).await,
                 admin::DaemonCommand::Status { .. } => {
                     unreachable!("daemon status is matched on its own")
+                }
+                admin::DaemonCommand::Config { command } => daemon_config::run(command).await,
+                admin::DaemonCommand::Reset(_) => {
+                    unreachable!("daemon reset is matched on its own")
                 }
             }
         }),
         Command::Up(args) => runtime.block_on(admin::up(args)),
         Command::Debug { command } => runtime.block_on(admin::debug(command)),
         Command::Open(args) => runtime.block_on(open::open(*args)),
+        Command::Preview(args) => runtime.block_on(preview::preview(*args)),
+        Command::Doctor(args) => exit_with(runtime, doctor::doctor(*args)),
         Command::Instance { command } => match command {
             instances::InstanceCommand::List(args) => exit_with(runtime, instances::list(args)),
             instances::InstanceCommand::Prune(args) => runtime.block_on(instances::prune(args)),
@@ -1361,12 +1404,14 @@ fn main() -> anyhow::Result<()> {
         Command::Secret { command } => runtime.block_on(admin::secret(command)),
         Command::Logging { command } => runtime.block_on(admin::logging(command)),
         Command::Deploy(args) => exit_with(runtime, admin::deploy(*args)),
-        Command::Render(args) => render::render(*args),
+        Command::Render(args) => runtime.block_on(render::render(*args)),
         Command::App { command } => runtime.block_on(async move {
             match command {
-                admin::AppCommand::List { socket, output } => {
-                    admin::app_list(socket, output.json).await
-                }
+                admin::AppCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                } => admin::app_list(socket, output.json, deployment).await,
                 admin::AppCommand::Remove(args) => admin::app_remove(*args).await,
                 admin::AppCommand::Set(args) => admin::app_set(*args).await,
                 admin::AppCommand::Unset(args) => admin::app_unset(*args).await,
@@ -1407,14 +1452,29 @@ fn main() -> anyhow::Result<()> {
             }
         }),
         Command::Host {
-            command: admin::HostCommand::List { socket, output },
-        } => runtime.block_on(admin::host_list(socket, output.json)),
+            command:
+                admin::HostCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                },
+        } => runtime.block_on(admin::host_list(socket, output.json, deployment)),
         Command::Route {
-            command: admin::RouteCommand::List { socket, output },
-        } => runtime.block_on(admin::route_list(socket, output.json)),
+            command:
+                admin::RouteCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                },
+        } => runtime.block_on(admin::route_list(socket, output.json, deployment)),
         Command::Upstream {
-            command: admin::UpstreamCommand::List { socket, output },
-        } => runtime.block_on(admin::upstream_list(socket, output.json)),
+            command:
+                admin::UpstreamCommand::List {
+                    deployment,
+                    socket,
+                    output,
+                },
+        } => runtime.block_on(admin::upstream_list(socket, output.json, deployment)),
         Command::Rollback {
             app,
             socket,
@@ -1469,22 +1529,55 @@ fn main() -> anyhow::Result<()> {
             shown
         }),
         Command::Apply(args) => exit_with(runtime, admin::apply(*args)),
-        Command::Config { command } => match command {
-            admin::ConfigCommand::Export {
+        Command::Deployment { command } => match command {
+            admin::DeploymentCommand::Export {
+                name,
+                dir,
                 app,
+                as_deployment,
                 resolve_rollouts,
                 json,
                 socket,
-            } => runtime.block_on(admin::config_export(app, resolve_rollouts, json, socket)),
-            admin::ConfigCommand::Show {
+            } => runtime.block_on(admin::config_export(
+                admin::Exporting {
+                    name,
+                    dir,
+                    app,
+                    as_deployment,
+                    resolve_rollouts,
+                    json,
+                },
+                socket,
+            )),
+            admin::DeploymentCommand::Show {
+                name,
                 app,
                 effective,
                 socket,
                 output,
-            } => runtime.block_on(admin::config_show(app, effective, socket, output.json)),
-            admin::ConfigCommand::Diff { file, json, socket } => {
+            } => runtime.block_on(admin::config_show(
+                name,
+                app,
+                effective,
+                socket,
+                output.json,
+            )),
+            admin::DeploymentCommand::Diff { file, json, socket } => {
                 exit_with(runtime, admin::config_diff(file, json, socket))
             }
+            admin::DeploymentCommand::List { socket, output } => {
+                runtime.block_on(admin::deployment_list(socket, output.json))
+            }
+            admin::DeploymentCommand::Remove {
+                name,
+                data,
+                dry_run,
+                yes,
+                socket,
+            } => exit_with(
+                runtime,
+                admin::deployment_remove(name, data, dry_run, yes, socket),
+            ),
         },
         Command::Events {
             follow,
@@ -2245,6 +2338,10 @@ struct Resolved {
     max_requests: Option<u64>,
     /// How long a worker lives before it is replaced (section 7.7).
     max_lifetime: Option<Duration>,
+    /// How many workers a group may run over and under its count while
+    /// workers are swapped (section 7.8).
+    max_surge: u32,
+    max_unavailable: u32,
     /// The host's timeouts from the table (section 7.6).
     timeouts: Option<muru_config::Timeouts>,
     /// The table's own limits on a request (section 4.6): its
@@ -2572,6 +2669,19 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
         "[tool.muru] max_requests must be at least 1"
     );
 
+    // Section 7.8: the swap settings, which must leave a way to swap.
+
+    let max_surge = args
+        .max_surge
+        .or(table.max_surge)
+        .unwrap_or(muru_config::DEFAULT_MAX_SURGE);
+    let max_unavailable = args
+        .max_unavailable
+        .or(table.max_unavailable)
+        .unwrap_or(muru_config::DEFAULT_MAX_UNAVAILABLE);
+    muru_config::check_swap(max_surge, max_unavailable)
+        .map_err(|error| anyhow::anyhow!("[tool.muru] {error}"))?;
+
     // Section 4.9: the file hint keys, the release's and each mount's
     // over them.
 
@@ -2722,6 +2832,8 @@ fn resolve_for(args: &RunArgs, serve: Option<&serve::Mode>) -> anyhow::Result<Re
             ),
             (None, None) => None,
         },
+        max_surge,
+        max_unavailable,
         timeouts: table.timeouts,
         memory: table.memory,
         env,
@@ -2850,23 +2962,50 @@ fn group_sockets_from(
         .collect()
 }
 
-/// Connect to a host's control socket for the run (section 5.9), or,
-/// when the host has none, a receiver that never yields.
+/// Keep a control connection to a host for the run (section 5.9, issue
+/// 988): the first connection, when one could be made, and the receiver
+/// of everything after it, what the host says and the end of each
+/// connection, which the run's loop answers with whether to connect
+/// again. A host with no connection yet is tried again in the background.
 async fn host_control(
     host: &HostProcess,
 ) -> (
     Option<muru_controller::host::HostControl>,
-    tokio::sync::mpsc::Receiver<muru_controller::host::HostMessage>,
+    tokio::sync::mpsc::Receiver<muru_controller::host::ControlEvent>,
 ) {
-    match muru_controller::host::HostControl::connect(&host.control_path()).await {
-        Ok((control, messages)) => (Some(control), messages),
-        Err(error) => {
-            muru_common::muru_println!("no control connection to the host: {error:#}");
-            let (_sender, receiver) = tokio::sync::mpsc::channel(1);
-            std::mem::forget(_sender);
-            (None, receiver)
+    use muru_controller::host::ControlEvent;
+
+    // Section 10.14: a new host has no restart of every worker under
+    // way, whatever the last one was doing; one that has says so once
+    // connected.
+
+    run_admin::set_restart(None);
+
+    let (sender, mut events) = tokio::sync::mpsc::channel(32);
+
+    tokio::spawn(muru_controller::host::keep_control(
+        sender,
+        host.control_path(),
+        None,
+        |event| event,
+    ));
+
+    // The first thing said is the connection, or that none could be made.
+
+    let control = match events.recv().await {
+        Some(ControlEvent::Attached { control, .. }) => Some(control),
+        Some(ControlEvent::Ended { failed, answer, .. }) => {
+            if let Some(error) = failed {
+                muru_common::muru_println!("no control connection to the host: {error:#}");
+            }
+
+            let _ = answer.send(true);
+            None
         }
-    }
+        Some(ControlEvent::Message(_)) | None => None,
+    };
+
+    (control, events)
 }
 
 /// What a worker takes at once, as its HELLO declared it: the threads of
@@ -3638,6 +3777,12 @@ fn host_spec(
         .groups
         .iter()
         .map(|(name, group)| {
+            muru_config::check_swap(
+                group.max_surge.unwrap_or(resolved.max_surge),
+                group.max_unavailable.unwrap_or(resolved.max_unavailable),
+            )
+            .map_err(|error| anyhow::anyhow!("[tool.muru.groups.{name}] {error}"))?;
+
             Ok(muru_controller::host::HostGroup {
                 name: name.clone(),
                 processes: group.processes.unwrap_or(resolved.processes),
@@ -3666,6 +3811,8 @@ fn host_spec(
                     }
                     None => resolved.max_lifetime,
                 },
+                max_surge: group.max_surge.unwrap_or(resolved.max_surge),
+                max_unavailable: group.max_unavailable.unwrap_or(resolved.max_unavailable),
                 optional: group.optional.unwrap_or(false),
                 mounts: group.mounts.clone(),
             })
@@ -3759,6 +3906,8 @@ fn host_spec(
             .unwrap_or_default(),
         max_requests: resolved.max_requests,
         max_lifetime: resolved.max_lifetime,
+        max_surge: resolved.max_surge,
+        max_unavailable: resolved.max_unavailable,
         soft_timeout: timeouts.soft,
         hard_timeout: timeouts.hard,
         hard_drain_grace: timeouts.hard_drain_grace,
@@ -4364,6 +4513,27 @@ async fn run_with(
         serve::group_writable(&run_dir, 0o770);
     }
 
+    // Section 13.8 (issue 948): each host's sockets go in a directory
+    // named by its number under the run's own, and its regular files in
+    // the directory of the same number under the run's files, which are
+    // in the user state location. A serve keeps both in its run
+    // directory, which is the container's and is not cleaned by age.
+
+    let files_dir = match (&serve, registration.as_ref().and_then(|r| r.files())) {
+        (None, Some(files)) => files.to_path_buf(),
+        _ => run_dir.clone(),
+    };
+
+    let host_dirs = |release: u32| {
+        muru_controller::locations::HostDirs::numbered(&run_dir, &files_dir, release.into())
+    };
+
+    if let Err(message) = muru_controller::locations::check_socket_room(&run_dir) {
+        drop(registration);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        anyhow::bail!(message);
+    }
+
     // Section 13.12: the detour's socket is bound and the detour opened
     // before the host starts, so a refusal ends the run with the daemon's
     // reason and nothing started, and the daemon's host names and data
@@ -4553,7 +4723,7 @@ async fn run_with(
 
     let mut current = HostProcess::start(
         &spec,
-        &run_dir,
+        &host_dirs(1),
         1,
         &logs,
         relay_watcher(&label, "r1", &run_events),
@@ -4822,7 +4992,7 @@ async fn run_with(
             "traffic: {}{}",
             detour::takes(&traffic, &mode.app, &paths),
             if traffic == "preview" {
-                "; muructl detour preview gives an entry link"
+                "; muructl preview gives an entry link"
             } else {
                 ""
             }
@@ -5351,6 +5521,10 @@ async fn run_with(
 
     let mut signalled = false;
 
+    // Issue 982: the last event recorded from the host, by its number.
+
+    let mut events_recorded = muru_controller::host::Recorded::default();
+
     let outcome = loop {
         tokio::select! {
             served = &mut serving => {
@@ -5367,7 +5541,28 @@ async fn run_with(
             status = current.exited() => {
                 break Err(anyhow::anyhow!("the host exited with {}", status?));
             }
-            Some(message) = host_messages.recv() => {
+            Some(event) = host_messages.recv() => {
+                // Issue 988: a control connection that ended is made
+                // again while the host runs. A host that has exited is
+                // not connected to; the branch above says so a moment
+                // later.
+
+                let message = match event {
+                    muru_controller::host::ControlEvent::Message(message) => *message,
+                    muru_controller::host::ControlEvent::Attached { control, .. } => {
+                        muru_common::muru_println!(
+                            "the control connection to the host ended and was made again"
+                        );
+                        host_link.lock().expect("host link poisoned").reattach(Some(control));
+                        continue;
+                    }
+                    muru_controller::host::ControlEvent::Ended { answer, .. } => {
+                        host_link.lock().expect("host link poisoned").reattach(None);
+                        let _ = answer.send(matches!(current.try_exited(), Ok(None)));
+                        continue;
+                    }
+                };
+
                 if let Some(health) = &health {
                     health.host_heard();
                 }
@@ -5426,16 +5621,33 @@ async fn run_with(
                             }
                         }
                     }
-                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason, evidence } => {
+                    muru_controller::host::HostMessage::Event { kind, level, message, group, reason, evidence, time_unix_ms, number } => {
+                        // Issue 982: the host is told the event is
+                        // recorded, and one it sends again, to a
+                        // connection made again before it heard so, is
+                        // not recorded twice.
+
+                        if let Some(number) = number {
+                            let new = events_recorded.take(number);
+                            host_link.lock().expect("host link poisoned").recorded(number.seq);
+
+                            if !new {
+                                continue;
+                            }
+                        }
+
+
                         // The host has logged the event, and its line is
                         // the one the terminal shows; the run counts it
                         // and keeps it for muructl events, and its
                         // evidence goes to the records of the requests it
-                        // names (issue 706).
+                        // names (issue 706). One the host held while
+                        // nothing was connected carries the time it
+                        // happened.
 
                         let release = format!("r{}", current.release);
                         run_admin::count_worker_event(&label, &release, &kind, &group, &reason);
-                        run_events.record(&kind, &format!("{label}@{release}"), &level, &message);
+                        run_events.record_at(&kind, &format!("{label}@{release}"), &level, &message, time_unix_ms);
 
                         if let (Some(mut evidence), Some(recorder)) = (evidence, &recorder) {
                             if KILLS.contains(&kind.as_str()) {
@@ -5468,8 +5680,17 @@ async fn run_with(
                     muru_controller::host::HostMessage::Response { id, workers, error } => {
                         host_link.lock().expect("host link poisoned").answer(id, workers, error);
                     }
-                    muru_controller::host::HostMessage::Status { workers, host_rss, memory_replacements } => {
+                    muru_controller::host::HostMessage::Restart { total, left, started_unix_ms, group } => {
+                        run_admin::set_restart((left > 0).then_some(muru_proto::admin::v1::RestartStatus {
+                            total,
+                            left,
+                            started_unix_ms,
+                            group,
+                        }));
+                    }
+                    muru_controller::host::HostMessage::Status { workers, host_rss, memory_replacements, swaps_waiting } => {
                         run_admin::set_worker_modules(&label, &format!("r{}", current.release), &workers);
+                        run_admin::set_swaps_waiting(&label, &format!("r{}", current.release), swaps_waiting);
 
                         // The relay may have been started again since.
 
@@ -5630,7 +5851,7 @@ async fn run_with(
 
                     let watcher = relay_watcher(&label, &format!("r{release}"), &run_events);
 
-                    let mut next = match HostProcess::start(&spec, &run_dir, release, &logs, watcher) {
+                    let mut next = match HostProcess::start(&spec, &host_dirs(release), release, &logs, watcher) {
                         Ok(next) => next,
                         Err(error) => {
                             muru_common::muru_println!("release r{release} failed to start: {error:#}; release r{} keeps serving", current.release);
