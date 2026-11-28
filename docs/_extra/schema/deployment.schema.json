@@ -2007,6 +2007,10 @@
           "description": "Serve gRPC server reflection for the services the release's gRPC mounts register (default false).",
           "type": "boolean"
         },
+        "restart": {
+          "$ref": "#/$defs/Restart",
+          "description": "What happens when an `http` release's instance exits."
+        },
         "scaling": {
           "$ref": "#/$defs/Scaling",
           "description": "How the default group is scaled; static when absent."
@@ -2149,6 +2153,72 @@
         }
       },
       "type": "object"
+    },
+    "Restart": {
+      "additionalProperties": false,
+      "description": "The `restart` table of a managed HTTP release: what happens when an instance exits.",
+      "properties": {
+        "delay": {
+          "default": "1s",
+          "description": "The wait before the next start after a run that lasted, and after the first quick exit.",
+          "type": "string"
+        },
+        "give_up_after": {
+          "description": "Quick exits in a row after which the instance is left failed until it is restarted by hand. Without it the instance is started again every `max_delay`, without end.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_delay": {
+          "default": "1m",
+          "description": "The longest wait: the wait doubles with each quick exit in a row up to this.",
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/RestartMode",
+          "default": "always",
+          "description": "When an instance that exited is started again: `always`, after any exit; `on-failure`, after a failure, with a clean exit left alone; or `never`."
+        },
+        "stable_after": {
+          "default": "1m",
+          "description": "A run this long was not a quick exit, and clears the count of them.",
+          "type": "string"
+        },
+        "success_exit_codes": {
+          "default": [
+            0
+          ],
+          "description": "The exit statuses that count as a clean exit. Any other status, and death by a signal, is a failure.",
+          "items": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "RestartMode": {
+      "description": "When a supervised process that exited is started again.",
+      "oneOf": [
+        {
+          "const": "always",
+          "description": "After any exit.",
+          "type": "string"
+        },
+        {
+          "const": "on-failure",
+          "description": "After a failure; a clean exit is left alone.",
+          "type": "string"
+        },
+        {
+          "const": "never",
+          "description": "Never.",
+          "type": "string"
+        }
+      ]
     },
     "Route": {
       "additionalProperties": false,

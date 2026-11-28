@@ -230,6 +230,8 @@ def test_full_writes_every_setting_with_where_it_came_from() -> None:
         "gunicorn",
         "--instances",
         "2",
+        "--restart",
+        "policy=on-failure",
         "--full",
         "--",
         "gunicorn",
@@ -244,10 +246,19 @@ def test_full_writes_every_setting_with_where_it_came_from() -> None:
         "bind": "unix",
         "instances": 2,
         "readiness": {"timeout": "60s"},
+        "restart": {
+            "policy": "on-failure",
+            "success_exit_codes": [0],
+            "delay": "1s",
+            "max_delay": "60s",
+            "stable_after": "60s",
+        },
         "timeouts": {"shutdown_timeout": "5s"},
     }
     assert comment(server.stdout, "instances") == "command line"
     assert comment(server.stdout, "bind") == "default"
+    assert comment(server.stdout, "policy") == "command line"
+    assert comment(server.stdout, "max_delay") == "default"
 
 
 def test_what_a_deploy_would_refuse_is_refused_and_nothing_is_written(tmp_path: Path) -> None:

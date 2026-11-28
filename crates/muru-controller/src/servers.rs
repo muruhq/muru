@@ -18,7 +18,7 @@ use tokio::time::Instant;
 use crate::host::Identity;
 use crate::locations::HostDirs;
 use crate::model::HttpServerSpec;
-use crate::supervisor::{self, EventNames, InstanceSpec, Report, RestartPolicy, Supervisor};
+use crate::supervisor::{self, EventNames, InstanceSpec, Report, Supervisor};
 
 /// How long one readiness probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -96,9 +96,12 @@ pub struct InstanceRecord {
     /// When its process was started, Unix milliseconds; 0 when not known.
     #[serde(default)]
     pub started_unix_ms: u64,
-    /// Its exits and failed starts in a row.
+    /// Its quick exits and failed starts in a row.
     #[serde(default)]
     pub quick_exits: u32,
+    /// How it was left, for one that exited and is not started again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<supervisor::Left>,
     /// The start time the kernel gives its process, which with the pid
     /// names the process; 0 when not known.
     #[serde(default)]
@@ -119,6 +122,7 @@ impl InstanceRecord {
             pid: self.pid,
             started_unix_ms: self.started_unix_ms,
             quick_exits: self.quick_exits,
+            left: self.left,
             start_time: self.start_time,
             relay_pid: self.relay_pid,
             relay_start_time: self.relay_start_time,
@@ -224,7 +228,7 @@ impl Servers {
         let dropped = Arc::new(AtomicU64::new(0));
         let started = Supervisor::start(
             process_spec(spec, cwd, env, identity, log, dirs, relays, &dropped),
-            RestartPolicy::default(),
+            spec.restart.policy(),
             instances,
             grace,
         )
@@ -318,7 +322,7 @@ impl Servers {
         let dropped = Arc::new(AtomicU64::new(0));
         let supervisor = Supervisor::adopt(
             process_spec(spec, cwd, env, identity, log, dirs, relays, &dropped),
-            RestartPolicy::default(),
+            spec.restart.policy(),
             instances,
             &processes,
         )?;
@@ -580,6 +584,7 @@ impl Servers {
                     address: bind.address(),
                     started_unix_ms: process.started_unix_ms,
                     quick_exits: process.quick_exits,
+                    left: process.left,
                     start_time: process.start_time,
                     relay_pid: process.relay_pid,
                     relay_start_time: process.relay_start_time,
@@ -1065,6 +1070,7 @@ mod tests {
             readiness_path: None,
             readiness_timeout_ms: 1000,
             stop_signal: None,
+            restart: crate::model::RestartSpec::default(),
         };
 
         // Something answers HTTP at one address, and nothing listens at
@@ -1091,6 +1097,7 @@ mod tests {
                     address: bind.address(),
                     started_unix_ms: 0,
                     quick_exits: 0,
+                    left: None,
                     start_time: 0,
                     relay_pid: 0,
                     relay_start_time: 0,

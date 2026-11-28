@@ -1197,6 +1197,82 @@ pub struct HttpServerSpec {
     /// names one; the profile's otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_signal: Option<String>,
+    /// What happens when an instance exits.
+    #[serde(default)]
+    pub restart: RestartSpec,
+}
+
+/// The `restart` table of a managed HTTP release as resolved: when an
+/// instance that exited is started again, and after what wait.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartSpec {
+    /// When an instance is started again.
+    pub policy: muru_config::RestartMode,
+    /// The exit statuses that count as a clean exit.
+    pub success_exit_codes: Vec<u8>,
+    /// The wait before the next start, in milliseconds.
+    pub delay_ms: u64,
+    /// The longest that wait gets, in milliseconds.
+    pub max_delay_ms: u64,
+    /// How long a run lasts to clear the count of quick exits, in
+    /// milliseconds.
+    pub stable_after_ms: u64,
+    /// Quick exits in a row after which the instance is left failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub give_up_after: Option<u32>,
+}
+
+impl Default for RestartSpec {
+    fn default() -> Self {
+        Self {
+            policy: muru_config::RestartMode::Always,
+            success_exit_codes: vec![0],
+            delay_ms: muru_config::DEFAULT_RESTART_DELAY.as_millis() as u64,
+            max_delay_ms: muru_config::DEFAULT_RESTART_MAX_DELAY.as_millis() as u64,
+            stable_after_ms: muru_config::DEFAULT_RESTART_STABLE_AFTER.as_millis() as u64,
+            give_up_after: None,
+        }
+    }
+}
+
+impl RestartSpec {
+    /// The table as the supervisor takes it.
+    pub fn policy(&self) -> crate::supervisor::RestartPolicy {
+        crate::supervisor::RestartPolicy {
+            mode: self.policy,
+            success_exit_codes: self
+                .success_exit_codes
+                .iter()
+                .map(|code| i32::from(*code))
+                .collect(),
+            delay: std::time::Duration::from_millis(self.delay_ms),
+            max_delay: std::time::Duration::from_millis(self.max_delay_ms),
+            stable_after: std::time::Duration::from_millis(self.stable_after_ms),
+            give_up_after: self.give_up_after,
+        }
+    }
+
+    /// The table as one phrase: `always, 1s to 60s, stable after 60s`.
+    pub fn describe(&self) -> String {
+        let wait = |ms| muru_config::format_duration(std::time::Duration::from_millis(ms));
+        let mut text = format!(
+            "{}, {} to {}, stable after {}",
+            self.policy.as_str(),
+            wait(self.delay_ms),
+            wait(self.max_delay_ms),
+            wait(self.stable_after_ms)
+        );
+
+        if self.success_exit_codes != [0] {
+            text.push_str(&format!(", clean exits {:?}", self.success_exit_codes));
+        }
+
+        if let Some(count) = self.give_up_after {
+            text.push_str(&format!(", gives up after {count}"));
+        }
+
+        text
+    }
 }
 
 impl HttpServerSpec {

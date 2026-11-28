@@ -179,9 +179,126 @@ words!(ServerProfile {
     Generic => "generic",
 });
 words!(ServerBind { Unix => "unix", Port => "port" });
+words!(RestartMode {
+    Always => "always",
+    OnFailure => "on-failure",
+    Never => "never",
+});
 
 /// The signals a `stop_signal` may name.
 pub const STOP_SIGNALS: [&str; 7] = ["TERM", "INT", "QUIT", "HUP", "USR1", "USR2", "WINCH"];
+
+/// When a supervised process that exited is started again (section
+/// 9.9).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartMode {
+    /// After any exit.
+    #[default]
+    Always,
+    /// After a failure; a clean exit is left alone.
+    OnFailure,
+    /// Never.
+    Never,
+}
+
+/// The wait before a process that exited is started again, when the
+/// `restart` table gives none.
+pub const DEFAULT_RESTART_DELAY: Duration = Duration::from_secs(1);
+
+/// The longest wait before a start, when the `restart` table gives none.
+pub const DEFAULT_RESTART_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// How long a run lasts to count as a recovery, when the `restart` table
+/// does not say.
+pub const DEFAULT_RESTART_STABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// The `restart` table of a managed HTTP release (section 9.9): what
+/// happens when an instance exits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Restart {
+    /// When an instance that exited is started again: `always`, after
+    /// any exit; `on-failure`, after a failure, with a clean exit left
+    /// alone; or `never`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "always"))]
+    pub policy: Option<RestartMode>,
+    /// The exit statuses that count as a clean exit. Any other status,
+    /// and death by a signal, is a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = [0]))]
+    pub success_exit_codes: Option<Vec<u8>>,
+    /// The wait before the next start after a run that lasted, and after
+    /// the first quick exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "1s"))]
+    pub delay: Option<String>,
+    /// The longest wait: the wait doubles with each quick exit in a row
+    /// up to this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "1m"))]
+    pub max_delay: Option<String>,
+    /// A run this long was not a quick exit, and clears the count of
+    /// them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "1m"))]
+    pub stable_after: Option<String>,
+    /// Quick exits in a row after which the instance is left failed
+    /// until it is restarted by hand. Without it the instance is started
+    /// again every `max_delay`, without end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub give_up_after: Option<u32>,
+}
+
+/// Check a `restart` table: waits that are longer than nothing, a
+/// longest wait no shorter than the first, at least one clean status and
+/// a count of at least one.
+pub fn check_restart(table: &Restart) -> Result<(), String> {
+    let wait = |key: &str, text: &Option<String>, default: Duration| match text {
+        Some(text) => {
+            let duration =
+                parse_duration(text).map_err(|error| format!("restart.{key}: {error}"))?;
+
+            if duration.is_zero() {
+                return Err(format!("restart.{key} must be longer than nothing"));
+            }
+
+            Ok(duration)
+        }
+        None => Ok(default),
+    };
+
+    let delay = wait("delay", &table.delay, DEFAULT_RESTART_DELAY)?;
+    let max_delay = wait("max_delay", &table.max_delay, DEFAULT_RESTART_MAX_DELAY)?;
+    wait(
+        "stable_after",
+        &table.stable_after,
+        DEFAULT_RESTART_STABLE_AFTER,
+    )?;
+
+    if max_delay < delay {
+        return Err(format!(
+            "restart.max_delay ({}) must not be shorter than restart.delay ({})",
+            format_duration(max_delay),
+            format_duration(delay)
+        ));
+    }
+
+    if table.success_exit_codes.as_ref().is_some_and(Vec::is_empty) {
+        return Err(
+            "restart.success_exit_codes must name at least one exit status; \
+             policy = 'always' starts an instance again whatever its status"
+                .to_owned(),
+        );
+    }
+
+    if table.give_up_after == Some(0) {
+        return Err("restart.give_up_after must be at least 1".to_owned());
+    }
+
+    Ok(())
+}
 
 /// The `readiness` table of a managed HTTP release (section 9.9): how
 /// an instance is known to be ready.
@@ -970,6 +1087,9 @@ pub struct Release {
     /// How an `http` release's instances are known to be ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness: Option<Readiness>,
+    /// What happens when an `http` release's instance exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<Restart>,
     /// The signal that stops an `http` release's instance gracefully:
     /// TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic
     /// profile; the other profiles know their server's.
@@ -5250,13 +5370,14 @@ pub const UPSTREAM_PROTOCOLS: [&str; 3] = ["http1", "h2c", "h2"];
 /// the worker settings, and a workers release takes none of the server
 /// ones.
 pub fn check_release_kind(table: &Release) -> Result<(), String> {
-    let server_keys: [(&str, bool); 7] = [
+    let server_keys: [(&str, bool); 8] = [
         ("profile", table.profile.is_some()),
         ("command", !table.command.is_empty()),
         ("cwd", table.cwd.is_some()),
         ("bind", table.bind.is_some()),
         ("instances", table.instances.is_some()),
         ("readiness", table.readiness.is_some()),
+        ("restart", table.restart.is_some()),
         ("stop_signal", table.stop_signal.is_some()),
     ];
 
@@ -5387,6 +5508,10 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
                 return Err("readiness.timeout must be longer than nothing".to_owned());
             }
         }
+    }
+
+    if let Some(restart) = &table.restart {
+        check_restart(restart)?;
     }
 
     match &table.stop_signal {
@@ -9233,5 +9358,68 @@ mod python_logging_tests {
             "the more specific layer's filters come last"
         );
         assert!(merged.check().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::{Release, Restart, RestartMode, check_release_kind, check_restart};
+
+    #[test]
+    fn a_restart_table_is_read_and_checked() {
+        let release: Release = toml::from_str(
+            "kind = 'http'\nprofile = 'gunicorn'\ncommand = ['gunicorn', 'shop:app']\ncwd = '/srv'\n\
+             [restart]\npolicy = 'on-failure'\nsuccess_exit_codes = [0, 3]\ndelay = '2s'\n\
+             max_delay = '5m'\nstable_after = '30s'\ngive_up_after = 5\n",
+        )
+        .unwrap();
+        let restart = release.restart.clone().unwrap();
+        assert_eq!(restart.policy, Some(RestartMode::OnFailure));
+        assert_eq!(restart.success_exit_codes, Some(vec![0, 3]));
+        assert_eq!(restart.give_up_after, Some(5));
+        assert_eq!(check_release_kind(&release), Ok(()));
+
+        // Every key has a default, so an empty table is whole.
+
+        assert_eq!(check_restart(&Restart::default()), Ok(()));
+        assert_eq!("never".parse(), Ok(RestartMode::Never));
+        assert!("sometimes".parse::<RestartMode>().is_err());
+    }
+
+    #[test]
+    fn a_restart_table_that_cannot_be_followed_is_refused() {
+        let refused = |table: &str| {
+            let restart: Restart = toml::from_str(table).unwrap();
+            check_restart(&restart).unwrap_err()
+        };
+
+        assert_eq!(
+            refused("delay = '0s'"),
+            "restart.delay must be longer than nothing"
+        );
+        assert!(refused("stable_after = 'soon'").starts_with("restart.stable_after: "));
+        assert_eq!(
+            refused("delay = '2m'"),
+            "restart.max_delay (60s) must not be shorter than restart.delay (120s)"
+        );
+        assert!(
+            refused("success_exit_codes = []")
+                .starts_with("restart.success_exit_codes must name at least one exit status")
+        );
+        assert_eq!(
+            refused("give_up_after = 0"),
+            "restart.give_up_after must be at least 1"
+        );
+        assert!(toml::from_str::<Restart>("success_exit_codes = [256]").is_err());
+        assert!(toml::from_str::<Restart>("retries = 3").is_err());
+
+        // The table is a managed server's, not a release of workers'.
+
+        let workers: Release =
+            toml::from_str("source = '/srv'\n[restart]\npolicy = 'never'\n").unwrap();
+        assert_eq!(
+            check_release_kind(&workers),
+            Err("restart applies to a managed HTTP release (kind = 'http')".to_owned())
+        );
     }
 }

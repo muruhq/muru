@@ -4099,9 +4099,22 @@ fn adoption_message(adopted: &[(u32, crate::supervisor::Adopted)]) -> String {
     for (index, found) in adopted {
         match found {
             Adopted::Kept(pid) => pids.push(pid.to_string()),
-            Adopted::Ended { exit, wait } => ended.push(format!(
+            Adopted::Ended {
+                exit,
+                wait: Some(wait),
+            } => ended.push(format!(
                 "instance {index} {exit} while no daemon ran and is started again in {}",
                 muru_config::format_duration(*wait)
+            )),
+            Adopted::Ended { exit, wait: None } => ended.push(format!(
+                "instance {index} {exit} while no daemon ran and is not started again"
+            )),
+            Adopted::Left(left) => ended.push(format!(
+                "instance {index} had {} before and is not started again",
+                match left {
+                    crate::supervisor::Left::Exited => "exited",
+                    crate::supervisor::Left::Failed => "failed",
+                }
             )),
             Adopted::Gone => gone.push(index.to_string()),
         }
@@ -15844,7 +15857,7 @@ mod tests {
 
         let killed = Adopted::Ended {
             exit: crate::supervisor::Exit::Status(std::process::ExitStatus::from_raw(9)),
-            wait: Duration::from_secs(1),
+            wait: Some(Duration::from_secs(1)),
         };
         assert_eq!(
             adoption_message(&adopted(&[Adopted::Kept(41), killed])),

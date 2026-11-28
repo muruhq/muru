@@ -4844,6 +4844,14 @@ pub struct ReleaseArgs {
     #[arg(long, value_name = "NAME")]
     pub(crate) stop_signal: Option<String>,
 
+    /// What happens when a managed server's instance exits, as
+    /// KEY=VALUE: policy (always, on-failure or never), success_exit_codes
+    /// (the statuses of a clean exit, for example 0,3), delay (1s),
+    /// max_delay (1m), stable_after (1m) or give_up_after (a count of
+    /// quick exits in a row). Repeatable.
+    #[arg(long = "restart", value_name = "KEY=VALUE", value_parser = crate::parse_restart_setting)]
+    pub(crate) restart: Vec<(String, String)>,
+
     /// A directory a path in an X-Muru-Sendfile response header must lie
     /// in for the file to be served, relative to the source unless
     /// absolute; repeatable (default the table's).
@@ -5175,6 +5183,37 @@ fn memory_setting(settings: &[(String, String)], key: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+/// The --restart settings as a request carries them, each already
+/// checked as it was parsed; none when no setting was given.
+fn restart_settings(settings: &[(String, String)]) -> Option<pb::RestartSettings> {
+    if settings.is_empty() {
+        return None;
+    }
+
+    let wait = |key: &str| {
+        memory_setting(settings, key)
+            .and_then(|value| muru_config::parse_duration(&value).ok())
+            .map(|duration| duration.as_millis() as u64)
+    };
+
+    Some(pb::RestartSettings {
+        policy: memory_setting(settings, "policy").unwrap_or_default(),
+        success_exit_codes: memory_setting(settings, "success_exit_codes")
+            .map(|codes| {
+                codes
+                    .split(',')
+                    .filter_map(|code| code.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        delay_ms: wait("delay"),
+        max_delay_ms: wait("max_delay"),
+        stable_after_ms: wait("stable_after"),
+        give_up_after: memory_setting(settings, "give_up_after")
+            .and_then(|count| count.parse().ok()),
+    })
+}
+
 /// The last value given for a named timeout, in milliseconds.
 fn timeout_ms(timeouts: &[(String, Duration)], name: &str) -> Option<u64> {
     timeouts
@@ -5266,6 +5305,7 @@ impl ReleaseArgs {
                 .readiness_timeout
                 .map(|timeout| timeout.as_millis() as u64),
             stop_signal: self.stop_signal.unwrap_or_default(),
+            restart: restart_settings(&self.restart),
             entrypoint: self.entrypoint.unwrap_or_default(),
             interface: self
                 .interface

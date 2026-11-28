@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -524,6 +525,12 @@ readiness = {{ path = '/healthz', timeout = '20s' }}
 stop_signal = 'TERM'
 env = {{ LEGACY_SETTING = 'declared' }}
 
+[app.legacy.release.r1.restart]
+policy = 'on-failure'
+success_exit_codes = [0, 3]
+max_delay = '2m'
+give_up_after = 5
+
 [host.legacy]
 names = ['legacy.test']
 default = true
@@ -543,6 +550,19 @@ app = 'legacy'
     assert "profile = 'generic'" in exported.replace('"', "'")
     assert "stop_signal = 'TERM'" in exported.replace('"', "'")
     assert "entrypoint" not in exported
+
+    # The restart table is exported with every key, the defaults of
+    # those the file left out among them.
+
+    restart = tomllib.loads(exported)["app"]["legacy"]["release"]["r1"]["restart"]
+    assert restart == {
+        "policy": "on-failure",
+        "success_exit_codes": [0, 3],
+        "delay": "1s",
+        "max_delay": "120s",
+        "stable_after": "60s",
+        "give_up_after": 5,
+    }, exported
     again = tmp_path / "again.toml"
     again.write_text(exported)
     assert "no changes" in daemon.muructl("apply", "-f", str(again)).stdout
@@ -570,6 +590,18 @@ app = 'legacy'
     )
     assert "profile applies to a managed HTTP release" in refused(
         f"source = '{SHOP}'\nprofile = 'gunicorn'\n"
+    )
+    assert "restart applies to a managed HTTP release" in refused(
+        f"source = '{SHOP}'\nrestart = {{ policy = 'never' }}\n"
+    )
+    assert "restart.max_delay (5s) must not be shorter than restart.delay (10s)" in refused(
+        base + "profile = 'gunicorn'\nrestart = { delay = '10s', max_delay = '5s' }\n"
+    )
+    assert "restart.give_up_after must be at least 1" in refused(
+        base + "profile = 'gunicorn'\nrestart = { give_up_after = 0 }\n"
+    )
+    assert "sometimes" in refused(
+        base + "profile = 'gunicorn'\nrestart = { policy = 'sometimes' }\n"
     )
     assert "a managed HTTP release needs the command" in refused(
         f"kind = 'http'\nprofile = 'gunicorn'\ncwd = '{LEGACY}'\n"

@@ -1779,6 +1779,46 @@ pub(crate) fn parse_memory_setting(text: &str) -> Result<(String, String), Strin
     Ok((key.to_owned(), value.to_owned()))
 }
 
+/// A --restart setting of a managed server as KEY=VALUE, checked as the
+/// `restart` table's key of that name is.
+pub(crate) fn parse_restart_setting(text: &str) -> Result<(String, String), String> {
+    let (key, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not KEY=VALUE, for example policy=on-failure"))?;
+    let (key, value) = (key.trim(), value.trim());
+
+    match key {
+        "policy" => {
+            value
+                .parse::<muru_config::RestartMode>()
+                .map_err(|error| error.to_string())?;
+        }
+        "success_exit_codes" => {
+            for code in value.split(',') {
+                code.trim().parse::<u8>().map_err(|_| {
+                    format!("success_exit_codes: {code:?} is not an exit status, 0 to 255")
+                })?;
+            }
+        }
+        "delay" | "max_delay" | "stable_after" => {
+            muru_config::parse_duration(value)?;
+        }
+        "give_up_after" => {
+            value
+                .parse::<u32>()
+                .map_err(|_| format!("give_up_after: {value:?} is not a count"))?;
+        }
+        _ => {
+            return Err(format!(
+                "{key:?} is not a restart setting: policy, success_exit_codes, delay, max_delay, \
+                 stable_after or give_up_after"
+            ));
+        }
+    }
+
+    Ok((key.to_owned(), value.to_owned()))
+}
+
 /// The memory policy from --memory settings over a project table
 /// (section 7.7), with the defaults of appendix C.
 pub(crate) fn memory_policy(
