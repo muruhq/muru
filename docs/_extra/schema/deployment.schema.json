@@ -103,6 +103,13 @@
           },
           "type": "array"
         },
+        "service": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ServiceOverride"
+          },
+          "description": "What this node changes of the services the application's releases declare, by the service's name: every release deployed after this is applied takes them over its own.",
+          "type": "object"
+        },
         "serving": {
           "description": "The release that serves the application's traffic, a declared one or one the daemon has. The other releases an apply adds are started held, and naming a release the daemon has promotes it. An apply that adds more than one release of the application needs it.",
           "type": "string",
@@ -2802,6 +2809,42 @@
           "type": "string"
         }
       ]
+    },
+    "ServiceOverride": {
+      "additionalProperties": false,
+      "description": "What a node's operator changes of a service a project declares, the `[app.NAME.service.SERVICE]` table: the keys that are the node's to decide. The command is the release's.",
+      "properties": {
+        "autostart": {
+          "description": "Whether the service starts with its release on this node.",
+          "type": "boolean"
+        },
+        "env": {
+          "additionalProperties": {
+            "$ref": "#/$defs/EnvValue"
+          },
+          "description": "Variables over the service's own, by name: a value, or a secret reference.",
+          "type": "object"
+        },
+        "instances": {
+          "description": "How many copies of the command run.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "on_idle": {
+          "$ref": "#/$defs/ServiceIdle",
+          "description": "Whether the service runs on while the application's host is stopped for idleness."
+        },
+        "restart": {
+          "$ref": "#/$defs/Restart",
+          "description": "What happens when an instance exits, in place of the project's table."
+        },
+        "stop_timeout": {
+          "description": "How long an instance asked to stop has before it is killed.",
+          "type": "string"
+        }
+      },
+      "type": "object"
     },
     "ServiceReadiness": {
       "additionalProperties": false,

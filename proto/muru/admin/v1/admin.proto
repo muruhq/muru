@@ -834,6 +834,7 @@ message AppSettings {
   string notice = 22;                        // on a change's answer: what its caller should be told, as that applied files last wrote these settings (issue 936)
   optional uint32 max_surge = 23;            // workers a group may run over its count while workers are swapped
   optional uint32 max_unavailable = 24;      // workers a group may run under its count while workers are swapped
+  map<string, string> services = 25;         // what the node changes of a service the releases declare, by the service's name: a JSON object with the keys autostart, instances, restart, stop_timeout, on_idle and env
 }
 
 // Set some of an application's settings and remove others. The settings

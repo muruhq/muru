@@ -6301,6 +6301,141 @@ pub struct App {
     /// The memory policy for every release, each key over the source's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,
+    /// What this node changes of the services the application's
+    /// releases declare (section 9.17), by the service's name: every
+    /// release deployed after this is applied takes them over its own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub service: BTreeMap<String, ServiceOverride>,
+}
+
+/// What a node's operator changes of a service a project declares, the
+/// `[app.NAME.service.SERVICE]` table: the keys that are the node's to
+/// decide. The command is the release's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceOverride {
+    /// Whether the service starts with its release on this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autostart: Option<bool>,
+    /// How many copies of the command run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instances: Option<u32>,
+    /// What happens when an instance exits, in place of the project's
+    /// table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<Restart>,
+    /// How long an instance asked to stop has before it is killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout: Option<String>,
+    /// Whether the service runs on while the application's host is
+    /// stopped for idleness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_idle: Option<ServiceIdle>,
+    /// Variables over the service's own, by name: a value, or a secret
+    /// reference.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, EnvValue>,
+}
+
+/// The keys of a `[app.NAME.service.SERVICE]` table.
+pub const SERVICE_OVERRIDE_KEYS: [&str; 6] = [
+    "autostart",
+    "instances",
+    "restart",
+    "stop_timeout",
+    "on_idle",
+    "env",
+];
+
+impl ServiceOverride {
+    /// Whether nothing is set.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Check what can be refused before a release takes it.
+    pub fn check(&self) -> Result<(), String> {
+        if self.instances == Some(0) {
+            return Err("instances must be at least 1".to_owned());
+        }
+
+        if let Some(restart) = &self.restart {
+            check_restart(restart)?;
+        }
+
+        if let Some(text) = &self.stop_timeout {
+            let duration =
+                parse_duration(text).map_err(|error| format!("stop_timeout: {error}"))?;
+
+            if duration.is_zero() {
+                return Err("stop_timeout must be longer than nothing".to_owned());
+            }
+        }
+
+        for name in self.env.keys() {
+            if !valid_env_name(name) {
+                return Err(format!("env: {name:?} is not a variable name"));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// These settings with `over`'s laid on them, a variable by its name.
+    pub fn with(&self, over: &Self) -> Self {
+        let mut env = self.env.clone();
+        env.extend(over.env.clone());
+
+        Self {
+            autostart: over.autostart.or(self.autostart),
+            instances: over.instances.or(self.instances),
+            restart: over.restart.clone().or_else(|| self.restart.clone()),
+            stop_timeout: over
+                .stop_timeout
+                .clone()
+                .or_else(|| self.stop_timeout.clone()),
+            on_idle: over.on_idle.or(self.on_idle),
+            env,
+        }
+    }
+
+    /// Lay the settings over a service's table, and give the keys that
+    /// were set.
+    pub fn apply(&self, table: &mut Service) -> Vec<String> {
+        let mut given = Vec::new();
+
+        if let Some(autostart) = self.autostart {
+            table.autostart = Some(autostart);
+            given.push("autostart".to_owned());
+        }
+
+        if let Some(instances) = self.instances {
+            table.instances = Some(instances);
+            given.push("instances".to_owned());
+        }
+
+        if let Some(restart) = &self.restart {
+            table.restart = Some(restart.clone());
+            given.push("restart".to_owned());
+        }
+
+        if let Some(stop_timeout) = &self.stop_timeout {
+            table.stop_timeout = Some(stop_timeout.clone());
+            given.push("stop_timeout".to_owned());
+        }
+
+        if let Some(on_idle) = self.on_idle {
+            table.on_idle = Some(on_idle);
+            given.push("on_idle".to_owned());
+        }
+
+        for (name, value) in &self.env {
+            table.env.insert(name.clone(), value.clone());
+            given.push(format!("env.{name}"));
+        }
+
+        given
+    }
 }
 
 impl App {
@@ -6336,6 +6471,7 @@ impl App {
             max_unavailable,
             timeouts,
             memory,
+            service,
         } = self;
 
         serving.is_some()
@@ -6360,6 +6496,7 @@ impl App {
             || max_unavailable.is_some()
             || timeouts.is_some()
             || memory.is_some()
+            || !service.is_empty()
     }
 
     /// Take another table's own settings in place of this one's, and give
@@ -6390,6 +6527,7 @@ impl App {
             max_unavailable,
             timeouts,
             memory,
+            service,
         } = other;
 
         self.serving = serving;
@@ -6414,6 +6552,7 @@ impl App {
         self.max_unavailable = max_unavailable;
         self.timeouts = timeouts;
         self.memory = memory;
+        self.service = service;
 
         (release, schedule)
     }
@@ -10059,6 +10198,63 @@ mod service_tests {
         }
 
         assert!(toml::from_str::<Service>("command = ['x']\nswitch = 'both'").is_err());
+    }
+
+    #[test]
+    fn a_nodes_settings_for_a_projects_service_are_laid_over_its_table() {
+        use super::{App, ServiceIdle, ServiceOverride};
+
+        let app: App = toml::from_str(
+            "[service.worker]\ninstances = 8\nstop_timeout = '2m'\nenv = { QUEUE = 'bulk' }\n\
+             [service.beat]\nautostart = false\non_idle = 'stop'\n\
+             restart = { give_up_after = 3 }\n",
+        )
+        .unwrap();
+        assert!(app.sets_own());
+        let worker = &app.service["worker"];
+        assert_eq!(worker.check(), Ok(()));
+
+        // Only what is set is laid over, and the keys set are named.
+
+        let mut table = service("command = ['celery', 'worker']\ninstances = 4\nenv = { A = 'b' }");
+        assert_eq!(
+            worker.apply(&mut table),
+            ["instances", "stop_timeout", "env.QUEUE"]
+        );
+        assert_eq!(table.instances, Some(8));
+        assert_eq!(table.command, ["celery", "worker"]);
+        assert_eq!(table.env.len(), 2);
+        let mut beat = service("command = ['celery', 'beat']");
+        app.service["beat"].apply(&mut beat);
+        assert_eq!(
+            (beat.autostart, beat.on_idle),
+            (Some(false), Some(ServiceIdle::Stop))
+        );
+
+        // A later setting replaces the same key and keeps the others.
+
+        let over: ServiceOverride =
+            toml::from_str("instances = 2\nenv = { QUEUE = 'fast' }").unwrap();
+        let merged = worker.with(&over);
+        assert_eq!(merged.instances, Some(2));
+        assert_eq!(merged.stop_timeout.as_deref(), Some("2m"));
+        assert_eq!(merged.env.len(), 1);
+
+        // The command is the release's, and what cannot be run is refused.
+
+        assert!(toml::from_str::<ServiceOverride>("command = ['x']").is_err());
+        let refused = |text: &str| {
+            toml::from_str::<ServiceOverride>(text)
+                .unwrap()
+                .check()
+                .unwrap_err()
+        };
+        assert_eq!(refused("instances = 0"), "instances must be at least 1");
+        assert!(refused("stop_timeout = 'soon'").starts_with("stop_timeout: "));
+        assert_eq!(
+            refused("restart = { give_up_after = 0 }"),
+            "restart.give_up_after must be at least 1"
+        );
     }
 
     #[test]

@@ -580,6 +580,36 @@ A [managed HTTP server](managed-servers.md) release carries its
 services the same way, so the worker beside a gunicorn that is being
 cut over comes along unchanged.
 
+### The node's own settings for a service
+
+The node's operator can change some of what a project declared without
+a new release of its code. These are settings of the application, as
+its worker counts and variables are: every release deployed from then
+on takes them over the project's own.
+
+```toml
+[app.shop.service.worker]
+instances = 8
+
+[app.shop.service.beat]
+autostart = false           # this node does not run the scheduler
+```
+
+`autostart`, `instances`, `restart`, `stop_timeout`, `on_idle` and `env`
+can be set there. The command is the release's. The same by command:
+
+```console
+$ muructl app set shop --service worker.instances=8 --service beat.autostart=false
+$ muructl app unset shop service.worker.instances
+$ muructl app unset shop service.beat
+```
+
+`--service` takes `restart.KEY` for a key of the restart table and
+`env.NAME` for a variable. `muructl app show` lists what is set, and an
+export writes it back. A service the serving release does not declare
+has nothing to change. The settings reach the next release deployed,
+not the one that serves.
+
 ### What an instance runs with
 
 What a [command](commands.md) of the release runs with: the release's

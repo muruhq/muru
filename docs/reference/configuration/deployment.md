@@ -45,6 +45,7 @@ An application's table and its releases.
 | `processes` | integer | the source's, else 1 | Worker processes for every release, over the source's. |
 | `release` | table of tables, {ref}`[app.NAME.release.ID] <config-deployment-app-name-release-id>` |  | Releases by identifier. |
 | `schedule` | array of tables, {ref}`[[app.NAME.schedule]] <config-deployment-app-name-schedule>` |  | Scheduled capacity. |
+| `service` | table of tables, {ref}`[app.NAME.service.NAME] <config-deployment-app-name-service-name>` |  | What this node changes of the services the application's releases declare, by the service's name: every release deployed after this is applied takes them over its own. |
 | `serving` | string | the one release an apply adds, else the one that serves | The release that serves the application's traffic, a declared one or one the daemon has. The other releases an apply adds are started held, and naming a release the daemon has promotes it. An apply that adds more than one release of the application needs it. |
 | `slow` | string | the `[logs]` table's | How slow one of the application's requests is to be written under `access_log = "errors"`. |
 | `sync_threads` | integer | the source's, else 8 | Threads for synchronous code called from an ASGI application, for every release, over the source's. |
@@ -59,7 +60,7 @@ An application's table and its releases.
 
 A secret reference in an `[env]` table.
 
-The same keys apply at `[service.NAME.env.NAME]` and `[app.NAME.release.ID.env.NAME]`.
+The same keys apply at `[service.NAME.env.NAME]`, `[app.NAME.release.ID.env.NAME]` and `[app.NAME.service.NAME.env.NAME]`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -405,6 +406,20 @@ An `[[app.NAME.schedule]]` entry: capacity for a window, shorthand for an overla
 | `start` | string |  | A one-off window's start, as for an overlay's schedule. |
 | `timezone` | string | the daemon's system time zone | The time zone of local times. |
 | `warm_up` | string |  | How long before each window the floor applies, such as 30m. |
+
+(config-deployment-app-name-service-name)=
+## `[app.NAME.service.NAME]`
+
+What a node's operator changes of a service a project declares, the `[app.NAME.service.SERVICE]` table: the keys that are the node's to decide. The command is the release's.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `autostart` | boolean |  | Whether the service starts with its release on this node. |
+| `env` | table of strings or tables, {ref}`[app.NAME.env.NAME] <config-deployment-app-name-env-name>` |  | Variables over the service's own, by name: a value, or a secret reference. |
+| `instances` | integer |  | How many copies of the command run. |
+| `on_idle` | string |  | Whether the service runs on while the application's host is stopped for idleness. `run`: It runs on. `stop`: It stops with the host and starts when a request wakes it. |
+| `restart` | table, {ref}`[service.NAME.restart] <config-deployment-service-name-restart>` |  | What happens when an instance exits, in place of the project's table. |
+| `stop_timeout` | string |  | How long an instance asked to stop has before it is killed. |
 
 (config-deployment-app-name-timeouts)=
 ## `[app.NAME.timeouts]`
@@ -901,7 +916,7 @@ The `readiness` table of a service: how an instance is known to be up. One of `a
 
 The `restart` table of a managed HTTP release: what happens when an instance exits.
 
-The same keys apply at `[app.NAME.release.ID.restart]`.
+The same keys apply at `[app.NAME.release.ID.restart]` and `[app.NAME.service.NAME.restart]`.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |

@@ -547,6 +547,29 @@ def test_a_projects_services_run_with_its_serving_release(daemon: Daemon, tmp_pa
     daemon.muructl("service", "start", "shop/beat", "--wait")
     assert of_app()["shop/beat"]["release"] == "r3"
 
+    # The node's own settings for a service are taken by the releases
+    # deployed from then on, over what the project declares.
+
+    daemon.muructl(
+        "app", "set", "shop", "--service", "worker.instances=2", "--service", "beat.autostart=false"
+    )
+    shown = daemon.muructl("app", "show", "shop").stdout
+    assert "service.worker.instances" in shown and "service.beat.autostart" in shown
+    exported = tomllib.loads(daemon.muructl("deployment", "export").stdout)
+    assert exported["app"]["shop"]["service"] == {
+        "beat": {"autostart": False},
+        "worker": {"instances": 2},
+    }
+    daemon.deploy("shop", project, "--wait-services")
+    listed = of_app()
+    assert [instance["state"] for instance in listed["shop/worker"]["instance_list"]] == [
+        "running",
+        "running",
+    ]
+    wait_for(lambda: of_app()["shop/beat"]["state"] == "stopped")
+    assert of_app()["shop/beat"]["held"] is False
+    daemon.muructl("app", "unset", "shop", "service.worker", "service.beat")
+
     # A release that no longer declares a service leaves nothing in its
     # place, and a drained application runs none.
 
