@@ -45,6 +45,89 @@ pub const RECORD: &str = "service.toml";
 /// How many of an instance's exits are kept for `service status`.
 const HISTORY: usize = 5;
 
+/// The file in a service's runtime directory its instances' last exits
+/// are kept in, for the daemon that takes the service over.
+pub const EXITS: &str = "exits.toml";
+
+/// The last exits of a service's instances as kept in [`EXITS`].
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct KeptExits {
+    #[serde(default)]
+    instance: Vec<KeptInstance>,
+}
+
+/// One instance's last exits, oldest first.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct KeptInstance {
+    index: u32,
+    exits: Vec<KeptExit>,
+}
+
+/// One exit: when, Unix milliseconds, and what happened.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct KeptExit {
+    at_unix_ms: u64,
+    what: String,
+}
+
+/// The exits kept in a service's runtime directory, by instance; none
+/// when the file is not there or cannot be read, since they are only
+/// shown.
+fn read_exits(files: &std::path::Path) -> BTreeMap<u32, VecDeque<(u64, String)>> {
+    let Ok(text) = std::fs::read_to_string(files.join(EXITS)) else {
+        return BTreeMap::new();
+    };
+
+    let kept: KeptExits = toml::from_str(&text).unwrap_or_default();
+    kept.instance
+        .into_iter()
+        .map(|instance| {
+            let skip = instance.exits.len().saturating_sub(HISTORY);
+            (
+                instance.index,
+                instance
+                    .exits
+                    .into_iter()
+                    .skip(skip)
+                    .map(|exit| (exit.at_unix_ms, exit.what))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Keep the exits in a service's runtime directory, written beside the
+/// file and renamed over it. A failure is not reported: the exits are
+/// in the events, and this copy is only for `service status`.
+fn write_exits(files: &std::path::Path, history: &BTreeMap<u32, VecDeque<(u64, String)>>) {
+    let kept = KeptExits {
+        instance: history
+            .iter()
+            .map(|(index, exits)| KeptInstance {
+                index: *index,
+                exits: exits
+                    .iter()
+                    .map(|(at_unix_ms, what)| KeptExit {
+                        at_unix_ms: *at_unix_ms,
+                        what: what.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+
+    let Ok(text) = toml::to_string(&kept) else {
+        return;
+    };
+
+    let path = files.join(EXITS);
+    let beside = files.join(format!("{EXITS}.new"));
+
+    if std::fs::write(&beside, text).is_ok() {
+        let _ = std::fs::rename(&beside, &path);
+    }
+}
+
 /// How long one readiness probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -738,6 +821,17 @@ impl Service {
         let policy = policy_of(&setting.table);
         let mut probes = BTreeMap::new();
 
+        // A service taken over keeps the exits the daemon before saw;
+        // one started from nothing has none, whatever was left behind.
+
+        let history = match begin {
+            Begin::Adopt(_) => read_exits(&setting.dirs.files),
+            Begin::Start | Begin::Idle => {
+                let _ = std::fs::remove_file(setting.dirs.files.join(EXITS));
+                BTreeMap::new()
+            }
+        };
+
         let supervisor = match begin {
             Begin::Adopt(record) => {
                 // The record decides how many instances there are: the
@@ -790,7 +884,7 @@ impl Service {
             start_after_retiring: false,
             overlap_until: None,
             probes,
-            history: BTreeMap::new(),
+            history,
             rolling: VecDeque::new(),
             rolling_at: None,
             held,
@@ -1299,6 +1393,7 @@ impl Service {
         self.roll();
         let seen = self.supervisor.check().await;
         let now_unix_ms = crate::model::now_unix_ms();
+        let mut exited = false;
 
         for report in &seen {
             if let Some(outcome) = report.outcome {
@@ -1324,10 +1419,16 @@ impl Service {
                     while exits.len() > HISTORY {
                         exits.pop_front();
                     }
+
+                    exited = true;
                 }
                 Change::Started { again: true } => self.restarts += 1,
                 Change::Started { again: false } | Change::None => {}
             }
+        }
+
+        if exited {
+            write_exits(&self.setting.dirs.files, &self.history);
         }
 
         reports.extend(seen);
@@ -2151,6 +2252,17 @@ mod tests {
             states(status) == ["running", "stopped"]
         })
         .await;
+
+        // An exit of its own is kept for the daemon that comes next.
+
+        let killed = first.status().instances[0].pid;
+        assert!(crate::host::signal_process(killed, libc::SIGKILL));
+        settle(&mut first, |status| {
+            states(status) == ["running", "stopped"] && status.instances[0].pid != killed
+        })
+        .await;
+        let exits = first.status().instances[0].exits.clone();
+        assert_eq!(exits.len(), 1);
         let pid = first.status().instances[0].pid;
         let record = first.record();
         first.release();
@@ -2174,6 +2286,22 @@ mod tests {
         .await;
         assert_eq!(said, Vec::<String>::new());
         assert_eq!(second.status().instances[0].pid, pid);
+        assert_eq!(second.status().instances[0].exits, exits);
         second.stop_until(std::time::Instant::now()).await;
+
+        // A service started from nothing has no exits, whatever the
+        // directory was left with.
+
+        std::fs::create_dir_all(dir.path().join("files")).unwrap();
+        std::fs::write(
+            dir.path().join("files").join(EXITS),
+            "[[instance]]\nindex = 0\nexits = [{ at_unix_ms = 1, what = 'exited' }]\n",
+        )
+        .unwrap();
+        let mut third =
+            Service::begin(setting(dir.path(), "kept", table), false, Begin::Start).unwrap();
+        settle(&mut third, |status| status.state == "running").await;
+        assert!(third.status().instances[0].exits.is_empty());
+        third.stop_until(std::time::Instant::now()).await;
     }
 }

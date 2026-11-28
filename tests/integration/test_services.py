@@ -356,6 +356,14 @@ def test_services_outlive_the_daemon_and_are_stopped_by_a_shutdown(tmp_path: Pat
         wait_for(lambda: all(service["state"] == "running" for service in services(first).values()))
         first.muructl("service", "stop", "stopped")
         kept = pids(first, "kept")[0]
+
+        # An exit this daemon sees is one the next still lists.
+
+        os.kill(pids(first, "dies")[0], signal.SIGKILL)
+        wait_for(lambda: services(first)["dies"]["restarts"] == 1)
+        wait_for(lambda: services(first)["dies"]["state"] == "running")
+        seen = services(first)["dies"]["instance_list"][0]["exits"]
+        assert len(seen) == 1
         dies = pids(first, "dies")[0]
 
         # The daemon detaches, and the services run on with nobody
@@ -377,6 +385,7 @@ def test_services_outlive_the_daemon_and_are_stopped_by_a_shutdown(tmp_path: Pat
         assert pids(second, "kept") == [kept]
         assert (listed["stopped"]["state"], listed["stopped"]["held"]) == ("stopped", True)
         assert listed["dies"]["restarts"] == 1
+        assert listed["dies"]["instance_list"][0]["exits"][0] == seen[0]
         adopted = dict(
             line.split(None, 5)[4:6]
             for line in second.muructl("events").stdout.splitlines()
