@@ -317,6 +317,30 @@ pub struct Readiness {
     pub timeout: Option<String>,
 }
 
+/// The `liveness` table of a managed HTTP release (section 9.9): a
+/// check made of each instance for as long as it runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Liveness {
+    /// The path asked for with a GET, which passes with a 2xx or 3xx
+    /// answer: the readiness `path` when absent, and without either any
+    /// HTTP response passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How often an instance is asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10s"))]
+    pub interval: Option<String>,
+    /// How long one answer may take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "2s"))]
+    pub timeout: Option<String>,
+    /// How many failures in a row stop the instance; at least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 3))]
+    pub failures: Option<u32>,
+}
+
 /// A Python logging level (section 11.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
@@ -1092,6 +1116,10 @@ pub struct Release {
     /// What happens when an `http` release's instance exits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<Restart>,
+    /// A check that each running instance of an `http` release still
+    /// answers; one that fails it is stopped and started again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<Liveness>,
     /// The signal that stops an `http` release's instance gracefully:
     /// TERM, INT, QUIT, HUP, USR1, USR2 or WINCH. Required by the generic
     /// profile; the other profiles know their server's.
@@ -1798,6 +1826,13 @@ pub struct Daemon {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub detours: Option<bool>,
+    /// Which services this node runs (section 9.17): `all`, those of
+    /// applied files and those its applications' projects declare;
+    /// `node`, only those of applied files; or `none`. What is not run
+    /// is refused when it is applied or deployed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "all"))]
+    pub services: Option<ServicesAccepted>,
     /// The node's budget across every application (section 7.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<Budget>,
@@ -5288,6 +5323,10 @@ pub struct Service {
     /// How an instance is known to be up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness: Option<ServiceReadiness>,
+    /// A check that an instance still answers, made for as long as it
+    /// runs; one that fails it is stopped and started again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<ServiceLiveness>,
     /// The signal that asks an instance to stop: TERM, INT, QUIT, HUP,
     /// USR1, USR2 or WINCH.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5325,6 +5364,30 @@ pub struct Service {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("default" = false))]
     pub required: Option<bool>,
+}
+
+/// Which services a node runs: the daemon's `services` setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ServicesAccepted {
+    /// The node's own and those its applications' projects declare.
+    #[default]
+    All,
+    /// Only the node's own, from `[service.NAME]` in applied files.
+    Node,
+    /// None.
+    None,
+}
+
+impl ServicesAccepted {
+    /// The setting as it is written.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Node => "node",
+            Self::None => "none",
+        }
+    }
 }
 
 /// How a project's service changes over when another release takes over.
@@ -5429,6 +5492,49 @@ pub struct ServiceReadiness {
     #[schemars(extend("default" = "500ms"))]
     pub interval: Option<String>,
 }
+
+/// The `liveness` table of a service: a check that a running instance
+/// still answers. One of `tcp`, `unix`, `http` and `command` says how.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceLiveness {
+    /// Alive while a TCP connection to this `host:port` is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<String>,
+    /// Alive while a connection to this Unix socket is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix: Option<String>,
+    /// Alive while a GET of this `http://` URL answers 2xx or 3xx.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<String>,
+    /// Alive while this command, run as the service's user with its
+    /// environment, exits 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    /// How often the check is made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "10s"))]
+    pub interval: Option<String>,
+    /// How long one check may take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "2s"))]
+    pub timeout: Option<String>,
+    /// How many checks in a row fail before the instance is stopped; at
+    /// least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = 3))]
+    pub failures: Option<u32>,
+}
+
+/// How often liveness is checked, when the table does not say.
+pub const DEFAULT_LIVENESS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long one liveness check may take, when the table does not say.
+pub const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many liveness checks in a row fail before an instance is
+/// stopped, when the table does not say.
+pub const DEFAULT_LIVENESS_FAILURES: u32 = 3;
 
 /// How long a service's instance asked to stop has, when its table does
 /// not say.
@@ -5580,6 +5686,108 @@ pub fn check_service(table: &Service) -> Result<(), String> {
 
     wait("stop_timeout", &table.stop_timeout)?;
 
+    // What a probe is made of, for readiness and for liveness.
+
+    let targets = |key: &str,
+                   tcp: &Option<String>,
+                   unix: &Option<String>,
+                   http: &Option<String>,
+                   command: &Option<Vec<String>>|
+     -> Result<(), String> {
+        if let Some(address) = tcp {
+            filled(&format!("{key}.tcp"), address)?;
+            let address = fill_placeholders(address, &[("index", "0"), ("run_dir", "/run")])
+                .unwrap_or_default();
+
+            match parse_upstream_address(&address) {
+                Ok(UpstreamAddress::Tcp(..)) => {}
+                _ => return Err(format!("{key}.tcp {address:?} is not host:port")),
+            }
+        }
+
+        if let Some(path) = unix {
+            filled(&format!("{key}.unix"), path)?;
+
+            if !path.starts_with('/') && !path.starts_with("{run_dir}") {
+                return Err(format!(
+                    "{key}.unix {path:?} must be an absolute path, or start with {{run_dir}}"
+                ));
+            }
+        }
+
+        if let Some(url) = http {
+            filled(&format!("{key}.http"), url)?;
+            let rest = url.strip_prefix("http://").unwrap_or_default();
+            let address = rest.split('/').next().unwrap_or_default();
+            let address = fill_placeholders(address, &[("index", "0"), ("run_dir", "/run")])
+                .unwrap_or_default();
+
+            if !matches!(
+                parse_upstream_address(&address),
+                Ok(UpstreamAddress::Tcp(..))
+            ) {
+                return Err(format!(
+                    "{key}.http {url:?} is not a URL such as http://127.0.0.1:9187/metrics"
+                ));
+            }
+        }
+
+        if let Some(command) = command {
+            if command.is_empty() || command[0].is_empty() {
+                return Err(format!("{key}.command: the command is empty"));
+            }
+
+            for argument in command {
+                filled(&format!("{key}.command"), argument)?;
+            }
+        }
+
+        Ok(())
+    };
+
+    if let Some(liveness) = &table.liveness {
+        let forms: Vec<&str> = [
+            ("tcp", liveness.tcp.is_some()),
+            ("unix", liveness.unix.is_some()),
+            ("http", liveness.http.is_some()),
+            ("command", liveness.command.is_some()),
+        ]
+        .into_iter()
+        .filter(|(_, given)| *given)
+        .map(|(form, _)| form)
+        .collect();
+
+        match forms.len() {
+            0 => {
+                return Err(
+                    "liveness needs the check it makes: tcp, unix, http or command".to_owned(),
+                );
+            }
+            1 => {}
+            _ => {
+                return Err(format!(
+                    "liveness: {} are given, and an instance is checked one way",
+                    forms.join(" and ")
+                ));
+            }
+        }
+
+        wait("liveness.interval", &liveness.interval)?;
+        wait("liveness.timeout", &liveness.timeout)?;
+
+        if liveness.failures == Some(0) {
+            return Err("liveness.failures must be at least 1".to_owned());
+        }
+
+        targets(
+            "liveness",
+            &liveness.tcp,
+            &liveness.unix,
+            &liveness.http,
+            &liveness.command,
+        )?;
+    }
+
     let Some(readiness) = &table.readiness else {
         return Ok(());
     };
@@ -5613,55 +5821,13 @@ pub fn check_service(table: &Service) -> Result<(), String> {
         );
     }
 
-    if let Some(address) = &readiness.tcp {
-        filled("readiness.tcp", address)?;
-        let address =
-            fill_placeholders(address, &[("index", "0"), ("run_dir", "/run")]).unwrap_or_default();
-
-        match parse_upstream_address(&address) {
-            Ok(UpstreamAddress::Tcp(..)) => {}
-            _ => return Err(format!("readiness.tcp {address:?} is not host:port")),
-        }
-    }
-
-    if let Some(path) = &readiness.unix {
-        filled("readiness.unix", path)?;
-
-        if !path.starts_with('/') && !path.starts_with("{run_dir}") {
-            return Err(format!(
-                "readiness.unix {path:?} must be an absolute path, or start with {{run_dir}}"
-            ));
-        }
-    }
-
-    if let Some(url) = &readiness.http {
-        filled("readiness.http", url)?;
-        let rest = url.strip_prefix("http://").unwrap_or_default();
-        let address = rest.split('/').next().unwrap_or_default();
-        let address =
-            fill_placeholders(address, &[("index", "0"), ("run_dir", "/run")]).unwrap_or_default();
-
-        if !matches!(
-            parse_upstream_address(&address),
-            Ok(UpstreamAddress::Tcp(..))
-        ) {
-            return Err(format!(
-                "readiness.http {url:?} is not a URL such as http://127.0.0.1:9187/metrics"
-            ));
-        }
-    }
-
-    if let Some(command) = &readiness.command {
-        if command.is_empty() || command[0].is_empty() {
-            return Err("readiness.command: the command is empty".to_owned());
-        }
-
-        for argument in command {
-            filled("readiness.command", argument)?;
-        }
-    }
-
-    Ok(())
+    targets(
+        "readiness",
+        &readiness.tcp,
+        &readiness.unix,
+        &readiness.http,
+        &readiness.command,
+    )
 }
 
 /// An HTTP upstream (section 4.13), one of the `[upstream.NAME]` tables:
@@ -5806,7 +5972,7 @@ pub const UPSTREAM_PROTOCOLS: [&str; 3] = ["http1", "h2c", "h2"];
 /// the worker settings, and a workers release takes none of the server
 /// ones.
 pub fn check_release_kind(table: &Release) -> Result<(), String> {
-    let server_keys: [(&str, bool); 8] = [
+    let server_keys: [(&str, bool); 9] = [
         ("profile", table.profile.is_some()),
         ("command", !table.command.is_empty()),
         ("cwd", table.cwd.is_some()),
@@ -5814,6 +5980,7 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
         ("instances", table.instances.is_some()),
         ("readiness", table.readiness.is_some()),
         ("restart", table.restart.is_some()),
+        ("liveness", table.liveness.is_some()),
         ("stop_signal", table.stop_signal.is_some()),
     ];
 
@@ -5948,6 +6115,32 @@ pub fn check_release_kind(table: &Release) -> Result<(), String> {
 
     if let Some(restart) = &table.restart {
         check_restart(restart)?;
+    }
+
+    if let Some(liveness) = &table.liveness {
+        if let Some(path) = &liveness.path
+            && !path.starts_with('/')
+        {
+            return Err(format!("liveness.path {path:?} must start with /"));
+        }
+
+        for (key, text) in [
+            ("interval", &liveness.interval),
+            ("timeout", &liveness.timeout),
+        ] {
+            if let Some(text) = text {
+                let duration =
+                    parse_duration(text).map_err(|error| format!("liveness.{key}: {error}"))?;
+
+                if duration.is_zero() {
+                    return Err(format!("liveness.{key} must be longer than nothing"));
+                }
+            }
+        }
+
+        if liveness.failures == Some(0) {
+            return Err("liveness.failures must be at least 1".to_owned());
+        }
     }
 
     match &table.stop_signal {
@@ -10026,6 +10219,52 @@ mod restart_tests {
             Err("restart applies to a managed HTTP release (kind = 'http')".to_owned())
         );
     }
+
+    #[test]
+    fn a_liveness_table_is_read_and_checked() {
+        let server = |liveness: &str| {
+            let release: Release = toml::from_str(&format!(
+                "kind = 'http'\nprofile = 'gunicorn'\ncommand = ['gunicorn', 'shop:app']\n\
+                 cwd = '/srv'\nliveness = {liveness}\n"
+            ))
+            .unwrap();
+            check_release_kind(&release)
+        };
+
+        // Every key has a default, so an empty table is a check.
+
+        assert_eq!(server("{}"), Ok(()));
+        assert_eq!(
+            server("{ path = '/healthz', interval = '5s', timeout = '1s', failures = 2 }"),
+            Ok(())
+        );
+        assert_eq!(
+            server("{ path = 'healthz' }").unwrap_err(),
+            "liveness.path \"healthz\" must start with /"
+        );
+        assert_eq!(
+            server("{ interval = '0s' }").unwrap_err(),
+            "liveness.interval must be longer than nothing"
+        );
+        assert!(
+            server("{ timeout = 'soon' }")
+                .unwrap_err()
+                .starts_with("liveness.timeout: ")
+        );
+        assert_eq!(
+            server("{ failures = 0 }").unwrap_err(),
+            "liveness.failures must be at least 1"
+        );
+        assert!(toml::from_str::<Release>("liveness = { tcp = '127.0.0.1:1' }").is_err());
+
+        // The table is a managed server's, not a release of workers'.
+
+        let workers: Release = toml::from_str("source = '/srv'\nliveness = {}\n").unwrap();
+        assert_eq!(
+            check_release_kind(&workers),
+            Err("liveness applies to a managed HTTP release (kind = 'http')".to_owned())
+        );
+    }
 }
 
 #[cfg(test)]
@@ -10144,6 +10383,41 @@ mod service_tests {
             ))
             .starts_with("readiness.interval is for a form that probes")
         );
+
+        // Liveness is one of the forms that probe, checked as readiness
+        // is.
+
+        let accepted = |liveness: &str| {
+            let table: Service = toml::from_str(&format!("{base}liveness = {liveness}")).unwrap();
+            check_service(&table)
+        };
+        assert_eq!(
+            accepted("{ tcp = '127.0.0.1:63{index}9', interval = '5s', failures = 2 }"),
+            Ok(())
+        );
+        assert_eq!(
+            accepted("{ interval = '5s' }").unwrap_err(),
+            "liveness needs the check it makes: tcp, unix, http or command"
+        );
+        assert_eq!(
+            accepted("{ tcp = '127.0.0.1:1', unix = '/x' }").unwrap_err(),
+            "liveness: tcp and unix are given, and an instance is checked one way"
+        );
+        assert_eq!(
+            accepted("{ tcp = '127.0.0.1:1', failures = 0 }").unwrap_err(),
+            "liveness.failures must be at least 1"
+        );
+        assert!(
+            accepted("{ http = 'https://x/' }")
+                .unwrap_err()
+                .starts_with("liveness.http")
+        );
+        assert!(
+            accepted("{ tcp = '127.0.0.1:1', timeout = '0s' }")
+                .unwrap_err()
+                .starts_with("liveness.timeout")
+        );
+        assert!(toml::from_str::<Service>("command = ['x']\nliveness = { after = '1s' }").is_err());
         assert!(toml::from_str::<Service>("command = ['x']\nports = 1").is_err());
     }
 

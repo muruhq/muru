@@ -82,6 +82,8 @@ pub struct NodeSettings {
     pub debug_exec: bool,
     /// Whether development runs may open detours (section 9.13).
     pub detours: bool,
+    /// `[daemon] services`: which services the node runs (section 9.17).
+    pub services: muru_config::ServicesAccepted,
     /// Section 8.7: the variables of the daemon's own environment passed
     /// to a release's processes beside the base, by name or `PREFIX*`.
     pub pass_env: Vec<String>,
@@ -268,6 +270,7 @@ impl NodeSettings {
                 .or_else(|| daemon.and_then(|table| table.user.clone())),
             debug_exec: daemon.and_then(|table| table.debug_exec).unwrap_or(false),
             detours: daemon.and_then(|table| table.detours).unwrap_or(false),
+            services: daemon.and_then(|table| table.services).unwrap_or_default(),
             pass_env: pass_env_from(daemon)?,
             keep_command_runs: keep_command_runs_from(daemon)?,
             budget,

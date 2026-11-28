@@ -36,6 +36,7 @@ precisely than the status, appears in the access log line as
 | 503 | `queue_full` | Every worker thread was busy for longer than the queue timeout, with `Retry-After: 1` |
 | 503 | `cold_start_timeout` | The request's group had no worker, because it was [scaled to zero](../howto/scaling.md#scale-to-zero), its host was starting or its workers were on their way, and none started within the queue timeout, with `Retry-After: 1` |
 | 503 | `upstream_starting` | Every instance of a [managed server](../howto/managed-servers.md) was starting again and too many requests were already waiting for one to answer, with `Retry-After: 1` |
+| 503 | `upstream_down` | Every instance of a [managed server](../howto/managed-servers.md) had exited and none was going to be started again, until one is restarted by hand |
 | 503 | `mount_not_loaded` | The worker the request reached does not serve the request's mount, which a [worker group's `mounts` list](../howto/worker-groups.md#mounts-a-group-serves) left out |
 | 504 | `deadline` | The application or upstream did not produce a response head within the request deadline |
 | 504 | `soft_timeout` | The request ran past the soft timeout and was interrupted in the worker before it produced a response head; development mode includes the traceback of where it was (see the [timeouts guide](../howto/timeouts.md)) |

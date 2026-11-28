@@ -231,6 +231,67 @@ def test_a_crashed_instance_is_started_again(daemon: Daemon) -> None:
     ]
 
 
+def test_an_instance_that_fails_its_liveness_check_is_started_again(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    flag = tmp_path / "ready"
+    flag.touch()
+    deploy_server(
+        daemon,
+        "legacy",
+        "--readiness",
+        "/healthz",
+        "--liveness",
+        "interval=200ms",
+        "--liveness",
+        "failures=2",
+        "--env",
+        f"LEGACY_READY={flag}",
+    )
+    before = report(daemon)["pid"]
+
+    # The check asks for the readiness path, and is exported with every
+    # key.
+
+    exported = tomllib.loads(daemon.muructl("deployment", "export").stdout)
+    assert exported["app"]["legacy"]["release"]["r1"]["liveness"] == {
+        "path": "/healthz",
+        "interval": "200ms",
+        "timeout": "2s",
+        "failures": 2,
+    }
+
+    def events() -> str:
+        return daemon.muructl("events").stdout
+
+    # While it answers nothing is done.
+
+    time.sleep(1.5)
+    assert "server.unresponsive" not in events()
+    assert [instance["pid"] for instance in instances(daemon, "legacy@r1")] == [before]
+
+    # Once it fails twice in a row the instance is stopped and started
+    # again by the restart policy, and serves once it is ready.
+
+    flag.unlink()
+    wait_for(lambda: "server.unresponsive" in events())
+    flag.touch()
+    wait_for(lambda: not alive(before))
+    wait_for(lambda: daemon.request("/").status == 200, 20)
+    after = report(daemon)["pid"]
+    assert after != before
+    said = events()
+    assert "instance 0 failed its liveness check 2 times in a row and is stopped" in said
+    assert (
+        "instance 0 failed its liveness check 2 times in a row and was stopped "
+        "(exited with signal: 15 (SIGTERM)); starting it again in 1s"
+    ) in said
+    assert f"instance 0 started again (pid {after})" in said
+    assert daemon.releases("legacy") == [
+        {"release": "legacy@r1", "state": "ready", "serving": "yes"}
+    ]
+
+
 def test_a_crash_loop_is_loud_and_ends_as_the_restart_table_says(
     daemon: Daemon, tmp_path: Path
 ) -> None:
@@ -283,6 +344,14 @@ def test_a_crash_loop_is_loud_and_ends_as_the_restart_table_says(
     ]
     time.sleep(2.5)
     assert len(events("server.started")) == 3
+
+    # With its one instance failed nothing is going to answer, and a
+    # request is told so at once, not held for one to start.
+
+    asked = time.monotonic()
+    down = daemon.request("/", headers={"Accept": "application/json"})
+    assert (down.status, json.loads(down.body)["reason"]) == (503, "upstream_down")
+    assert time.monotonic() - asked < 2
 
     # A restart by hand starts the instance that was given up on.
 
@@ -663,6 +732,7 @@ command = {json.dumps(SERVER)}
 cwd = '{LEGACY}'
 instances = 1
 readiness = {{ path = '/healthz', timeout = '20s' }}
+liveness = {{ path = '/', interval = '30s' }}
 stop_signal = 'TERM'
 env = {{ LEGACY_SETTING = 'declared' }}
 
@@ -695,6 +765,13 @@ app = 'legacy'
     # The restart table is exported with every key, the defaults of
     # those the file left out among them.
 
+    declared = tomllib.loads(exported)["app"]["legacy"]["release"]["r1"]
+    assert declared["liveness"] == {
+        "path": "/",
+        "interval": "30s",
+        "timeout": "2s",
+        "failures": 3,
+    }
     restart = tomllib.loads(exported)["app"]["legacy"]["release"]["r1"]["restart"]
     assert restart == {
         "policy": "on-failure",

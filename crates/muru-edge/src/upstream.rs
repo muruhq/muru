@@ -40,6 +40,10 @@ pub const FAILED_REASON: &str = "upstream_failed";
 /// server is starting and `MAX_HELD` requests already wait (issue 919).
 pub const STARTING_REASON: &str = "upstream_starting";
 
+/// The reason of the 503 answered while every instance of a managed
+/// server has exited and none is to be started again (issue 1001).
+pub const DOWN_REASON: &str = "upstream_down";
+
 /// The most requests one upstream holds at a time, in one edge process,
 /// while every one of its addresses is starting (issue 919).
 const MAX_HELD: usize = 256;
@@ -299,9 +303,27 @@ struct Probe {
 /// upstream hears the snapshot that clears a mark.
 #[derive(Default)]
 struct Starting {
-    addresses: tokio::sync::watch::Sender<HashSet<String>>,
+    addresses: tokio::sync::watch::Sender<Marks>,
     /// Requests held now.
     held: AtomicUsize,
+}
+
+/// The marks of one snapshot: the addresses out of service as starting,
+/// and those of them whose instance exited and is not to be started
+/// again, which nothing is gained by waiting for (issue 1001).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Marks {
+    starting: HashSet<String>,
+    down: HashSet<String>,
+}
+
+/// Why a request is not sent to a managed server at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// Every address is starting and too many requests wait already.
+    TooManyHeld,
+    /// Every address is down.
+    Down,
 }
 
 /// Counts a request as held while it lives.
@@ -348,7 +370,8 @@ impl Shared {
         let count = self.addresses.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         let in_order = (0..count).map(|offset| &self.addresses[(start + offset) % count]);
-        let starting = self.starting.addresses.borrow();
+        let marks = self.starting.addresses.borrow();
+        let starting = &marks.starting;
 
         let candidates: Vec<(&Arc<Address>, Admission)> = in_order
             .clone()
@@ -375,7 +398,13 @@ impl Shared {
     /// address is still starting (issue 917): it is never ejected, or its
     /// ejection lengthened, for refusing connections while it starts.
     fn failed(&self, address: &Address) {
-        if self.starting.addresses.borrow().contains(&address.text) {
+        if self
+            .starting
+            .addresses
+            .borrow()
+            .starting
+            .contains(&address.text)
+        {
             return;
         }
 
@@ -383,10 +412,18 @@ impl Shared {
     }
 
     /// Whether every address is still starting, by the marks given.
-    fn all_starting(&self, starting: &HashSet<String>) -> bool {
+    fn all_starting(&self, marks: &Marks) -> bool {
         self.addresses
             .iter()
-            .all(|address| starting.contains(&address.text))
+            .all(|address| marks.starting.contains(&address.text))
+    }
+
+    /// Whether every address is down, by the marks given: nothing is
+    /// going to answer until someone starts an instance by hand.
+    fn all_down(&self, marks: &Marks) -> bool {
+        self.addresses
+            .iter()
+            .all(|address| marks.down.contains(&address.text))
     }
 
     /// Section 9.9 (issue 919): with every address still starting, hold
@@ -395,17 +432,27 @@ impl Shared {
     /// against the deadline, which was set when the request arrived. A
     /// request held to its bound goes on to be tried as any other is.
     /// When `MAX_HELD` requests are held already the request is refused,
-    /// which `Err` says.
-    async fn hold(&self, wait: Duration, deadline: Instant) -> Result<(), ()> {
+    /// and with every address down it is refused without waiting, now or
+    /// when a snapshot says so while it is held (issue 1001); `Err` says
+    /// which.
+    async fn hold(&self, wait: Duration, deadline: Instant) -> Result<(), Refused> {
         let mut marks = self.starting.addresses.subscribe();
 
-        if !self.all_starting(&marks.borrow_and_update()) {
-            return Ok(());
+        {
+            let now = marks.borrow_and_update();
+
+            if self.all_down(&now) {
+                return Err(Refused::Down);
+            }
+
+            if !self.all_starting(&now) {
+                return Ok(());
+            }
         }
 
         if self.starting.held.fetch_add(1, Ordering::Relaxed) >= MAX_HELD {
             self.starting.held.fetch_sub(1, Ordering::Relaxed);
-            return Err(());
+            return Err(Refused::TooManyHeld);
         }
 
         let _held = Held(&self.starting.held);
@@ -413,7 +460,17 @@ impl Shared {
 
         loop {
             match tokio::time::timeout_at(until, marks.changed()).await {
-                Ok(Ok(())) if self.all_starting(&marks.borrow_and_update()) => {}
+                Ok(Ok(())) => {
+                    let now = marks.borrow_and_update();
+
+                    if self.all_down(&now) {
+                        return Err(Refused::Down);
+                    }
+
+                    if !self.all_starting(&now) {
+                        return Ok(());
+                    }
+                }
                 _ => return Ok(()),
             }
         }
@@ -526,9 +583,10 @@ impl Upstream {
 
         let starting =
             earlier.map_or_else(Arc::default, |earlier| Arc::clone(&earlier.shared.starting));
-        starting
-            .addresses
-            .send_replace(message.starting.iter().cloned().collect());
+        starting.addresses.send_replace(Marks {
+            starting: message.starting.iter().cloned().collect(),
+            down: message.down.iter().cloned().collect(),
+        });
 
         let protocol = match message.protocol.as_str() {
             "" | "http1" => Protocol::Http1,
@@ -624,7 +682,10 @@ impl Upstream {
     /// as a snapshot that leaves the upstream out does: they are tried
     /// as they are.
     pub fn release_held(&self) {
-        self.shared.starting.addresses.send_replace(HashSet::new());
+        self.shared
+            .starting
+            .addresses
+            .send_replace(Marks::default());
     }
 
     /// Close every WebSocket relayed through the upstream, as the end of
@@ -1315,14 +1376,27 @@ pub async fn handle(
     // timeout and its deadline, rather than failing on a refused
     // connection.
 
-    if shared.hold(limits.queue_timeout, deadline).await.is_err() {
-        let mut problem = Problem::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            STARTING_REASON,
-            "Every instance of the server was starting, and too many requests were waiting for one.",
-        );
-        problem.retry_after = Some(1);
-        return Handled::Response(failing.respond(problem));
+    match shared.hold(limits.queue_timeout, deadline).await {
+        Ok(()) => {}
+        Err(Refused::TooManyHeld) => {
+            let mut problem = Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                STARTING_REASON,
+                "Every instance of the server was starting, and too many requests were waiting for one.",
+            );
+            problem.retry_after = Some(1);
+            return Handled::Response(failing.respond(problem));
+        }
+
+        // Issue 1001: nothing is going to answer, so the request is not
+        // held for the queue timeout to fail on a refused connection.
+        Err(Refused::Down) => {
+            return Handled::Response(failing.respond(Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                DOWN_REASON,
+                "Every instance of the server has exited, and none is to be started again.",
+            )));
+        }
     }
 
     let candidates = shared.in_turn(Instant::now());
@@ -2095,8 +2169,35 @@ mod tests {
             .store(MAX_HELD, Ordering::Relaxed);
         assert_eq!(
             third.shared.hold(Duration::from_secs(5), deadline).await,
-            Err(())
+            Err(Refused::TooManyHeld)
         );
+        third.shared.starting.held.store(0, Ordering::Relaxed);
+
+        // Issue 1001: with every address down nothing waits, and a
+        // request held when a snapshot says so is let go at once.
+
+        let down = |down: &[&str]| pb::Upstream {
+            down: down.iter().map(|text| (*text).to_owned()).collect(),
+            ..message(&["127.0.0.1:9001"])
+        };
+        let held = {
+            let third = Arc::new(third);
+            let waiting = Arc::clone(&third);
+            let held = tokio::spawn(async move {
+                waiting.shared.hold(Duration::from_secs(20), deadline).await
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!held.is_finished());
+            let fourth =
+                Upstream::from_message_after(&down(&["127.0.0.1:9001"]), Some(&third)).unwrap();
+            assert_eq!(
+                fourth.shared.hold(Duration::from_secs(20), deadline).await,
+                Err(Refused::Down)
+            );
+            held
+        };
+        let waited = tokio::time::timeout(Duration::from_secs(2), held).await;
+        assert_eq!(waited.unwrap().unwrap(), Err(Refused::Down));
 
         // With an address not starting, nothing waits.
 

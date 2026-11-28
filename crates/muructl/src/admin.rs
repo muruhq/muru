@@ -4857,6 +4857,13 @@ pub struct ReleaseArgs {
     #[arg(long = "restart", value_name = "KEY=VALUE", value_parser = crate::parse_restart_setting)]
     pub(crate) restart: Vec<(String, String)>,
 
+    /// A check made of each running instance of a managed server, which
+    /// restarts one that fails it, as KEY=VALUE: path (the path asked
+    /// for, the readiness path when not given), interval (10s), timeout
+    /// (2s) or failures (3, how many in a row). Repeatable.
+    #[arg(long = "liveness", value_name = "KEY=VALUE", value_parser = crate::parse_liveness_setting)]
+    pub(crate) liveness: Vec<(String, String)>,
+
     /// A directory a path in an X-Muru-Sendfile response header must lie
     /// in for the file to be served, relative to the source unless
     /// absolute; repeatable (default the table's).
@@ -5225,6 +5232,27 @@ fn restart_settings(settings: &[(String, String)]) -> Option<pb::RestartSettings
     })
 }
 
+/// The --liveness settings as a request carries them, each already
+/// checked as it was parsed; none when no setting was given.
+fn liveness_settings(settings: &[(String, String)]) -> Option<pb::LivenessSettings> {
+    if settings.is_empty() {
+        return None;
+    }
+
+    let wait = |key: &str| {
+        memory_setting(settings, key)
+            .and_then(|value| muru_config::parse_duration(&value).ok())
+            .map(|duration| duration.as_millis() as u64)
+    };
+
+    Some(pb::LivenessSettings {
+        path: memory_setting(settings, "path"),
+        interval_ms: wait("interval"),
+        timeout_ms: wait("timeout"),
+        failures: memory_setting(settings, "failures").and_then(|count| count.parse().ok()),
+    })
+}
+
 /// The last value given for a named timeout, in milliseconds.
 fn timeout_ms(timeouts: &[(String, Duration)], name: &str) -> Option<u64> {
     timeouts
@@ -5317,6 +5345,7 @@ impl ReleaseArgs {
                 .map(|timeout| timeout.as_millis() as u64),
             stop_signal: self.stop_signal.unwrap_or_default(),
             restart: restart_settings(&self.restart),
+            liveness: liveness_settings(&self.liveness),
             wait_services: false,
             entrypoint: self.entrypoint.unwrap_or_default(),
             interface: self

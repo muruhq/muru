@@ -3864,14 +3864,27 @@ impl Service {
             .map(|app| app.settings)
             .unwrap_or_default();
         let resolving = request.clone();
+        let defined = self
+            .handle
+            .info
+            .defined
+            .read()
+            .expect("defined names poisoned")
+            .clone();
 
         tokio::task::spawn_blocking(move || {
-            crate::app_settings::resolve(
+            let spec = crate::app_settings::resolve(
                 &resolving,
                 &settings,
                 &config::Tables::default(),
                 &provisioning,
-            )
+            )?;
+
+            // Issue 1009: a node may run no services of a project.
+
+            config::refuse_project_services(defined.services, &spec.services)
+                .map_err(|error| format!("the release is refused: {error}"))?;
+            Ok(spec)
         })
         .await
         .map_err(|error| Status::internal(error.to_string()))
@@ -5388,6 +5401,7 @@ pub fn service_status(
         user: table.user.clone().unwrap_or_default(),
         restart: status.restart.clone(),
         readiness: status.readiness.clone(),
+        liveness: status.liveness.clone(),
         stop_signal: table
             .stop_signal
             .clone()

@@ -89,6 +89,7 @@ The `[daemon]` table of the daemon's file: how the daemon itself runs.
 | `detours` | boolean | `false` | Let `muructl detour run` put a development run behind this daemon's edge as a release of an application; off unless set, read when the daemon starts, and refused by a system daemon. |
 | `keep_command_runs` | integer | `20` | How many runs of each of an application's commands are kept, with their output, once they have ended; at least 1. |
 | `pass_env` | array of strings |  | Variables of the daemon's own environment passed to a release's host, workers, commands and managed servers, beside `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ` and `TMPDIR`. Each is a name, or a name with a `*` suffix such as `AWS_*`. A release's own variables override them. |
+| `services` | string | `"all"` | Which services this node runs: `all`, those of applied files and those its applications' projects declare; `node`, only those of applied files; or `none`. What is not run is refused when it is applied or deployed. `all`: The node's own and those its applications' projects declare. `node`: Only the node's own, from `[service.NAME]` in applied files. `none`: None. |
 | `user` | string | `"muru"` | The service user: whom a daemon that runs as root starts the edge, and the applications that name no user of their own, as. Never root. |
 
 (config-daemon-daemon-budget)=

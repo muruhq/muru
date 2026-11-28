@@ -356,6 +356,14 @@ def test_services_outlive_the_daemon_and_are_stopped_by_a_shutdown(tmp_path: Pat
         wait_for(lambda: all(service["state"] == "running" for service in services(first).values()))
         first.muructl("service", "stop", "stopped")
         kept = pids(first, "kept")[0]
+
+        # An exit this daemon sees is one the next still lists.
+
+        os.kill(pids(first, "dies")[0], signal.SIGKILL)
+        wait_for(lambda: services(first)["dies"]["restarts"] == 1)
+        wait_for(lambda: services(first)["dies"]["state"] == "running")
+        seen = services(first)["dies"]["instance_list"][0]["exits"]
+        assert len(seen) == 1
         dies = pids(first, "dies")[0]
 
         # The daemon detaches, and the services run on with nobody
@@ -377,6 +385,7 @@ def test_services_outlive_the_daemon_and_are_stopped_by_a_shutdown(tmp_path: Pat
         assert pids(second, "kept") == [kept]
         assert (listed["stopped"]["state"], listed["stopped"]["held"]) == ("stopped", True)
         assert listed["dies"]["restarts"] == 1
+        assert listed["dies"]["instance_list"][0]["exits"][0] == seen[0]
         adopted = dict(
             line.split(None, 5)[4:6]
             for line in second.muructl("events").stdout.splitlines()
@@ -607,6 +616,26 @@ def test_a_projects_services_run_with_its_serving_release(daemon: Daemon, tmp_pa
     assert (
         "service x: switch is for a service a project declares" in refused.stdout + refused.stderr
     )
+
+    # A node set to run only its own services refuses a release that
+    # declares some, and one set to run none refuses a service's table.
+
+    daemon.muructl("daemon", "config", "set", "daemon.services", "node")
+    refused = daemon.muructl(
+        "deploy", "shop", str(project), "--python", sys.executable, check=False
+    )
+    assert refused.returncode != 0
+    assert (
+        "it declares services (reindex, worker), and this node runs no services of a "
+        "project: services = 'node' in the [daemon] table of the daemon's file"
+    ) in refused.stderr
+    assert apply(daemon, tmp_path / "node.toml", table("x", "sleep 600")).returncode == 0
+    daemon.muructl("daemon", "config", "set", "daemon.services", "none")
+    refused = apply(daemon, tmp_path / "node.toml", table("x", "sleep 600"))
+    assert refused.returncode != 0
+    assert (
+        "[service.x]: this node runs no services: services = 'none' in the [daemon] table"
+    ) in refused.stdout + refused.stderr
 
 
 def test_a_projects_services_run_beside_a_development_run(tmp_path: Path) -> None:

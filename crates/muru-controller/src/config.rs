@@ -668,6 +668,7 @@ pub fn plan_declared(
         let applying = Applying {
             prune: prune.any(),
             hold,
+            services: defined.services,
         };
         promotions.extend(plan_app(
             store,
@@ -699,7 +700,7 @@ pub fn plan_declared(
 
     plan_hosts(store, document, &defined.rate_limits, &mut plan);
     plan_upstreams(store, document, &mut plan);
-    plan_services(store, document, &mut plan);
+    plan_services(store, document, defined.services, &mut plan);
     plan_routes(store, document, defined, &mut plan);
     plan_overlays(store, document, defined, prune.any(), &mut plan);
     plan_conditions(store, document, file_conditions, &mut plan);
@@ -729,6 +730,8 @@ pub fn plan_declared(
 struct Applying {
     prune: bool,
     hold: bool,
+    /// Which services the node runs.
+    services: muru_config::ServicesAccepted,
 }
 
 /// The changes one application's table implies, and the promotion its
@@ -989,13 +992,16 @@ fn plan_app(
             continue;
         };
 
-        let spec = match resolve_declared(name, table, &settings, source, provisioning) {
-            Ok(spec) => spec,
-            Err(error) => {
-                plan.errors.push(format!("{name}@{id}: {error}"));
-                continue;
-            }
-        };
+        let spec =
+            match resolve_declared(name, table, &settings, source, provisioning).and_then(|spec| {
+                refuse_project_services(applying.services, &spec.services).map(|()| spec)
+            }) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    plan.errors.push(format!("{name}@{id}: {error}"));
+                    continue;
+                }
+            };
 
         match store.release(name, id) {
             Ok(recorded) if recorded.spec == spec => plan.unchanged += 1,
@@ -1242,6 +1248,30 @@ pub struct Defined {
     pub conditions: BTreeMap<String, muru_config::Condition>,
     /// The node's budget and what its releases hold.
     pub budget: crate::budget::View,
+    /// `[daemon] services`: which services the node runs (issue 1009).
+    pub services: muru_config::ServicesAccepted,
+}
+
+/// The refusal of a release that declares services on a node that
+/// runs none of a project's.
+pub fn refuse_project_services(
+    accepted: muru_config::ServicesAccepted,
+    services: &BTreeMap<String, muru_config::Service>,
+) -> Result<(), String> {
+    if services.is_empty() || accepted == muru_config::ServicesAccepted::All {
+        return Ok(());
+    }
+
+    Err(format!(
+        "it declares {} ({}), and this node runs no services of a project: services = \
+         '{}' in the [daemon] table of the daemon's file",
+        match services.len() {
+            1 => "a service",
+            _ => "services",
+        },
+        services.keys().cloned().collect::<Vec<_>>().join(", "),
+        accepted.as_str()
+    ))
 }
 
 impl Defined {
@@ -2714,7 +2744,24 @@ fn describe_overlay(overlay: &Overlay) -> String {
 /// Section 9.17: the services a document declares, each checked as its
 /// table is and compared with what is recorded, with what the change
 /// does to its instances as the detail.
-fn plan_services(store: &Store, document: &Document, plan: &mut Plan) {
+fn plan_services(
+    store: &Store,
+    document: &Document,
+    accepted: muru_config::ServicesAccepted,
+    plan: &mut Plan,
+) {
+    // Issue 1009: a node set to run no services refuses the tables,
+    // those already recorded with them, so the file says what runs.
+
+    if accepted == muru_config::ServicesAccepted::None && !document.service.is_empty() {
+        plan.errors.push(format!(
+            "[service.{}]: this node runs no services: services = 'none' in the [daemon] \
+             table of the daemon's file",
+            document.service.keys().next().expect("not empty")
+        ));
+        return;
+    }
+
     let stored: BTreeMap<String, muru_config::Service> = store
         .services()
         .unwrap_or_default()
@@ -6171,6 +6218,63 @@ pub(crate) fn restart_spec_from(table: Option<&muru_config::Restart>) -> crate::
     }
 }
 
+/// A request's liveness settings as the `liveness` table they amount to.
+fn liveness_table_from(settings: &pb::LivenessSettings) -> muru_config::Liveness {
+    muru_config::Liveness {
+        path: settings.path.clone(),
+        interval: settings.interval_ms.map(format_ms),
+        timeout: settings.timeout_ms.map(format_ms),
+        failures: settings.failures,
+    }
+}
+
+/// A `liveness` table as a request's liveness settings; a wait that does
+/// not parse is left out, and the validation of the declared release
+/// reports it.
+fn liveness_settings_from(table: &muru_config::Liveness) -> pb::LivenessSettings {
+    pb::LivenessSettings {
+        path: table.path.clone(),
+        interval_ms: duration_field(table.interval.as_ref()),
+        timeout_ms: duration_field(table.timeout.as_ref()),
+        failures: table.failures,
+    }
+}
+
+/// A `liveness` table, already checked, with the defaults filled in:
+/// without a path of its own it asks for the readiness path.
+fn liveness_spec_from(
+    table: &muru_config::Liveness,
+    readiness_path: Option<&str>,
+) -> crate::model::LivenessSpec {
+    let wait = |text: &Option<String>, default: Duration| {
+        duration_field(text.as_ref()).unwrap_or(default.as_millis() as u64)
+    };
+
+    crate::model::LivenessSpec {
+        path: table
+            .path
+            .clone()
+            .or_else(|| readiness_path.map(str::to_owned)),
+        interval_ms: wait(&table.interval, muru_config::DEFAULT_LIVENESS_INTERVAL),
+        timeout_ms: wait(&table.timeout, muru_config::DEFAULT_LIVENESS_TIMEOUT),
+        failures: table
+            .failures
+            .unwrap_or(muru_config::DEFAULT_LIVENESS_FAILURES)
+            .max(1),
+    }
+}
+
+/// A resolved liveness check as the table that declares it, every key
+/// written.
+fn liveness_table_of(spec: &crate::model::LivenessSpec) -> muru_config::Liveness {
+    muru_config::Liveness {
+        path: spec.path.clone(),
+        interval: Some(format_ms(spec.interval_ms)),
+        timeout: Some(format_ms(spec.timeout_ms)),
+        failures: Some(spec.failures),
+    }
+}
+
 /// A resolved restart policy as the table that declares it, every key
 /// written.
 fn restart_table_of(spec: &crate::model::RestartSpec) -> muru_config::Restart {
@@ -6197,6 +6301,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         .as_ref()
         .map(restart_table_from)
         .transpose()?;
+    let liveness = request.liveness.as_ref().map(liveness_table_from);
     let timeouts_given = request.soft_timeout_ms.is_some()
         || request.hard_timeout_ms.is_some()
         || request.hard_drain_grace_ms.is_some()
@@ -6231,6 +6336,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         instances: request.instances,
         readiness,
         restart,
+        liveness,
         stop_signal: (!request.stop_signal.is_empty()).then(|| request.stop_signal.clone()),
         source: Some(request.source.clone()),
         entrypoint: request.entrypoint.clone(),
@@ -6409,6 +6515,12 @@ fn resolve_http_spec(
             readiness_timeout_ms,
             stop_signal: table.stop_signal.clone(),
             restart: restart_spec_from(table.restart.as_ref()),
+            liveness: table.liveness.as_ref().map(|liveness| {
+                liveness_spec_from(
+                    liveness,
+                    (!request.readiness_path.is_empty()).then_some(request.readiness_path.as_str()),
+                )
+            }),
         }),
         layers: crate::model::Layers(env_layers),
         interpreter: None,
@@ -6811,6 +6923,7 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
         ),
         stop_signal: table.stop_signal.clone().unwrap_or_default(),
         restart: table.restart.as_ref().map(restart_settings_from),
+        liveness: table.liveness.as_ref().map(liveness_settings_from),
         wait_services: false,
         entrypoint: table.entrypoint.clone(),
         interface: table
@@ -6989,6 +7102,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 timeout: Some(format_ms(http.readiness_timeout_ms)),
             }),
             restart: Some(restart_table_of(&http.restart)),
+            liveness: http.liveness.as_ref().map(liveness_table_of),
             stop_signal: http.stop_signal.clone(),
             max_body_size: spec.limits.max_body_size_text(),
             timeouts: with_served(
@@ -7015,6 +7129,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         cwd: None,
         bind: None,
         restart: None,
+        liveness: None,
         instances: None,
         readiness: None,
         stop_signal: None,
@@ -7234,7 +7349,7 @@ fn describe_http(http: Option<&HttpServerSpec>) -> String {
     };
 
     format!(
-        "{} {:?} bind {} instances {} readiness {}/{}{} restart {}",
+        "{} {:?} bind {} instances {} readiness {}/{}{} restart {}{}",
         http.profile.as_str(),
         http.command,
         http.bind.as_str(),
@@ -7245,7 +7360,11 @@ fn describe_http(http: Option<&HttpServerSpec>) -> String {
             .as_ref()
             .map(|signal| format!(" stop {signal}"))
             .unwrap_or_default(),
-        http.restart.describe()
+        http.restart.describe(),
+        http.liveness
+            .as_ref()
+            .map(|liveness| format!(" liveness {}", liveness.describe()))
+            .unwrap_or_default()
     )
 }
 
@@ -9725,6 +9844,50 @@ mod tests {
                 .unwrap_err()
                 .starts_with("services.worker: command: ")
         );
+    }
+
+    #[test]
+    fn a_node_refuses_the_services_its_daemon_is_set_not_to_run() {
+        use muru_config::ServicesAccepted;
+
+        let store = Store::in_memory().unwrap();
+        let errors = |accepted: ServicesAccepted| {
+            plan(
+                &store,
+                &Document::parse("[service.redis]\ncommand = ['redis-server']\n").unwrap(),
+                false,
+                false,
+                &Defined {
+                    services: accepted,
+                    ..Defined::default()
+                },
+                &crate::provision::Provisioning::off(),
+            )
+            .errors
+        };
+        assert_eq!(errors(ServicesAccepted::All), Vec::<String>::new());
+        assert_eq!(errors(ServicesAccepted::Node), Vec::<String>::new());
+        assert_eq!(
+            errors(ServicesAccepted::None),
+            [
+                "[service.redis]: this node runs no services: services = 'none' in the \
+                 [daemon] table of the daemon's file"
+            ]
+        );
+
+        // A release's services are refused by both, and one without
+        // services by neither.
+
+        let declared: BTreeMap<String, muru_config::Service> =
+            toml::from_str("[worker]\ncommand = ['w']\n").unwrap();
+        assert!(refuse_project_services(ServicesAccepted::All, &declared).is_ok());
+        assert!(refuse_project_services(ServicesAccepted::None, &BTreeMap::new()).is_ok());
+        assert_eq!(
+            refuse_project_services(ServicesAccepted::Node, &declared).unwrap_err(),
+            "it declares a service (worker), and this node runs no services of a project: \
+             services = 'node' in the [daemon] table of the daemon's file"
+        );
+        assert!(refuse_project_services(ServicesAccepted::None, &declared).is_err());
     }
 
     #[test]

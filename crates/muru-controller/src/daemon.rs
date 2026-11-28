@@ -1499,6 +1499,7 @@ impl Backend {
             name: format!("{app}@{id}"),
             addresses: servers.addresses(),
             starting: servers.starting(),
+            down: servers.down(),
             protocol: "http1".to_owned(),
             trust_muru_headers: true,
             eject_after: 3,
@@ -2551,6 +2552,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             ..crate::budget::View::default()
         },
         conditions: settings.conditions.clone(),
+        services: settings.services,
         ..client_rules.defined()
     };
 
@@ -4855,7 +4857,22 @@ impl Daemon {
         let mut defined = self.client_rules.defined();
         defined.budget = self.budget_view(self.budget_usage());
         defined.conditions = self.file_conditions.clone();
-        *self.info.defined.write().expect("defined names poisoned") = defined;
+        defined.services = settings.services;
+        let services_was = std::mem::replace(
+            &mut *self.info.defined.write().expect("defined names poisoned"),
+            defined,
+        )
+        .services;
+
+        if services_was != settings.services {
+            report.changed(
+                "[daemon] services",
+                "for what is applied or deployed from now on",
+            );
+        } else {
+            report.unchanged("[daemon] services");
+        }
+
         let pass_env_was = std::mem::replace(
             &mut *self.info.pass_env.write().expect("pass_env poisoned"),
             settings.pass_env.clone(),
@@ -7810,6 +7827,7 @@ impl Daemon {
             &self.host_log(app, id),
             Some(relays),
             record,
+            Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms),
         )
         .await;
 
@@ -14955,9 +14973,9 @@ impl Daemon {
             // it answers (issue 917), which the edge hears in a snapshot.
 
             if let Backend::Servers(servers) = &mut running.backend {
-                let marked = servers.starting();
+                let marked = (servers.starting(), servers.down());
                 let changes = servers.check(&probed(&self.commands, &key.0, &key.1)).await;
-                marks_changed |= servers.starting() != marked;
+                marks_changed |= (servers.starting(), servers.down()) != marked;
 
                 if !changes.is_empty() {
                     write_record(
@@ -16916,6 +16934,7 @@ fn upstream_message(name: &str, table: &muru_config::Upstream) -> anyhow::Result
         sendfile_header: table.sendfile_header.clone().unwrap_or_default(),
         detour: false,
         starting: Vec::new(),
+        down: Vec::new(),
         connect_timeout_ms: millis(table.connect_timeout.as_deref()),
         probe: health.map(|health| pb::UpstreamProbe {
             path: health.path.clone().unwrap_or_default(),
