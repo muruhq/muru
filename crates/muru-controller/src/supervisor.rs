@@ -1624,7 +1624,8 @@ impl Supervisor {
 
             let index = instance.index;
             let again = instance.started_before;
-            let after_exit = again && !std::mem::take(&mut instance.by_hand);
+            let by_hand = std::mem::take(&mut instance.by_hand);
+            let after_exit = again && !by_hand;
 
             match self.spawn(position).await {
                 Ok(()) => reports.push(

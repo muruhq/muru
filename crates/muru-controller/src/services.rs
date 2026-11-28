@@ -296,9 +296,18 @@ struct ProbeContext {
     identity: Option<Identity>,
 }
 
-/// Whether an instance becomes ready within its time: the form tried
-/// until it passes or the time is up.
-async fn ready_within(readiness: Readiness, fill: Fill, context: ProbeContext) -> bool {
+/// How long an instance takes to become ready, when it does within its
+/// time: the form tried until it passes or the time is up.
+async fn ready_within(readiness: Readiness, fill: Fill, context: ProbeContext) -> Option<Duration> {
+    let began = Instant::now();
+
+    probe_until_ready(readiness, fill, context)
+        .await
+        .then(|| Instant::now().saturating_duration_since(began))
+}
+
+/// Whether an instance becomes ready within its time.
+async fn probe_until_ready(readiness: Readiness, fill: Fill, context: ProbeContext) -> bool {
     let deadline = Instant::now() + readiness.timeout;
 
     if let Form::After(wait) = readiness.form {
@@ -555,12 +564,11 @@ pub enum Begin<'a> {
 struct Probe {
     /// The process it is about.
     pid: Option<u32>,
-    /// When that process was seen first.
-    since: Option<Instant>,
     /// Whether it has passed.
     ready: bool,
-    /// The check under way.
-    task: Option<tokio::task::JoinHandle<bool>>,
+    /// The check under way, which gives how long the instance took to
+    /// be ready when it was in time.
+    task: Option<tokio::task::JoinHandle<Option<Duration>>>,
 }
 
 impl Drop for Probe {
@@ -694,7 +702,6 @@ impl Service {
                             instance.index(),
                             Probe {
                                 pid: Some(pid),
-                                since: None,
                                 ready: true,
                                 task: None,
                             },
@@ -960,6 +967,10 @@ impl Service {
         self.setting = setting;
         self.readiness = Readiness::of(&self.setting.table);
 
+        // One declared again while it was being removed is kept.
+
+        self.removing = false;
+
         if !difference.restart.is_empty() {
             // The instances that run are stopped under the supervisor
             // that started them, and a new one takes their place once
@@ -1016,6 +1027,11 @@ impl Service {
         self.start_after_retiring = false;
         self.rolling.clear();
         self.rolling_at = None;
+    }
+
+    /// Whether the service is being removed.
+    pub fn removing(&self) -> bool {
+        self.removing
     }
 
     /// Whether the service was removed and nothing of it runs any more.
@@ -1119,7 +1135,6 @@ impl Service {
             if probe.pid != pid {
                 *probe = Probe {
                     pid,
-                    since: pid.map(|_| Instant::now()),
                     ready: false,
                     task: pid.map(|_| {
                         tokio::spawn(ready_within(
@@ -1148,14 +1163,10 @@ impl Service {
 
             let passed = futures::FutureExt::now_or_never(task)
                 .and_then(Result::ok)
-                .unwrap_or(false);
+                .flatten();
 
-            if passed {
+            if let Some(took) = passed {
                 probe.ready = true;
-                let took = probe
-                    .since
-                    .map(|since| Instant::now().saturating_duration_since(since))
-                    .unwrap_or_default();
                 reports.push(Report::new(
                     READY_EVENT,
                     "info",
@@ -1381,6 +1392,55 @@ impl Service {
 
         self.supervisor.release();
     }
+}
+
+/// What adoption found of a service's instances, as its event says it:
+/// the pids taken over, how each instance that ended while no daemon ran
+/// did and what follows, and those left as they were.
+pub fn adoption_message(adopted: &[(u32, supervisor::Adopted)]) -> String {
+    use supervisor::Adopted;
+
+    let mut pids = Vec::new();
+    let mut clauses = Vec::new();
+
+    for (index, found) in adopted {
+        match found {
+            Adopted::Kept(pid) => pids.push(pid.to_string()),
+            Adopted::Ended {
+                exit,
+                wait: Some(wait),
+            } => clauses.push(format!(
+                "instance {index} {exit} while no daemon ran and is started again in {}",
+                muru_config::format_duration(*wait)
+            )),
+            Adopted::Ended { exit, wait: None } => clauses.push(format!(
+                "instance {index} {exit} while no daemon ran and is not started again"
+            )),
+            Adopted::Left(left) => clauses.push(format!(
+                "instance {index} stays {}",
+                match left {
+                    Left::Exited => "exited",
+                    Left::Failed => "failed",
+                    Left::Stopped => "stopped",
+                }
+            )),
+            Adopted::Gone => {
+                clauses.push(format!("instance {index} was gone and is started again"))
+            }
+        }
+    }
+
+    let mut message = match pids.len() {
+        0 => "none of its instances was still running".to_owned(),
+        _ => format!("took over its instances (pid {})", pids.join(", ")),
+    };
+
+    for clause in clauses {
+        message.push_str("; ");
+        message.push_str(&clause);
+    }
+
+    message
 }
 
 /// A length of time to a tenth of a second, which is as close as an
