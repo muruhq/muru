@@ -94,11 +94,15 @@ with the instance and the reason in the release's message. A release
 that fails leaves nothing running: the instances that had started are
 stopped as a drain stops them.
 
-An instance that exits later is
-started again after a wait that doubles with each exit in a row, from one
-second up to thirty, and starts over once an instance has run for a
-minute; the exit and the restart are `server.exited` and `server.started`
-events, and a start that fails is `server.failed`. An instance is never
+An instance that exits later is started again, whatever its exit
+status: a server is declared because it should be up. It is started
+after a wait of one second, which doubles with each quick exit in a row
+up to a minute. A quick exit is one within a minute of the instance's
+start; an instance that ran for longer has recovered, and the waits
+start over. The exit and the restart are `server.exited` and
+`server.started` events, and a start that fails is `server.failed`. The
+`restart` table changes any of this, as [the restart
+policy](#the-restart-policy) below describes. An instance is never
 started beside what the one before it left running. Processes still in
 the process group of an instance that exited, such as workers whose
 master was killed, are sent the stop signal when the exit is seen, and
@@ -144,6 +148,145 @@ requests, requests still try them all, and are answered 502
 `muru_upstream_health` reports each instance by address under the
 release's name, 0 while it is out of service. The instance count is
 fixed: `muructl scale` refuses a managed server.
+
+### The restart policy
+
+The `restart` table of the release says what happens when an instance
+exits. Every key has a default, so a table gives only what differs:
+
+```toml
+[app.api.release.r3.restart]
+policy = 'on-failure'
+success_exit_codes = [0, 3]
+delay = '2s'
+max_delay = '5m'
+stable_after = '30s'
+give_up_after = 5
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `policy` | `always` | `always` starts the instance again after any exit. `on-failure` starts it again after a failure and leaves a clean exit alone. `never` never starts it again. |
+| `success_exit_codes` | `[0]` | The exit statuses that count as a clean exit. Any other status is a failure, as is an instance killed by a signal. |
+| `delay` | `1s` | The wait before the next start after a run that lasted, and after the first quick exit. |
+| `max_delay` | `1m` | The longest wait. The wait doubles with each quick exit in a row up to this. |
+| `stable_after` | `1m` | A run this long was not a quick exit, and clears the count of them. |
+| `give_up_after` | none | Quick exits in a row after which the instance is left failed. Without it the instance is started again every `max_delay`, without end. |
+
+With `muructl deploy` each key is a `--restart KEY=VALUE` flag, the
+exit statuses separated by commas:
+
+```
+muructl deploy api /srv/api --server gunicorn \
+    --restart policy=on-failure --restart success_exit_codes=0,3 \
+    -- .venv/bin/gunicorn api.wsgi
+```
+
+An exit that the policy does not follow with a start is a
+`server.exited` event that says so, at `info` level for a clean exit
+and `error` for a failure:
+
+```
+instance 0 exited with exit status: 3; it is not started again (restart policy on-failure)
+```
+
+The instance stays out of service and the release stays `ready`, with
+its other instances serving.
+
+### Crash loops
+
+An instance that exits soon after every start is crash looping. The
+release stays `ready` and the instance is started again after each
+wait, so a loop is made hard to miss in three places:
+
+- The third quick exit in a row is a `server.crash_looping` event, at
+  `error` level, once for each loop:
+
+  ```
+  instance 1 is crash looping: it has exited or failed to start 3 times in a row, each within 60s of starting; it is started again after waits of up to 60s until it stays up
+  ```
+
+- `muructl release show` gives the instance as in `backoff`, with when
+  it is started next and its quick exits in a row.
+
+- `muru_server_exits_total` counts the release's instance exits by
+  `outcome`, `clean` or `failed`.
+
+A start that fails, such as a command that is no longer there, counts as
+a quick exit does.
+
+By default nothing gives up: the instance is started again every minute
+until it stays up, so a server whose database was away comes back
+without anyone acting. With `give_up_after` set, the quick exit that
+reaches the count is the last. The instance is left `failed`, with a
+`server.gave_up` event:
+
+```
+instance 1 is left failed after exiting or failing to start 5 times in a row, each within 60s of starting (give_up_after = 5); a restart by hand starts it again
+```
+
+A daemon that restarts or upgrades leaves an `exited` or `failed`
+instance as it found it. While every instance of a release is
+`exited` or `failed`, a request waits for the queue timeout and is then
+answered 502 `upstream_failed`. The table applies to an instance that
+exits once the release is ready. An instance that exits while the
+release is still starting fails the release, whatever the policy. A
+release that fails that way in a deploy stays failed. One that fails
+when the daemon starts it after a reboot is [tried
+again](daemon.md#stopping-and-restarting) with the table's waits.
+
+### Restarting the instances
+
+`muructl restart APP --all` restarts every instance of the application's
+serving release, one at a time:
+
+```console
+$ muructl restart legacy --all
+muru: 2 instances of legacy@r1 to be restarted, one at a time
+muru: the restart of legacy@r1 has finished
+```
+
+Each instance in turn is taken out of service at the edge, sent its
+stop signal and given the release's `shutdown_timeout` to finish its
+requests before it is killed, started again at the same address, and
+waited for until it answers the readiness probe. Only then is the next
+one stopped, so a release with two or more instances serves throughout
+and no request is lost. With one instance, requests wait for it to
+answer, as they do after a crash.
+
+The start is made at once, with none of the waits an exit has, and the
+stop does not count as a quick exit. An instance that is in `backoff`,
+`exited` or `failed` is started too, with its count of quick exits
+cleared, which is how an instance that `give_up_after` left failed is
+brought back.
+
+The restart stops early if an instance does not come back: its start
+fails, it exits again before it answers, or it does not answer within
+the readiness timeout. The instances not yet reached are left running
+as they were, the instance that failed is supervised as after any exit,
+and the command fails with the reason:
+
+```
+muru: error: the restart of legacy@r1 stopped: instance 0 did not answer its readiness probe within 60s
+```
+
+The command waits for up to ten minutes, and `--no-wait` returns once
+the restart has begun. The daemon carries the restart out, so it goes
+on if the command is interrupted, and `muructl release show` says how
+far it has got:
+
+```
+restart      1 of 2 instances still to be restarted, one at a time; muructl restart --cancel leaves them
+```
+
+`muructl restart legacy --cancel` ends it: the instances not yet
+reached stay as they are, and the one being restarted is still started.
+The restart is a `restart.started` event and, when it ends,
+`restart.finished`, with each instance's `server.exited`,
+`server.started` and `server.ready` between them. A daemon that is
+stopped or upgraded part way leaves the instances not yet reached as
+they are. The flags that name one worker (`--worker`, `--pid`,
+`--group` and `--force`) do not apply to a managed server.
 
 Draining stops new requests at the edge, waits for those in flight, then
 sends the process of each instance the profile's stop signal (`TERM` for
@@ -252,15 +395,29 @@ process since is not taken over, and that process is never signalled.
 
 `muructl release list` shows a
 managed server as its instance count and profile in the workers column.
-`muructl release show` lists each instance with its pid and address, and
-with `--json` as `server_instances`, each with `index`, `pid` (0 while it
-waits to be started again), `address` and `started_unix_ms`:
+`muructl release show` lists each instance with where it stands and its
+address:
 
 ```
 command      .venv/bin/gunicorn shop.wsgi:application
 instance 0   pid 48213, unix:/run/muru/h/7/server-0.sock
-instance 1   pid 48214, unix:/run/muru/h/7/server-1.sock
+instance 1   backoff, starting again in 8s after 4 quick exits in a row, unix:/run/muru/h/7/server-1.sock
 ```
+
+An instance is in one of five states:
+
+| State | Shown as | Meaning |
+| --- | --- | --- |
+| `running` | `pid 48213` | Its process runs and takes requests. |
+| `starting` | `pid 48213, starting` | Its process was started again and has not answered the readiness probe. |
+| `backoff` | `backoff, starting again in 8s` | It exited, or could not be started, and waits for its next start. |
+| `exited` | `exited, not started again` | It exited cleanly and the restart policy leaves it so. |
+| `failed` | `failed, not started again` | It failed and is not started again: the policy is `never`, or `give_up_after` was reached. |
+
+With `--json` the instances are `server_instances`, each with `index`,
+`pid` (0 without a process), `address`, `started_unix_ms`, `state`,
+`next_start_unix_ms` (for an instance in `backoff`, when its next start
+is due) and `quick_exits`, its quick exits in a row.
 
 ## Cutting over
 

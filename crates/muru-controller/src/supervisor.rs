@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use muru_config::RestartMode;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::process::{Child, Command};
 use tokio::time::Instant;
@@ -54,7 +55,15 @@ pub struct EventNames {
     pub started: &'static str,
     /// An instance could not be started.
     pub failed: &'static str,
+    /// An instance keeps exiting soon after it starts.
+    pub crash_looping: &'static str,
+    /// An instance that keeps exiting is left failed.
+    pub gave_up: &'static str,
 }
+
+/// The quick exits in a row at which an instance is reported as crash
+/// looping: the third, by when the wait has doubled twice.
+pub const CRASH_LOOP_AFTER: u32 = 3;
 
 /// What every instance of a supervised program shares.
 #[derive(Debug, Clone)]
@@ -139,43 +148,171 @@ pub struct InstanceSpec {
     pub stale: Vec<PathBuf>,
 }
 
-/// When an instance that exited is started again. The defaults are what
-/// a managed HTTP server does. The decisions still to be made about
-/// supervision (when not to start again, when to give up) belong here
-/// and in `restart_after`, which is the one place an exit is judged.
+/// When an instance that exited is started again, and after what wait:
+/// the `restart` table (ADR 0090), which `restart_after` applies, the
+/// one place an exit is judged. The defaults are the table's.
 #[derive(Debug, Clone)]
 pub struct RestartPolicy {
+    /// Which exits are followed by a start.
+    pub mode: RestartMode,
+    /// The exit statuses that count as a clean exit. Any other status,
+    /// death by a signal, a process that is simply gone and one that
+    /// lost its relay are failures.
+    pub success_exit_codes: Vec<i32>,
     /// The wait before the start that follows an exit, doubled with each
-    /// exit in a row.
+    /// quick exit in a row after the first.
     pub delay: Duration,
     /// The longest that wait gets.
     pub max_delay: Duration,
-    /// A run this long counts as a recovery: the exit that ends it
-    /// starts the waits over.
+    /// A run this long is not a quick exit: the exit that ends it clears
+    /// the count of them, so the waits start over.
     pub stable_after: Duration,
+    /// Quick exits in a row after which the instance is left failed;
+    /// none never gives up.
+    pub give_up_after: Option<u32>,
 }
 
 impl Default for RestartPolicy {
     fn default() -> Self {
         Self {
-            delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(30),
-            stable_after: Duration::from_secs(60),
+            mode: RestartMode::Always,
+            success_exit_codes: vec![0],
+            delay: muru_config::DEFAULT_RESTART_DELAY,
+            max_delay: muru_config::DEFAULT_RESTART_MAX_DELAY,
+            stable_after: muru_config::DEFAULT_RESTART_STABLE_AFTER,
+            give_up_after: None,
         }
     }
 }
 
+/// What is done about an exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// The instance is started again after this wait.
+    Restart(Duration),
+    /// The instance is left as it is, not started again.
+    Leave(Left),
+    /// The instance has exited quickly as often in a row as the policy
+    /// allows, and is left failed.
+    GiveUp,
+}
+
+/// Whether an exit was a clean one, for the count of exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Outcome {
+    /// A status the policy counts as success.
+    Clean,
+    /// Any other end.
+    Failed,
+}
+
+impl Outcome {
+    /// The outcome as a metric's label names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Where an instance stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// It has a process.
+    Running,
+    /// It exited, or could not be started, and its next start is due at
+    /// a known time.
+    Backoff {
+        /// How long until the start is due; nothing when it is due now.
+        wait: Duration,
+    },
+    /// It ended cleanly and the policy does not start it again.
+    Exited,
+    /// It ended in failure and is not started again: the policy is
+    /// `never`, or it kept exiting and was given up on.
+    Failed,
+}
+
+/// How an instance that is not started again was left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Left {
+    /// It ended cleanly and the policy does not start it again.
+    Exited,
+    /// It ended in failure and the policy does not start it again.
+    Failed,
+}
+
 impl RestartPolicy {
-    /// How long an instance waits to be started again after `exit`, the
-    /// latest of `quick_exits` in a row. Every exit is treated alike: a
-    /// clean one, a failure, and an adopted process that is simply gone
-    /// are all started again, without limit.
-    fn restart_after(&self, _exit: &Exit, quick_exits: u32) -> Duration {
-        self.backoff(quick_exits)
+    /// Whether `exit` is a clean one: a status the policy counts as
+    /// success. A process killed by a signal has no status, and neither
+    /// has one that is gone or lost its relay, so all three are failures.
+    fn clean(&self, exit: &Exit) -> bool {
+        match exit {
+            Exit::Status(status) => status
+                .code()
+                .is_some_and(|code| self.success_exit_codes.contains(&code)),
+            Exit::Gone | Exit::RelayLost => false,
+        }
     }
 
-    /// The wait before the next start after this many exits or failed
-    /// starts in a row.
+    /// What is done about `exit`, with `quick_exits` the quick exits in
+    /// a row it brings the instance to: `always` starts the instance
+    /// again whatever the exit, `on-failure` after a failure alone, and
+    /// `never` leaves it, as exited after a clean exit and failed after
+    /// any other. An exit that would be followed by a start is not once
+    /// the quick exits in a row reach `give_up_after`.
+    fn restart_after(&self, exit: &Exit, quick_exits: u32) -> Verdict {
+        let clean = self.clean(exit);
+
+        match self.mode {
+            RestartMode::OnFailure | RestartMode::Never if clean => Verdict::Leave(Left::Exited),
+            RestartMode::Never => Verdict::Leave(Left::Failed),
+            RestartMode::Always | RestartMode::OnFailure => self.again(quick_exits),
+        }
+    }
+
+    /// The start that follows this many quick exits or failed starts in
+    /// a row: after the wait, or not at all once the policy gives up.
+    fn again(&self, in_a_row: u32) -> Verdict {
+        if self.give_up_after.is_some_and(|limit| in_a_row >= limit) {
+            return Verdict::GiveUp;
+        }
+
+        Verdict::Restart(self.backoff(in_a_row))
+    }
+
+    /// The wait before a start that failed is tried again, for whoever
+    /// starts something whole under this policy, as the daemon does a
+    /// release it restores (section 9.9): the wait after `failed` starts
+    /// in a row, or none when it is not tried again, the policy being
+    /// `never` or `failed` having reached `give_up_after`.
+    pub fn retry_after(&self, failed: u32) -> Option<Duration> {
+        if self.mode == RestartMode::Never {
+            return None;
+        }
+
+        match self.again(failed) {
+            Verdict::Restart(wait) => Some(wait),
+            Verdict::Leave(_) | Verdict::GiveUp => None,
+        }
+    }
+
+    /// The quick exits in a row after an exit that ended a run of `ran`,
+    /// with `before` of them before it: a run that lasted clears the
+    /// count, and any other adds to it.
+    fn count(&self, before: u32, ran: Duration) -> u32 {
+        if ran >= self.stable_after {
+            0
+        } else {
+            before.saturating_add(1)
+        }
+    }
+
+    /// The wait before the next start after this many quick exits or
+    /// failed starts in a row: the first wait after none and after the
+    /// first, doubled with each one more.
     fn backoff(&self, in_a_row: u32) -> Duration {
         self.delay
             .saturating_mul(1 << in_a_row.saturating_sub(1).min(31))
@@ -574,6 +711,35 @@ impl Process {
         }
     }
 
+    /// Kill the process and everything in its group without waiting
+    /// for it to go: the next look at it sees the exit. An adopted
+    /// process is looked at once more, and checked to lead its group,
+    /// before anything is signalled, and a relayed one is killed by its
+    /// relay.
+    fn force(&self) {
+        match self {
+            Self::Child { pid, .. } => {
+                signal_group(*pid, libc::SIGKILL);
+            }
+            Self::Adopted { pid, start_time } => {
+                if !still_running(*pid, *start_time) {
+                    return;
+                }
+
+                if leads_group(*pid) {
+                    signal_group(*pid, libc::SIGKILL);
+                }
+
+                signal_process(*pid, libc::SIGKILL);
+            }
+            Self::Relayed(relayed) => {
+                if let Some(pid) = relayed.relay_pid() {
+                    signal_process(pid, libc::SIGUSR2);
+                }
+            }
+        }
+    }
+
     /// The process group of a process that has exited, if anything is
     /// still running in it.
     fn left_behind(&self) -> Option<u32> {
@@ -643,6 +809,8 @@ struct Leftover {
     group: u32,
     /// Whether the group has been sent SIGKILL.
     killed: bool,
+    /// When what is still there is killed.
+    kill_at: Instant,
 }
 
 /// One supervised instance.
@@ -655,13 +823,27 @@ pub struct Instance {
     /// When the process was started, Unix milliseconds; 0 for one adopted
     /// from a record that did not say.
     started_unix_ms: u64,
-    /// Exits and failed starts in a row, each doubling the wait before
-    /// the next start.
+    /// Quick exits and failed starts in a row, each after the first
+    /// doubling the wait before the next start.
     quick_exits: u32,
     /// When the next start is due, after an exit.
     due: Option<Instant>,
+    /// How the instance was left, when it exited and is not started
+    /// again.
+    left: Option<Left>,
     /// What the process that exited left running, until it has gone.
     leftover: Option<Leftover>,
+    /// The stop asked of the process for a restart by hand, until the
+    /// process has gone.
+    asked: Option<Asked>,
+}
+
+/// A stop asked of an instance's process so that it is started again.
+struct Asked {
+    /// When a process still there is killed.
+    kill_at: Instant,
+    /// Whether it has been.
+    killed: bool,
 }
 
 impl Instance {
@@ -674,7 +856,9 @@ impl Instance {
             started_unix_ms: 0,
             quick_exits: 0,
             due: None,
+            left: None,
             leftover: None,
+            asked: None,
         }
     }
 
@@ -686,6 +870,38 @@ impl Instance {
     /// The pid of the instance's process, when it has one.
     pub fn pid(&self) -> Option<u32> {
         self.process.as_ref().map(Process::pid)
+    }
+
+    /// Where the instance stands.
+    pub fn state(&self) -> State {
+        match (&self.process, self.left) {
+            (Some(_), _) => State::Running,
+            (None, Some(Left::Exited)) => State::Exited,
+            (None, Some(Left::Failed)) => State::Failed,
+            (None, None) => State::Backoff {
+                wait: self
+                    .due
+                    .map(|due| due.saturating_duration_since(Instant::now()))
+                    .unwrap_or_default(),
+            },
+        }
+    }
+
+    /// Whether the instance's process has been asked to stop for a
+    /// restart by hand and has not gone yet.
+    pub fn stopping(&self) -> bool {
+        self.asked.is_some()
+    }
+
+    /// The instance's quick exits and failed starts in a row.
+    pub fn quick_exits(&self) -> u32 {
+        self.quick_exits
+    }
+
+    /// When the instance's process was started, Unix milliseconds; 0 for
+    /// one adopted from a record that did not say.
+    pub fn started_unix_ms(&self) -> u64 {
+        self.started_unix_ms
     }
 
     /// Remove what the process left behind.
@@ -707,6 +923,7 @@ impl Instance {
                 0
             },
             quick_exits: self.quick_exits,
+            left: self.left,
             start_time: self.process.as_ref().map_or(0, Process::start_time),
             relay_pid: self.process.as_ref().map_or(0, |process| process.relay().0),
             relay_start_time: self.process.as_ref().map_or(0, |process| process.relay().1),
@@ -720,13 +937,17 @@ pub enum Adopted {
     /// Its process was there and is taken over, with this pid.
     Kept(u32),
     /// It ended while no daemon looked, as its relay recorded, and is
-    /// started again after `wait`, as after any exit (issue 916).
+    /// started again after `wait`, as after any exit (issue 916), or
+    /// left as it is where the policy does not start it again.
     Ended {
         /// How it ended.
         exit: Exit,
-        /// The wait before it is started again.
-        wait: Duration,
+        /// The wait before it is started again; none when it is not.
+        wait: Option<Duration>,
     },
+    /// It had exited before and was not to be started again, and is
+    /// left so.
+    Left(Left),
     /// It was not there, with no record of how it ended, or it was
     /// waiting to be started when the record was written; it is started
     /// at once.
@@ -741,6 +962,20 @@ pub struct Report {
     pub level: &'static str,
     /// What happened.
     pub message: String,
+    /// For the report of an exit, whether it was a clean one.
+    pub outcome: Option<Outcome>,
+}
+
+impl Report {
+    /// A report that is not of an exit.
+    fn new(kind: &'static str, level: &'static str, message: String) -> Self {
+        Self {
+            kind,
+            level,
+            message,
+            outcome: None,
+        }
+    }
 }
 
 /// The instances as recorded for the next daemon.
@@ -764,6 +999,9 @@ pub struct InstanceRecord {
     /// starts carry on under the next daemon.
     #[serde(default)]
     pub quick_exits: u32,
+    /// How it was left, for one that exited and is not started again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<Left>,
     /// The start time the kernel gives its process, which with the pid
     /// names the process: a number to compare for equality and nothing
     /// else (clock ticks since boot on Linux, microseconds on macOS).
@@ -834,9 +1072,10 @@ impl Supervisor {
     /// exit is reported once, by adoption, and not again by the first
     /// check (issue 916). One that is not there with no such record, or
     /// was waiting to be started when the record was written (pid 0),
-    /// is due at once, so the next `check` starts it. `adopted` says
-    /// which each was. Only a record that names no instance is
-    /// refused.
+    /// is due at once, so the next `check` starts it. One the record
+    /// says exited and was not to be started again is left so.
+    /// `adopted` says which each was. Only a record that names no
+    /// instance is refused.
     ///
     /// The waits between starts carry on as if the daemon had not
     /// changed: an instance's exits in a row are as recorded, and one
@@ -889,6 +1128,17 @@ impl Supervisor {
                     ..Instance::new(recorded.index, instance)
                 };
 
+                // One that was not to be started again still is not.
+
+                if let Some(left) = recorded.left.filter(|_| recorded.pid == 0) {
+                    found.push(Adopted::Left(left));
+
+                    return Instance {
+                        left: Some(left),
+                        ..instance
+                    };
+                }
+
                 // A process under a relay is the relay's to report on: one
                 // that ended while no daemon looked has the status the
                 // relay recorded, and its exit counts as `check` counts
@@ -901,14 +1151,24 @@ impl Supervisor {
 
                     if !running {
                         let exit = relayed.ended();
+                        let ran = now.saturating_duration_since(since(recorded));
+                        instance.quick_exits = policy.count(instance.quick_exits, ran);
 
-                        if now.saturating_duration_since(since(recorded)) >= policy.stable_after {
-                            instance.quick_exits = 0;
-                        }
+                        let wait = match policy.restart_after(&exit, instance.quick_exits) {
+                            Verdict::Restart(wait) => {
+                                instance.due = Some(now + wait);
+                                Some(wait)
+                            }
+                            Verdict::Leave(left) => {
+                                instance.left = Some(left);
+                                None
+                            }
+                            Verdict::GiveUp => {
+                                instance.left = Some(Left::Failed);
+                                None
+                            }
+                        };
 
-                        instance.quick_exits += 1;
-                        let wait = policy.restart_after(&exit, instance.quick_exits);
-                        instance.due = Some(now + wait);
                         found.push(Adopted::Ended { exit, wait });
                         return instance;
                     }
@@ -984,6 +1244,7 @@ impl Supervisor {
             instance.started = Instant::now();
             instance.started_unix_ms = crate::model::now_unix_ms();
             instance.due = None;
+            instance.left = None;
             return Ok(());
         }
 
@@ -1022,6 +1283,7 @@ impl Supervisor {
         instance.started = Instant::now();
         instance.started_unix_ms = crate::model::now_unix_ms();
         instance.due = None;
+        instance.left = None;
         Ok(())
     }
 
@@ -1151,18 +1413,34 @@ impl Supervisor {
     }
 
     /// Reap instances that exited and start again those whose wait has
-    /// passed, with what happened for the event stream.
+    /// passed, with what happened for the event stream. An exit the
+    /// policy does not follow with a start leaves the instance as it is.
     ///
     /// An instance is not started beside what the one before it left
     /// running. Processes still in the group of an instance that exited
     /// are sent the stop signal when the exit is seen, and have the wait
-    /// before the next start to go in. Any still there when the wait
-    /// ends are killed, and the start is put off to the next check.
+    /// before the next start to go in, or the policy's first wait when
+    /// there is no start to come. Any still there when the wait ends are
+    /// killed, and the start is put off to the next check.
     pub async fn check(&mut self) -> Vec<Report> {
         let now = Instant::now();
         let mut reports = Vec::new();
 
         for position in 0..self.instances.len() {
+            // A process asked to stop for a restart that is still there
+            // when its time is up is killed, once; the exit is seen by
+            // this check or the next.
+
+            let instance = &mut self.instances[position];
+
+            if let (Some(asked), Some(process)) = (&mut instance.asked, &instance.process)
+                && !asked.killed
+                && asked.kill_at <= now
+            {
+                process.force();
+                asked.killed = true;
+            }
+
             if let Some(exit) = self.try_exited(position).ok().flatten() {
                 let instance = &mut self.instances[position];
                 let left_behind = instance
@@ -1174,32 +1452,34 @@ impl Supervisor {
                     signal_group(group, self.spec.stop_signal);
                 }
 
-                instance.leftover = left_behind.map(|group| Leftover {
-                    group,
-                    killed: false,
-                });
+                // An exit that was asked for is no judgement on the
+                // program: it counts as no quick exit, the policy is not
+                // asked, and the start in its place is due at once.
 
-                if now.saturating_duration_since(instance.started) >= self.policy.stable_after {
+                if instance.asked.take().is_some() {
+                    // What it left behind has the policy's first wait to
+                    // go in, as after an exit of its own.
+
+                    let due = match left_behind {
+                        Some(_) => now + self.policy.delay,
+                        None => now,
+                    };
+
                     instance.quick_exits = 0;
+                    instance.due = Some(due);
+                    instance.leftover = left_behind.map(|group| Leftover {
+                        group,
+                        killed: false,
+                        kill_at: due,
+                    });
+                    reports.push(Report::new(
+                        self.spec.events.exited,
+                        "info",
+                        format!("instance {} stopped for a restart ({exit})", instance.index),
+                    ));
+                } else {
+                    reports.extend(self.exited(position, exit, left_behind, now));
                 }
-
-                instance.quick_exits += 1;
-                let wait = self.policy.restart_after(&exit, instance.quick_exits);
-                instance.due = Some(now + wait);
-                reports.push(Report {
-                    kind: self.spec.events.exited,
-                    level: "warning",
-                    message: format!(
-                        "instance {} {exit}{}; starting it again in {}",
-                        instance.index,
-                        if left_behind.is_some() {
-                            ", leaving processes behind that are being stopped"
-                        } else {
-                            ""
-                        },
-                        muru_config::format_duration(wait)
-                    ),
-                });
             }
 
             let instance = &mut self.instances[position];
@@ -1219,7 +1499,12 @@ impl Supervisor {
                 instance.leftover = None;
             }
 
-            if !instance.due.is_some_and(|due| due <= now) {
+            let waited = match &instance.leftover {
+                Some(leftover) if instance.due.is_none() => leftover.kill_at <= now,
+                _ => instance.due.is_some_and(|due| due <= now),
+            };
+
+            if !waited {
                 continue;
             }
 
@@ -1240,35 +1525,197 @@ impl Supervisor {
             }
 
             instance.leftover = None;
+
+            if instance.due.is_none() {
+                continue;
+            }
+
             let index = instance.index;
 
             match self.spawn(position).await {
-                Ok(()) => reports.push(Report {
-                    kind: self.spec.events.started,
-                    level: "info",
-                    message: format!(
+                Ok(()) => reports.push(Report::new(
+                    self.spec.events.started,
+                    "info",
+                    format!(
                         "instance {index} started again (pid {})",
                         self.instances[position].pid().unwrap_or(0)
                     ),
-                }),
+                )),
                 Err(error) => {
+                    // A start that fails counts as a quick exit does.
+
                     let instance = &mut self.instances[position];
-                    instance.quick_exits += 1;
-                    let wait = self.policy.backoff(instance.quick_exits);
-                    instance.due = Some(now + wait);
-                    reports.push(Report {
-                        kind: self.spec.events.failed,
-                        level: "error",
-                        message: format!(
-                            "instance {index} could not be started: {error:#}; trying again in {}",
-                            muru_config::format_duration(wait)
-                        ),
-                    });
+                    instance.quick_exits = instance.quick_exits.saturating_add(1);
+                    let verdict = self.policy.again(instance.quick_exits);
+
+                    let what = match verdict {
+                        Verdict::Restart(wait) => {
+                            instance.due = Some(now + wait);
+                            format!("trying again in {}", muru_config::format_duration(wait))
+                        }
+                        Verdict::Leave(_) | Verdict::GiveUp => {
+                            instance.due = None;
+                            instance.left = Some(Left::Failed);
+                            "it is not tried again".to_owned()
+                        }
+                    };
+
+                    reports.push(Report::new(
+                        self.spec.events.failed,
+                        "error",
+                        format!("instance {index} could not be started: {error:#}; {what}"),
+                    ));
+                    reports.extend(self.loop_report(position, verdict));
                 }
             }
         }
 
         reports
+    }
+
+    /// Judge an exit of its own of the instance at `position`, whose
+    /// process has been taken from it: count it, ask the policy, and set
+    /// the instance to wait for its next start or leave it as it is.
+    /// Gives the report of the exit, and the one that makes a crash loop
+    /// loud where there is one.
+    fn exited(
+        &mut self,
+        position: usize,
+        exit: Exit,
+        left_behind: Option<u32>,
+        now: Instant,
+    ) -> Vec<Report> {
+        let instance = &mut self.instances[position];
+        let ran = now.saturating_duration_since(instance.started);
+        instance.quick_exits = self.policy.count(instance.quick_exits, ran);
+        let verdict = self.policy.restart_after(&exit, instance.quick_exits);
+
+        let outcome = if self.policy.clean(&exit) {
+            Outcome::Clean
+        } else {
+            Outcome::Failed
+        };
+
+        let (level, what) = match verdict {
+            Verdict::Restart(wait) => {
+                instance.due = Some(now + wait);
+                (
+                    "warning",
+                    format!(
+                        "starting it again in {}",
+                        muru_config::format_duration(wait)
+                    ),
+                )
+            }
+            Verdict::Leave(left) => {
+                instance.left = Some(left);
+                (
+                    match left {
+                        Left::Exited => "info",
+                        Left::Failed => "error",
+                    },
+                    format!(
+                        "it is not started again (restart policy {})",
+                        self.policy.mode
+                    ),
+                )
+            }
+            Verdict::GiveUp => {
+                instance.left = Some(Left::Failed);
+                ("error", "it is not started again".to_owned())
+            }
+        };
+
+        instance.leftover = left_behind.map(|group| Leftover {
+            group,
+            killed: false,
+            kill_at: instance.due.unwrap_or(now + self.policy.delay),
+        });
+
+        let mut reports = vec![Report {
+            kind: self.spec.events.exited,
+            level,
+            message: format!(
+                "instance {} {exit}{}; {what}",
+                instance.index,
+                if left_behind.is_some() {
+                    ", leaving processes behind that are being stopped"
+                } else {
+                    ""
+                },
+            ),
+            outcome: Some(outcome),
+        }];
+        reports.extend(self.loop_report(position, verdict));
+        reports
+    }
+
+    /// Restart the instance at `position` by hand. Its process is asked
+    /// to stop, as a stop of the whole asks it, and killed with its
+    /// group if it is still there at `kill_at`; the check that sees it
+    /// gone starts it again, without the wait an exit of its own has
+    /// and without counting one. An instance with no process, waiting
+    /// for a start or left by the policy, is due at once and starts
+    /// with its count of quick exits cleared, which is how one the
+    /// policy gave up on is started again.
+    pub fn restart(&mut self, position: usize, kill_at: Instant) {
+        let instance = &mut self.instances[position];
+
+        match &instance.process {
+            Some(process) => {
+                process.stop(self.spec.stop_signal, self.spec.stop_group);
+                instance.asked = Some(Asked {
+                    kill_at,
+                    killed: false,
+                });
+            }
+            None => {
+                instance.left = None;
+                instance.quick_exits = 0;
+                instance.due = Some(Instant::now());
+            }
+        }
+    }
+
+    /// What makes a crash loop loud, after the quick exit or failed start
+    /// that `verdict` was given for: that the instance is crash looping,
+    /// once, when its quick exits in a row reach `CRASH_LOOP_AFTER` and
+    /// it is still to be started again, or that it has been given up on.
+    fn loop_report(&self, position: usize, verdict: Verdict) -> Option<Report> {
+        let instance = &self.instances[position];
+        let within = muru_config::format_duration(self.policy.stable_after);
+
+        match verdict {
+            Verdict::Restart(_) if instance.quick_exits == CRASH_LOOP_AFTER => Some(Report::new(
+                self.spec.events.crash_looping,
+                "error",
+                format!(
+                    "instance {} is crash looping: it has exited or failed to start {} times in \
+                     a row, each within {within} of starting; it is started again after waits \
+                     of up to {}{}",
+                    instance.index,
+                    instance.quick_exits,
+                    muru_config::format_duration(self.policy.max_delay),
+                    match self.policy.give_up_after {
+                        Some(limit) => format!(", and left failed after {limit} in a row"),
+                        None => " until it stays up".to_owned(),
+                    }
+                ),
+            )),
+            Verdict::GiveUp => Some(Report::new(
+                self.spec.events.gave_up,
+                "error",
+                format!(
+                    "instance {} is left failed after exiting or failing to start {} times in a \
+                     row, each within {within} of starting (give_up_after = {}); a restart by \
+                     hand starts it again",
+                    instance.index,
+                    instance.quick_exits,
+                    self.policy.give_up_after.unwrap_or(instance.quick_exits)
+                ),
+            )),
+            Verdict::Restart(_) | Verdict::Leave(_) => None,
+        }
     }
 
     /// What adoption found of each instance, in order; empty when this
@@ -1385,6 +1832,8 @@ mod tests {
         exited: "thing.exited",
         started: "thing.started",
         failed: "thing.failed",
+        crash_looping: "thing.crash_looping",
+        gave_up: "thing.gave_up",
     };
 
     /// A specification whose instances run in `dir`.
@@ -1540,9 +1989,11 @@ mod tests {
         assert_eq!(policy.backoff(2), Duration::from_secs(2));
         assert_eq!(policy.backoff(4), Duration::from_secs(8));
         assert_eq!(policy.backoff(5), Duration::from_secs(16));
-        assert_eq!(policy.backoff(6), Duration::from_secs(30));
-        assert_eq!(policy.backoff(9), Duration::from_secs(30));
-        assert_eq!(policy.backoff(500), Duration::from_secs(30));
+        assert_eq!(policy.backoff(0), Duration::from_secs(1));
+        assert_eq!(policy.backoff(6), Duration::from_secs(32));
+        assert_eq!(policy.backoff(7), Duration::from_secs(60));
+        assert_eq!(policy.backoff(9), Duration::from_secs(60));
+        assert_eq!(policy.backoff(500), Duration::from_secs(60));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1557,15 +2008,38 @@ mod tests {
         .await
         .unwrap();
 
-        for wait in [1, 2, 4] {
+        for wait in [1, 2, 4, 8] {
+            let exited = reports(&mut supervisor).await;
             assert_eq!(
-                reports(&mut supervisor).await,
-                [format!(
+                exited[0],
+                format!(
                     "thing.exited warning: instance 0 exited with exit status: 3; \
                      starting it again in {wait}s"
-                )]
+                )
             );
+
+            // The third quick exit in a row is a crash loop, said once.
+
+            match wait {
+                4 => assert_eq!(
+                    exited[1..],
+                    [
+                        "thing.crash_looping error: instance 0 is crash looping: it has exited \
+                      or failed to start 3 times in a row, each within 60s of starting; it \
+                      is started again after waits of up to 60s until it stays up"
+                    ]
+                ),
+                _ => assert_eq!(exited.len(), 1, "{exited:?}"),
+            }
+
             assert_eq!(supervisor.running(), 0);
+            let instance = supervisor.instances().next().unwrap();
+            assert_eq!(
+                instance.state(),
+                State::Backoff {
+                    wait: Duration::from_secs(wait)
+                }
+            );
 
             // Nothing happens until the whole wait has passed.
 
@@ -1580,6 +2054,8 @@ mod tests {
                     pids(&supervisor)[0]
                 )]
             );
+            let instance = supervisor.instances().next().unwrap();
+            assert_eq!(instance.state(), State::Running);
         }
 
         supervisor.stop_until(Instant::now()).await;
@@ -1618,6 +2094,365 @@ mod tests {
         let exited = reports(&mut supervisor).await;
         assert!(exited[0].ends_with("starting it again in 1s"), "{exited:?}");
 
+        // That exit was not a quick one, so the first quick exit after
+        // it waits as long, and the one after that twice as long.
+
+        for (waited, wait) in [(1, 1), (1, 2)] {
+            tokio::time::advance(Duration::from_secs(waited)).await;
+            assert!(reports(&mut supervisor).await[0].starts_with("thing.started"));
+            kill(pids(&supervisor)[0]);
+            let exited = reports(&mut supervisor).await;
+            assert!(
+                exited[0].ends_with(&format!("starting it again in {wait}s")),
+                "{exited:?}"
+            );
+        }
+
+        supervisor.stop_until(Instant::now()).await;
+    }
+
+    /// A policy other than the default one.
+    fn policy(mode: RestartMode, success_exit_codes: &[i32]) -> RestartPolicy {
+        RestartPolicy {
+            mode,
+            success_exit_codes: success_exit_codes.to_vec(),
+            ..RestartPolicy::default()
+        }
+    }
+
+    #[test]
+    fn an_exit_is_judged_by_the_policy_and_the_statuses_it_counts_as_clean() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let status = |code: i32| Exit::Status(ExitStatus::from_raw(code << 8));
+        let killed = Exit::Status(ExitStatus::from_raw(libc::SIGKILL));
+        let again = Verdict::Restart(Duration::from_secs(1));
+
+        // `always` starts the instance again whatever the exit.
+
+        let always = RestartPolicy::default();
+
+        for exit in [status(0), status(1), killed, Exit::Gone, Exit::RelayLost] {
+            assert_eq!(always.restart_after(&exit, 1), again, "{exit}");
+        }
+
+        // `on-failure` leaves a clean exit alone. A status not named, a
+        // signal, a process that is gone and a lost relay are failures.
+
+        let on_failure = policy(RestartMode::OnFailure, &[0, 3]);
+
+        for exit in [status(0), status(3)] {
+            assert_eq!(
+                on_failure.restart_after(&exit, 1),
+                Verdict::Leave(Left::Exited),
+                "{exit}"
+            );
+        }
+
+        for exit in [status(1), killed, Exit::Gone, Exit::RelayLost] {
+            assert_eq!(on_failure.restart_after(&exit, 1), again, "{exit}");
+        }
+
+        // `never` starts nothing again, and says which kind of exit it was.
+
+        let never = policy(RestartMode::Never, &[0]);
+        assert_eq!(
+            never.restart_after(&status(0), 1),
+            Verdict::Leave(Left::Exited)
+        );
+
+        for exit in [status(3), killed, Exit::Gone, Exit::RelayLost] {
+            assert_eq!(
+                never.restart_after(&exit, 1),
+                Verdict::Leave(Left::Failed),
+                "{exit}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_the_policy_does_not_follow_with_a_start_leaves_the_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = Supervisor::start(
+            spec(dir.path()),
+            policy(RestartMode::OnFailure, &[0, 3]),
+            vec![
+                instance(&["/bin/sh", "-c", "exit 3"]),
+                instance(&["/bin/sh", "-c", "exit 1"]),
+            ],
+            STOP_WITHIN,
+        )
+        .await
+        .unwrap();
+
+        // Both exits may be seen by one check or by two.
+
+        let mut seen = Vec::new();
+
+        while seen.len() < 2 {
+            seen.extend(reports(&mut supervisor).await);
+        }
+
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                "thing.exited info: instance 0 exited with exit status: 3; \
+                 it is not started again (restart policy on-failure)",
+                "thing.exited warning: instance 1 exited with exit status: 1; \
+                 starting it again in 1s",
+            ]
+        );
+
+        // The failure is started again; the clean exit never is, and the
+        // record says how it was left, for the next daemon.
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let started = reports(&mut supervisor).await;
+        assert!(
+            started[0].starts_with("thing.started info: instance 1 "),
+            "{started:?}"
+        );
+        let record = supervisor.record();
+        assert_eq!(record.instances[0].left, Some(Left::Exited));
+        assert_eq!(record.instances[0].pid, 0);
+        assert_eq!(record.instances[1].left, None);
+
+        // The next daemon leaves it so too.
+
+        let stopped = supervisor.record();
+        supervisor.stop_until(Instant::now()).await;
+        let mut adopted = Supervisor::adopt(
+            spec(dir.path()),
+            policy(RestartMode::OnFailure, &[0, 3]),
+            vec![
+                instance(&["/bin/sh", "-c", "exit 3"]),
+                instance(&["/bin/sleep", "600"]),
+            ],
+            &stopped,
+        )
+        .unwrap();
+        assert_eq!(adopted.adopted()[0], Adopted::Left(Left::Exited));
+        tokio::time::advance(Duration::from_secs(600)).await;
+        let later = reports(&mut adopted).await;
+        assert!(
+            later.iter().all(|report| report.contains("instance 1 ")),
+            "{later:?}"
+        );
+        assert_eq!(adopted.record().instances[0].left, Some(Left::Exited));
+        adopted.stop_until(Instant::now()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_under_never_leaves_the_instance_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = Supervisor::start(
+            spec(dir.path()),
+            policy(RestartMode::Never, &[0]),
+            vec![instance(&["/bin/sleep", "600"])],
+            STOP_WITHIN,
+        )
+        .await
+        .unwrap();
+
+        kill(pids(&supervisor)[0]);
+        assert_eq!(
+            reports(&mut supervisor).await,
+            [
+                "thing.exited error: instance 0 exited with signal: 9 (SIGKILL); \
+              it is not started again (restart policy never)"
+            ]
+        );
+        tokio::time::advance(Duration::from_secs(600)).await;
+        assert!(supervisor.check().await.is_empty());
+        assert_eq!(supervisor.running(), 0);
+        assert_eq!(supervisor.record().instances[0].left, Some(Left::Failed));
+        supervisor.stop_until(Instant::now()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_by_hand_stops_an_instance_and_starts_it_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = Supervisor::start(
+            spec(dir.path()),
+            RestartPolicy {
+                give_up_after: Some(1),
+                ..RestartPolicy::default()
+            },
+            vec![instance(&["/bin/sleep", "600"])],
+            STOP_WITHIN,
+        )
+        .await
+        .unwrap();
+        let first = pids(&supervisor)[0];
+
+        // The process is asked to stop, and the start in its place has
+        // no wait and counts no quick exit, soon as it was.
+
+        supervisor.restart(0, Instant::now() + STOP_WITHIN);
+        assert!(supervisor.instances().next().unwrap().stopping());
+        let mut seen = Vec::new();
+
+        while seen.len() < 2 {
+            seen.extend(reports(&mut supervisor).await);
+        }
+
+        let second = pids(&supervisor)[0];
+        assert_ne!(second, first);
+        assert_eq!(
+            seen,
+            [
+                "thing.exited info: instance 0 stopped for a restart \
+                 (exited with signal: 15 (SIGTERM))"
+                    .to_owned(),
+                format!("thing.started info: instance 0 started again (pid {second})"),
+            ]
+        );
+        let instance = supervisor.instances().next().unwrap();
+        assert_eq!((instance.quick_exits(), instance.stopping()), (0, false));
+
+        // An exit of its own is then the last the policy allows, and a
+        // restart by hand starts the instance it gave up on.
+
+        kill(second);
+        let exited = reports(&mut supervisor).await;
+        assert!(exited[1].starts_with("thing.gave_up error: "), "{exited:?}");
+        assert_eq!(
+            supervisor.instances().next().unwrap().state(),
+            State::Failed
+        );
+        supervisor.restart(0, Instant::now() + STOP_WITHIN);
+        let started = reports(&mut supervisor).await;
+        assert!(
+            started[0].starts_with("thing.started info: "),
+            "{started:?}"
+        );
+        let instance = supervisor.instances().next().unwrap();
+        assert_eq!(
+            (instance.state(), instance.quick_exits()),
+            (State::Running, 0)
+        );
+        assert_eq!(supervisor.record().instances[0].left, None);
+        supervisor.stop_until(Instant::now()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_by_hand_kills_an_instance_that_does_not_stop() {
+        // The instance ignores the stop signal, as does what it runs.
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut supervisor, first) = start_script(
+            dir.path(),
+            spec(dir.path()),
+            "trap '' TERM; touch ready; while :; do sleep 1; done",
+        )
+        .await;
+
+        supervisor.restart(0, Instant::now() + Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(supervisor.check().await.is_empty());
+        assert!(exists(first));
+
+        // When its time is up it is killed with its group, and started.
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let mut seen = Vec::new();
+
+        while seen.len() < 2 {
+            seen.extend(reports(&mut supervisor).await);
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+
+        assert_eq!(
+            seen[0],
+            "thing.exited info: instance 0 stopped for a restart \
+             (exited with signal: 9 (SIGKILL))"
+        );
+        assert!(seen[1].starts_with("thing.started info: "), "{seen:?}");
+        wait_for("the group to go", || (!group_exists(first)).then_some(()));
+        supervisor.stop_until(Instant::now()).await;
+    }
+
+    #[test]
+    fn a_start_that_failed_is_tried_again_as_the_policy_says() {
+        let waits = |policy: &RestartPolicy| {
+            (1..=8)
+                .map(|failed| policy.retry_after(failed).map(|wait| wait.as_secs()))
+                .collect::<Vec<_>>()
+        };
+
+        // Without end by default, the wait doubling to a minute.
+
+        assert_eq!(
+            waits(&RestartPolicy::default()),
+            [1, 2, 4, 8, 16, 32, 60, 60].map(Some)
+        );
+
+        // To the count the policy gives up at, and never under `never`.
+
+        let gives_up = RestartPolicy {
+            give_up_after: Some(3),
+            ..RestartPolicy::default()
+        };
+        assert_eq!(waits(&gives_up)[..4], [Some(1), Some(2), None, None]);
+        assert_eq!(waits(&policy(RestartMode::Never, &[0])), [None; 8]);
+        assert_eq!(waits(&policy(RestartMode::OnFailure, &[0]))[0], Some(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_instance_that_keeps_exiting_is_given_up_on_when_the_policy_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut supervisor = Supervisor::start(
+            spec(dir.path()),
+            RestartPolicy {
+                give_up_after: Some(2),
+                ..RestartPolicy::default()
+            },
+            vec![instance(&["/bin/sh", "-c", "exit 3"])],
+            STOP_WITHIN,
+        )
+        .await
+        .unwrap();
+
+        let exited = reports(&mut supervisor).await;
+        assert!(exited[0].ends_with("starting it again in 1s"), "{exited:?}");
+        assert_eq!(exited[0].split(' ').nth(1), Some("warning:"));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(reports(&mut supervisor).await[0].starts_with("thing.started"));
+
+        // The second quick exit in a row is the last: the exit counts as
+        // a failure, and the instance is left failed for good.
+
+        let exited: Vec<Report> = loop {
+            let reports = supervisor.check().await;
+
+            if !reports.is_empty() {
+                break reports;
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert_eq!(exited[0].outcome, Some(Outcome::Failed));
+        assert_eq!(
+            exited
+                .iter()
+                .map(|report| format!("{} {}: {}", report.kind, report.level, report.message))
+                .collect::<Vec<_>>(),
+            [
+                "thing.exited error: instance 0 exited with exit status: 3; \
+                 it is not started again",
+                "thing.gave_up error: instance 0 is left failed after exiting or failing to \
+                 start 2 times in a row, each within 60s of starting (give_up_after = 2); a \
+                 restart by hand starts it again",
+            ]
+        );
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(supervisor.check().await.is_empty());
+        let instance = supervisor.instances().next().unwrap();
+        assert_eq!(instance.state(), State::Failed);
+        assert_eq!(instance.quick_exits(), 2);
+        assert_eq!(supervisor.record().instances[0].left, Some(Left::Failed));
         supervisor.stop_until(Instant::now()).await;
     }
 
@@ -1965,6 +2800,7 @@ mod tests {
                     pid: *pid,
                     started_unix_ms: if *pid == 0 { 0 } else { now },
                     quick_exits: 2,
+                    left: None,
                     start_time: start_time(*pid).unwrap_or(0),
                     relay_pid: 0,
                     relay_start_time: 0,
@@ -2041,16 +2877,21 @@ mod tests {
         assert_eq!(supervisor.running(), 3);
 
         // The exits in a row carry on from the record: with two behind
-        // it, an instance's next exit waits as the third does.
+        // it, an instance's next exit waits as the third does, and is
+        // the one that makes a crash loop.
 
         kill(now[1]);
+        let exited = reports(&mut supervisor).await;
         assert_eq!(
-            reports(&mut supervisor).await,
-            [
-                "thing.exited warning: instance 1 exited with signal: 9 (SIGKILL); \
-              starting it again in 4s"
-            ]
+            exited[0],
+            "thing.exited warning: instance 1 exited with signal: 9 (SIGKILL); \
+             starting it again in 4s"
         );
+        assert!(
+            exited[1].starts_with("thing.crash_looping error: instance 1 is crash looping: "),
+            "{exited:?}"
+        );
+        assert_eq!(exited.len(), 2);
 
         // An adopted process that exits is seen to be gone and started
         // again as a child.
@@ -2058,8 +2899,8 @@ mod tests {
         survivor.kill().unwrap();
         survivor.wait().unwrap();
         assert_eq!(
-            reports(&mut supervisor).await,
-            ["thing.exited warning: instance 0 is gone; starting it again in 4s"]
+            reports(&mut supervisor).await[0],
+            "thing.exited warning: instance 0 is gone; starting it again in 4s"
         );
         tokio::time::advance(Duration::from_secs(4)).await;
         assert_eq!(supervisor.check().await.len(), 2);
@@ -2191,8 +3032,8 @@ mod tests {
         // signals nothing: the bystander runs on.
 
         assert_eq!(
-            reports(&mut supervisor).await,
-            ["thing.exited warning: instance 0 is gone; starting it again in 4s"]
+            reports(&mut supervisor).await[0],
+            "thing.exited warning: instance 0 is gone; starting it again in 4s"
         );
         supervisor.stop_until(Instant::now()).await;
         assert_eq!(bystander.try_wait().unwrap(), None);

@@ -140,6 +140,7 @@ A release definition, the `[app.NAME.release.ID]` table: the keys a deploy takes
 | `python` | string | found at start | The interpreter: a path, or a request in uv's syntax. A relative path with a directory in it, such as `.venv/bin/python`, is taken from the file's directory. |
 | `readiness` | table, {ref}`[app.NAME.release.ID.readiness] <config-deployment-app-name-release-id-readiness>` |  | How an `http` release's instances are known to be ready. |
 | `reflection` | boolean | `false` | Serve gRPC server reflection for the services the release's gRPC mounts register (default false). |
+| `restart` | table, {ref}`[app.NAME.release.ID.restart] <config-deployment-app-name-release-id-restart>` |  | What happens when an `http` release's instance exits. |
 | `scaling` | table, {ref}`[app.NAME.release.ID.scaling] <config-deployment-app-name-release-id-scaling>` |  | How the default group is scaled; static when absent. |
 | `sendfile_header` | string |  | A second response header honoured as `X-Muru-Sendfile` is, such as `X-Sendfile` for the frameworks that send that one. |
 | `sendfile_roots` | array of strings |  | Directories a path in an `X-Muru-Sendfile` response header must lie in for the file to be served, for the default mount and any mount that does not say otherwise; with none every hint is refused. `source:SUBDIR`, or a relative path, is taken from the release's `source`, and `media:SUBDIR` from the media part. |
@@ -317,6 +318,20 @@ The `readiness` table of a managed HTTP release: how an instance is known to be 
 | --- | --- | --- | --- |
 | `path` | string |  | The path probed with a GET until it answers 2xx or 3xx; without it, any HTTP response makes the instance ready. |
 | `timeout` | string | `"60s"` | How long the instances get to become ready. |
+
+(config-deployment-app-name-release-id-restart)=
+## `[app.NAME.release.ID.restart]`
+
+The `restart` table of a managed HTTP release: what happens when an instance exits.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `delay` | string | `"1s"` | The wait before the next start after a run that lasted, and after the first quick exit. |
+| `give_up_after` | integer |  | Quick exits in a row after which the instance is left failed until it is restarted by hand. Without it the instance is started again every `max_delay`, without end. |
+| `max_delay` | string | `"1m"` | The longest wait: the wait doubles with each quick exit in a row up to this. |
+| `policy` | string | `"always"` | When an instance that exited is started again: `always`, after any exit; `on-failure`, after a failure, with a clean exit left alone; or `never`. `always`: After any exit. `on-failure`: After a failure; a clean exit is left alone. `never`: Never. |
+| `stable_after` | string | `"1m"` | A run this long was not a quick exit, and clears the count of them. |
+| `success_exit_codes` | array of integers | `[0]` | The exit statuses that count as a clean exit. Any other status, and death by a signal, is a failure. |
 
 (config-deployment-app-name-release-id-scaling)=
 ## `[app.NAME.release.ID.scaling]`

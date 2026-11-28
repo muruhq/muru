@@ -464,6 +464,7 @@ fn workers(
         command: Vec::new(),
         cwd: None,
         bind: None,
+        restart: None,
         instances: None,
         readiness: None,
         stop_signal: None,
@@ -622,6 +623,40 @@ fn managed(
         None,
         Some(format_ms(spec.timeouts.shutdown_timeout_ms)),
     );
+
+    // The restart table: each key the flags gave, and the defaults of
+    // the rest when every setting is written.
+
+    let asked = given.restart.clone().unwrap_or_default();
+    let resolved = &http.restart;
+    let restart = muru_config::Restart {
+        policy: writer.one("restart.policy", asked.policy, None, Some(resolved.policy)),
+        success_exit_codes: writer.one(
+            "restart.success_exit_codes",
+            asked.success_exit_codes,
+            None,
+            Some(resolved.success_exit_codes.clone()),
+        ),
+        delay: writer.one(
+            "restart.delay",
+            asked.delay,
+            None,
+            Some(format_ms(resolved.delay_ms)),
+        ),
+        max_delay: writer.one(
+            "restart.max_delay",
+            asked.max_delay,
+            None,
+            Some(format_ms(resolved.max_delay_ms)),
+        ),
+        stable_after: writer.one(
+            "restart.stable_after",
+            asked.stable_after,
+            None,
+            Some(format_ms(resolved.stable_after_ms)),
+        ),
+        give_up_after: writer.given("restart.give_up_after", asked.give_up_after, None),
+    };
     let mut env = BTreeMap::new();
 
     for (name, value) in env_from(request) {
@@ -638,6 +673,7 @@ fn managed(
         instances: writer.one("instances", given.instances, None, Some(http.instances)),
         readiness: (path.is_some() || timeout.is_some())
             .then_some(muru_config::Readiness { path, timeout }),
+        restart: (restart != muru_config::Restart::default()).then_some(restart),
         stop_signal: given.stop_signal,
         timeouts: shutdown_timeout.map(|shutdown_timeout| muru_config::Timeouts {
             shutdown_timeout: Some(shutdown_timeout),

@@ -4844,6 +4844,14 @@ pub struct ReleaseArgs {
     #[arg(long, value_name = "NAME")]
     pub(crate) stop_signal: Option<String>,
 
+    /// What happens when a managed server's instance exits, as
+    /// KEY=VALUE: policy (always, on-failure or never), success_exit_codes
+    /// (the statuses of a clean exit, for example 0,3), delay (1s),
+    /// max_delay (1m), stable_after (1m) or give_up_after (a count of
+    /// quick exits in a row). Repeatable.
+    #[arg(long = "restart", value_name = "KEY=VALUE", value_parser = crate::parse_restart_setting)]
+    pub(crate) restart: Vec<(String, String)>,
+
     /// A directory a path in an X-Muru-Sendfile response header must lie
     /// in for the file to be served, relative to the source unless
     /// absolute; repeatable (default the table's).
@@ -5175,6 +5183,37 @@ fn memory_setting(settings: &[(String, String)], key: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+/// The --restart settings as a request carries them, each already
+/// checked as it was parsed; none when no setting was given.
+fn restart_settings(settings: &[(String, String)]) -> Option<pb::RestartSettings> {
+    if settings.is_empty() {
+        return None;
+    }
+
+    let wait = |key: &str| {
+        memory_setting(settings, key)
+            .and_then(|value| muru_config::parse_duration(&value).ok())
+            .map(|duration| duration.as_millis() as u64)
+    };
+
+    Some(pb::RestartSettings {
+        policy: memory_setting(settings, "policy").unwrap_or_default(),
+        success_exit_codes: memory_setting(settings, "success_exit_codes")
+            .map(|codes| {
+                codes
+                    .split(',')
+                    .filter_map(|code| code.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        delay_ms: wait("delay"),
+        max_delay_ms: wait("max_delay"),
+        stable_after_ms: wait("stable_after"),
+        give_up_after: memory_setting(settings, "give_up_after")
+            .and_then(|count| count.parse().ok()),
+    })
+}
+
 /// The last value given for a named timeout, in milliseconds.
 fn timeout_ms(timeouts: &[(String, Duration)], name: &str) -> Option<u64> {
     timeouts
@@ -5266,6 +5305,7 @@ impl ReleaseArgs {
                 .readiness_timeout
                 .map(|timeout| timeout.as_millis() as u64),
             stop_signal: self.stop_signal.unwrap_or_default(),
+            restart: restart_settings(&self.restart),
             entrypoint: self.entrypoint.unwrap_or_default(),
             interface: self
                 .interface
@@ -5891,7 +5931,9 @@ pub struct RestartArgs {
     /// Every worker of the release, each in its turn: as many at once
     /// as the max_surge and max_unavailable of its group allow, one at a
     /// time by default, so capacity holds. The release's host takes the
-    /// turns, so the restart carries on if the daemon is stopped.
+    /// turns, so the restart carries on if the daemon is stopped. For a
+    /// managed HTTP server release, every instance, one at a time, each
+    /// answering its readiness probe before the next is stopped.
     #[arg(long, required_unless_present_any = ["worker", "pid", "group", "cancel"])]
     all: bool,
 
@@ -6081,10 +6123,15 @@ async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
             return print_answer(&answer);
         }
 
+        let (one, many) = match answer.instances {
+            true => ("instance", "instances"),
+            false => ("worker", "workers"),
+        };
+
         println!(
             "muru: the restart of {} is cancelled: {} left as {} {}",
             release_name(&answer.app, &answer.release),
-            counted(answer.workers.len(), "worker", "workers"),
+            counted(answer.workers.len(), one, many),
             if answer.workers.len() == 1 {
                 "it"
             } else {
@@ -6121,12 +6168,25 @@ async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
         anyhow::bail!("{name} has no worker{scope} to restart");
     }
 
+    // A managed server's instances are restarted one at a time by the
+    // daemon, each answering its readiness probe before the next.
+
+    let (one, many) = match answer.instances {
+        true => ("instance", "instances"),
+        false => ("worker", "workers"),
+    };
+
     if args.output.json {
         print_answer(&answer)?;
+    } else if answer.instances {
+        println!(
+            "muru: {} of {name} to be restarted, one at a time",
+            counted(answer.workers.len(), one, many),
+        );
     } else {
         println!(
             "muru: {}{scope} of {name} marked to be replaced, each in its turn",
-            counted(answer.workers.len(), "worker", "workers"),
+            counted(answer.workers.len(), one, many),
         );
     }
 
@@ -6134,7 +6194,7 @@ async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
         (Some(restart), false) => anyhow::bail!(
             "the restart of {name} is still under way: {} of {} left; muructl release show \
              says how far it has got, and muructl restart --cancel ends it",
-            counted(restart.left as usize, "worker", "workers"),
+            counted(restart.left as usize, one, many),
             restart.total
         ),
         (None, false) if !args.output.json => {
@@ -8950,6 +9010,38 @@ fn finish_removal(answer: &pb::RemoveReleasesResponse, json: bool) -> anyhow::Re
     }
 }
 
+/// Where a managed server's instance stands, for `release show`: its
+/// process, or why it has none and when it is started again.
+fn instance_standing(instance: &pb::ServerInstance, now_unix_ms: u64) -> String {
+    let in_a_row = match instance.quick_exits {
+        0 | 1 => String::new(),
+        count => format!(" after {count} quick exits in a row"),
+    };
+
+    match instance.state.as_str() {
+        "starting" => format!("pid {}, starting", instance.pid),
+        "backoff" => {
+            let wait = Duration::from_secs(
+                instance
+                    .next_start_unix_ms
+                    .saturating_sub(now_unix_ms)
+                    .div_ceil(1000),
+            );
+            format!(
+                "backoff, starting again in {}{in_a_row}",
+                muru_config::format_duration(wait)
+            )
+        }
+        "exited" => "exited, not started again".to_owned(),
+        "failed" => format!("failed, not started again{in_a_row}"),
+
+        // A daemon from before the state was given says only whether
+        // the instance has a process.
+        _ if instance.pid == 0 => "waiting to start again".to_owned(),
+        _ => format!("pid {}", instance.pid),
+    }
+}
+
 /// The WORKERS column of `release list`: what runs now, or `-` when
 /// nothing does, and the shape the release asks for in brackets.
 fn workers_column(release: &pb::Release) -> String {
@@ -9121,14 +9213,25 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
         lines.push(("command".to_owned(), release.command.join(" ")));
 
         for instance in &release.server_instances {
-            let process = if instance.pid == 0 {
-                "waiting to start again".to_owned()
-            } else {
-                format!("pid {}", instance.pid)
-            };
             lines.push((
                 format!("instance {}", instance.index),
-                format!("{process}, {}", instance.address),
+                format!(
+                    "{}, {}",
+                    instance_standing(instance, now_unix_ms()),
+                    instance.address
+                ),
+            ));
+        }
+
+        if let Some(restart) = &release.restart {
+            lines.push((
+                "restart".to_owned(),
+                format!(
+                    "{} of {} still to be restarted, one at a time; muructl restart --cancel \
+                     leaves them",
+                    restart.left,
+                    counted(restart.total as usize, "instance", "instances"),
+                ),
             ));
         }
 
@@ -13927,6 +14030,42 @@ tls = { ca = "ca.pem" }
             ..server
         };
         assert_eq!(super::workers_column(&running), "1 (2 gunicorn)");
+    }
+
+    #[test]
+    fn an_instance_is_shown_by_where_it_stands() {
+        let instance = |state: &str, pid: u32, quick_exits: u32| pb::ServerInstance {
+            pid,
+            state: state.to_owned(),
+            next_start_unix_ms: 61_500,
+            quick_exits,
+            ..Default::default()
+        };
+        let shown = |instance: &pb::ServerInstance| super::instance_standing(instance, 50_000);
+
+        assert_eq!(shown(&instance("running", 7, 0)), "pid 7");
+        assert_eq!(shown(&instance("starting", 7, 1)), "pid 7, starting");
+        assert_eq!(
+            shown(&instance("backoff", 0, 1)),
+            "backoff, starting again in 12s"
+        );
+        assert_eq!(
+            shown(&instance("backoff", 0, 4)),
+            "backoff, starting again in 12s after 4 quick exits in a row"
+        );
+        assert_eq!(
+            shown(&instance("exited", 0, 0)),
+            "exited, not started again"
+        );
+        assert_eq!(
+            shown(&instance("failed", 0, 5)),
+            "failed, not started again after 5 quick exits in a row"
+        );
+
+        // A daemon that names no state.
+
+        assert_eq!(shown(&instance("", 0, 0)), "waiting to start again");
+        assert_eq!(shown(&instance("", 7, 0)), "pid 7");
     }
 
     #[tokio::test]

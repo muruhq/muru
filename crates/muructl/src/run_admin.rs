@@ -2319,6 +2319,7 @@ impl Admin for Service {
             release,
             workers: marked.into_iter().map(marked_worker).collect(),
             restart: restart_under_way(),
+            instances: false,
         }))
     }
 
@@ -2342,6 +2343,7 @@ impl Admin for Service {
             release,
             workers: left.into_iter().map(marked_worker).collect(),
             restart: restart_under_way(),
+            instances: false,
         }))
     }
 

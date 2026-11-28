@@ -5992,6 +5992,89 @@ fn resolve_error_tables(
     Ok((error_pages, error_override, maintenance))
 }
 
+/// A request's restart settings as the `restart` table they amount to.
+pub(crate) fn restart_table_from(
+    settings: &pb::RestartSettings,
+) -> Result<muru_config::Restart, String> {
+    let codes = settings
+        .success_exit_codes
+        .iter()
+        .map(|code| {
+            u8::try_from(*code).map_err(|_| {
+                format!("restart.success_exit_codes: {code} is not an exit status, 0 to 255")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(muru_config::Restart {
+        policy: parse_optional(&settings.policy)?,
+        success_exit_codes: (!codes.is_empty()).then_some(codes),
+        delay: settings.delay_ms.map(format_ms),
+        max_delay: settings.max_delay_ms.map(format_ms),
+        stable_after: settings.stable_after_ms.map(format_ms),
+        give_up_after: settings.give_up_after,
+    })
+}
+
+/// A `restart` table as a request's restart settings; a wait that does
+/// not parse is left out, and the validation of the declared release
+/// reports it.
+fn restart_settings_from(table: &muru_config::Restart) -> pb::RestartSettings {
+    pb::RestartSettings {
+        policy: table
+            .policy
+            .map(|policy| policy.as_str().to_owned())
+            .unwrap_or_default(),
+        success_exit_codes: table
+            .success_exit_codes
+            .iter()
+            .flatten()
+            .map(|code| u32::from(*code))
+            .collect(),
+        delay_ms: duration_field(table.delay.as_ref()),
+        max_delay_ms: duration_field(table.max_delay.as_ref()),
+        stable_after_ms: duration_field(table.stable_after.as_ref()),
+        give_up_after: table.give_up_after,
+    }
+}
+
+/// A `restart` table, already checked, with the defaults filled in.
+fn restart_spec_from(table: Option<&muru_config::Restart>) -> crate::model::RestartSpec {
+    let defaults = crate::model::RestartSpec::default();
+
+    let Some(table) = table else {
+        return defaults;
+    };
+
+    let wait =
+        |text: &Option<String>, default: u64| duration_field(text.as_ref()).unwrap_or(default);
+
+    crate::model::RestartSpec {
+        policy: table.policy.unwrap_or(defaults.policy),
+        success_exit_codes: table
+            .success_exit_codes
+            .clone()
+            .unwrap_or(defaults.success_exit_codes),
+        delay_ms: wait(&table.delay, defaults.delay_ms),
+        max_delay_ms: wait(&table.max_delay, defaults.max_delay_ms),
+        stable_after_ms: wait(&table.stable_after, defaults.stable_after_ms),
+        give_up_after: table.give_up_after,
+    }
+}
+
+/// A resolved restart policy as the table that declares it, every key
+/// written.
+fn restart_table_of(spec: &crate::model::RestartSpec) -> muru_config::Restart {
+    muru_config::Restart {
+        policy: Some(spec.policy),
+        success_exit_codes: Some(spec.success_exit_codes.clone()),
+        delay: Some(format_ms(spec.delay_ms)),
+        max_delay: Some(format_ms(spec.max_delay_ms)),
+        stable_after: Some(format_ms(spec.stable_after_ms)),
+        give_up_after: spec.give_up_after,
+    }
+}
+
 /// A deploy request's keys as the release table they amount to, for the
 /// kind check of section 9.9: which keys are set is what matters.
 pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config::Release, String> {
@@ -6000,6 +6083,11 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
             path: (!request.readiness_path.is_empty()).then(|| request.readiness_path.clone()),
             timeout: request.readiness_timeout_ms.map(format_ms),
         });
+    let restart = request
+        .restart
+        .as_ref()
+        .map(restart_table_from)
+        .transpose()?;
     let timeouts_given = request.soft_timeout_ms.is_some()
         || request.hard_timeout_ms.is_some()
         || request.hard_drain_grace_ms.is_some()
@@ -6033,6 +6121,7 @@ pub(crate) fn kind_table_from(request: &pb::DeployRequest) -> Result<muru_config
         bind: parse_optional(&request.bind)?,
         instances: request.instances,
         readiness,
+        restart,
         stop_signal: (!request.stop_signal.is_empty()).then(|| request.stop_signal.clone()),
         source: Some(request.source.clone()),
         entrypoint: request.entrypoint.clone(),
@@ -6209,6 +6298,7 @@ fn resolve_http_spec(
                 .then(|| request.readiness_path.clone()),
             readiness_timeout_ms,
             stop_signal: table.stop_signal.clone(),
+            restart: restart_spec_from(table.restart.as_ref()),
         }),
         layers: crate::model::Layers(env_layers),
         interpreter: None,
@@ -6609,6 +6699,7 @@ fn request_from(app: &str, table: &ReleaseTable, source: &str) -> pb::DeployRequ
                 .and_then(|readiness| readiness.timeout.as_ref()),
         ),
         stop_signal: table.stop_signal.clone().unwrap_or_default(),
+        restart: table.restart.as_ref().map(restart_settings_from),
         entrypoint: table.entrypoint.clone(),
         interface: table
             .interface
@@ -6785,6 +6876,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
                 path: http.readiness_path.clone(),
                 timeout: Some(format_ms(http.readiness_timeout_ms)),
             }),
+            restart: Some(restart_table_of(&http.restart)),
             stop_signal: http.stop_signal.clone(),
             max_body_size: spec.limits.max_body_size_text(),
             timeouts: with_served(
@@ -6810,6 +6902,7 @@ fn table_from(spec: &ReleaseSpec) -> ReleaseTable {
         command: Vec::new(),
         cwd: None,
         bind: None,
+        restart: None,
         instances: None,
         readiness: None,
         stop_signal: None,
@@ -7028,7 +7121,7 @@ fn describe_http(http: Option<&HttpServerSpec>) -> String {
     };
 
     format!(
-        "{} {:?} bind {} instances {} readiness {}/{}{}",
+        "{} {:?} bind {} instances {} readiness {}/{}{} restart {}",
         http.profile.as_str(),
         http.command,
         http.bind.as_str(),
@@ -7038,7 +7131,8 @@ fn describe_http(http: Option<&HttpServerSpec>) -> String {
         http.stop_signal
             .as_ref()
             .map(|signal| format!(" stop {signal}"))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        http.restart.describe()
     )
 }
 

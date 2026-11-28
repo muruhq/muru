@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -225,6 +226,127 @@ def test_a_crashed_instance_is_started_again(daemon: Daemon) -> None:
     events = daemon.muructl("events").stdout
     assert "instance 0 exited with exit status: 3; starting it again in 1s" in events
     assert f"instance 0 started again (pid {after})" in events
+    assert daemon.releases("legacy") == [
+        {"release": "legacy@r1", "state": "ready", "serving": "yes"}
+    ]
+
+
+def test_a_crash_loop_is_loud_and_ends_as_the_restart_table_says(
+    daemon: Daemon, tmp_path: Path
+) -> None:
+    # The instance serves until the file is there, and from then on
+    # exits as soon as it is started.
+
+    broken = tmp_path / "broken"
+    script = f"test -e {shlex.quote(str(broken))} && exit 7; exec {shlex.join(SERVER)}"
+    deploy_server(
+        daemon, "legacy", "--restart", "give_up_after=4", command=["/bin/sh", "-c", script]
+    )
+    assert [instance["state"] for instance in instances(daemon, "legacy@r1")] == ["running"]
+    broken.touch()
+    report(daemon, "/crash")
+
+    def events(kind: str) -> list[str]:
+        lines = daemon.muructl("events").stdout.splitlines()
+        return [line for line in lines if f" {kind} " in line]
+
+    # The third quick exit in a row is a crash loop, and the instance
+    # waits in backoff, with when it is started next.
+
+    wait_for(lambda: len(events("server.crash_looping")) == 1, 30)
+    assert (
+        "instance 0 is crash looping: it has exited or failed to start 3 times"
+        in (events("server.crash_looping")[0])
+    )
+    (waiting,) = instances(daemon, "legacy@r1")
+    assert (waiting["state"], waiting["pid"], waiting["quick_exits"]) == ("backoff", 0, 3)
+    assert waiting["next_start_unix_ms"] > time.time() * 1000
+    shown = daemon.muructl("release", "show", "legacy@r1").stdout
+    assert re.search(r"backoff, starting again in \ds after 3 quick exits in a row", shown), shown
+
+    # The fourth is the last the table allows: the instance is left
+    # failed, the release stays ready, and the exits are counted.
+
+    wait_for(lambda: len(events("server.gave_up")) == 1, 30)
+    assert "(give_up_after = 4)" in events("server.gave_up")[0]
+    (failed,) = instances(daemon, "legacy@r1")
+    assert (failed["state"], failed["pid"], failed["quick_exits"]) == ("failed", 0, 4)
+    shown = daemon.muructl("release", "show", "legacy@r1").stdout
+    assert "failed, not started again after 4 quick exits in a row" in shown
+    exits = [line for line in events("server.exited") if "exit status" in line]
+    assert len(exits) == 4, exits
+    assert exits[-1].endswith("exited with exit status: 7; it is not started again")
+    metrics = daemon.muructl("metrics").stdout
+    assert 'muru_server_exits_total{app="legacy",release="r1",outcome="failed"} 4' in metrics
+    assert daemon.releases("legacy") == [
+        {"release": "legacy@r1", "state": "ready", "serving": "yes"}
+    ]
+    time.sleep(2.5)
+    assert len(events("server.started")) == 3
+
+    # A restart by hand starts the instance that was given up on.
+
+    broken.unlink()
+    daemon.muructl("restart", "legacy", "--all")
+    (back,) = instances(daemon, "legacy@r1")
+    assert (back["state"], back["quick_exits"]) == ("running", 0)
+    assert report(daemon)["pid"] == back["pid"]
+
+
+def test_a_restart_by_hand_restarts_the_instances_one_at_a_time(daemon: Daemon) -> None:
+    deploy_server(daemon, "legacy", "--bind", "port", "--instances", "2", "--readiness", "/healthz")
+    before = {instance["index"]: instance["pid"] for instance in instances(daemon, "legacy@r1")}
+
+    # A managed server has no workers to name, and nothing to cancel yet.
+
+    refused = daemon.muructl("restart", "legacy", "--worker", "0", check=False)
+    assert refused.returncode != 0
+    assert "muructl restart --all restarts its instances, one at a time" in refused.stderr
+    refused = daemon.muructl("restart", "legacy", "--cancel", check=False)
+    assert "no restart of its instances is under way" in refused.stderr
+
+    with Load(daemon.port, clients=4) as load:
+        restarted = daemon.muructl("restart", "legacy", "--all").stdout.splitlines()
+        time.sleep(0.5)
+
+    load.check("a restart of a managed server's instances", at_least=20)
+    assert restarted == [
+        "muru: 2 instances of legacy@r1 to be restarted, one at a time",
+        "muru: the restart of legacy@r1 has finished",
+    ]
+
+    # Every instance is a new process that serves, at the address it had.
+
+    after = instances(daemon, "legacy@r1")
+    assert [instance["state"] for instance in after] == ["running", "running"]
+    assert all(instance["pid"] not in before.values() for instance in after)
+    assert not any(alive(pid) for pid in before.values())
+    assert {report(daemon, f"/n/{n}")["pid"] for n in range(12)} == {
+        instance["pid"] for instance in after
+    }
+
+    # The second instance was not stopped until the first answered again.
+
+    lines = daemon.muructl("events").stdout.splitlines()
+    told = [
+        line.split(None, 5)[5]
+        for line in lines
+        if " restart." in line or (" server." in line and "instance" in line)
+    ]
+    assert told[0] == (
+        "restarting 2 instances one at a time, each to answer its readiness probe before the "
+        "next is stopped"
+    )
+    order = [
+        re.sub(r" \(.*\)$", "", line) for line in told[1:-1] if not line.startswith("instance 1 a")
+    ]
+    assert order[:4] == [
+        "instance 0 stopped for a restart",
+        "instance 0 started again",
+        "instance 0 answers and takes requests again",
+        "instance 1 stopped for a restart",
+    ], told
+    assert told[-1] == "every instance has been restarted and answers"
     assert daemon.releases("legacy") == [
         {"release": "legacy@r1", "state": "ready", "serving": "yes"}
     ]
@@ -524,6 +646,12 @@ readiness = {{ path = '/healthz', timeout = '20s' }}
 stop_signal = 'TERM'
 env = {{ LEGACY_SETTING = 'declared' }}
 
+[app.legacy.release.r1.restart]
+policy = 'on-failure'
+success_exit_codes = [0, 3]
+max_delay = '2m'
+give_up_after = 5
+
 [host.legacy]
 names = ['legacy.test']
 default = true
@@ -543,6 +671,19 @@ app = 'legacy'
     assert "profile = 'generic'" in exported.replace('"', "'")
     assert "stop_signal = 'TERM'" in exported.replace('"', "'")
     assert "entrypoint" not in exported
+
+    # The restart table is exported with every key, the defaults of
+    # those the file left out among them.
+
+    restart = tomllib.loads(exported)["app"]["legacy"]["release"]["r1"]["restart"]
+    assert restart == {
+        "policy": "on-failure",
+        "success_exit_codes": [0, 3],
+        "delay": "1s",
+        "max_delay": "120s",
+        "stable_after": "60s",
+        "give_up_after": 5,
+    }, exported
     again = tmp_path / "again.toml"
     again.write_text(exported)
     assert "no changes" in daemon.muructl("apply", "-f", str(again)).stdout
@@ -570,6 +711,18 @@ app = 'legacy'
     )
     assert "profile applies to a managed HTTP release" in refused(
         f"source = '{SHOP}'\nprofile = 'gunicorn'\n"
+    )
+    assert "restart applies to a managed HTTP release" in refused(
+        f"source = '{SHOP}'\nrestart = {{ policy = 'never' }}\n"
+    )
+    assert "restart.max_delay (5s) must not be shorter than restart.delay (10s)" in refused(
+        base + "profile = 'gunicorn'\nrestart = { delay = '10s', max_delay = '5s' }\n"
+    )
+    assert "restart.give_up_after must be at least 1" in refused(
+        base + "profile = 'gunicorn'\nrestart = { give_up_after = 0 }\n"
+    )
+    assert "sometimes" in refused(
+        base + "profile = 'gunicorn'\nrestart = { policy = 'sometimes' }\n"
     )
     assert "a managed HTTP release needs the command" in refused(
         f"kind = 'http'\nprofile = 'gunicorn'\ncwd = '{LEGACY}'\n"
@@ -625,6 +778,65 @@ def test_a_daemon_restart_readopts_the_instances(tmp_path: Path) -> None:
         second.stop(shutdown=True)
 
     wait_for(lambda: not alive(replacement))
+
+
+def test_a_release_that_cannot_start_when_the_daemon_does_is_tried_again(tmp_path: Path) -> None:
+    # The server starts unless the file is there.
+
+    broken = tmp_path / "broken"
+    script = f"test -e {shlex.quote(str(broken))} && exit 7; exec {shlex.join(SERVER)}"
+    first = start_daemon(tmp_path)
+    second = None
+
+    try:
+        deploy_server(first, "legacy", command=["/bin/sh", "-c", script])
+        pid = report(first)["pid"]
+        assert "detached" in first.muructl("daemon", "stop").stdout
+        first.process.wait(timeout=30)
+
+        # As after a reboot: nothing of the release runs, its runtime
+        # files are gone, and what the server needs is not there yet.
+
+        os.kill(pid, signal.SIGKILL)
+        wait_for(lambda: not alive(pid))
+        (first.files_dir / "h" / "1" / "servers.toml").unlink()
+        broken.touch()
+        second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
+        def events(kind: str) -> list[str]:
+            lines = second.muructl("events").stdout.splitlines()
+            return [line for line in lines if f" {kind} " in line]
+
+        # Each start that fails is an event, as any failed start is, and
+        # another says when the next attempt is, the waits doubling.
+
+        wait_for(lambda: len(events("release.restarting")) >= 2, 30)
+        again = events("release.restarting")
+        assert again[0].endswith(
+            "could not restart after the daemon restarted (attempt 1): instance 0 exited with "
+            "exit status: 7 before it was ready; trying again in 1s"
+        )
+        assert "(attempt 2)" in again[1] and again[1].endswith("trying again in 2s")
+        assert len(events("release.failed")) >= 2
+        shown = json.loads(second.muructl("release", "show", "legacy@r1", "--json").stdout)
+        assert shown["state"] == "failed"
+        assert "trying again in" in shown["message"]
+
+        # Once the server can start, the next attempt brings it back.
+
+        broken.unlink()
+        wait_for(lambda: second.request("/").status == 200, 30)
+        assert second.releases("legacy") == [
+            {"release": "legacy@r1", "state": "ready", "serving": "yes"}
+        ]
+        attempts = len(events("release.restarting"))
+        time.sleep(2.5)
+        assert len(events("release.restarting")) == attempts
+    finally:
+        if second is None:
+            second = start_daemon(tmp_path, run_dir=first.run_dir, port=first.port)
+
+        second.stop(shutdown=True)
 
 
 def test_a_daemon_restart_adopts_the_instances_still_there_and_starts_the_rest(

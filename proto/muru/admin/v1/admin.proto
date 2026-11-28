@@ -904,6 +904,18 @@ message DeployRequest {
   optional uint32 max_unavailable = 62;     // workers a group may run under its count while workers are swapped; the table's, else 0, when absent
   optional uint32 initial_processes = 63;   // the workers each group starts with and keeps while the release takes no traffic, where that is fewer than its processes (issue 964); its processes when absent
   map<string, uint32> group_initial_processes = 64; // the same for one named worker group, over initial_processes
+  RestartSettings restart = 65;             // what happens when an http release's instance exits; the defaults when absent
+}
+
+// The restart table of an http release: when an instance that exited is
+// started again, and after what wait.
+message RestartSettings {
+  string policy = 1;                        // always (the default), on-failure or never
+  repeated uint32 success_exit_codes = 2;   // exit statuses that count as a clean exit; 0 alone when empty
+  optional uint64 delay_ms = 3;             // the wait before the next start; 1 s when absent
+  optional uint64 max_delay_ms = 4;         // the longest wait, which doubles with each quick exit in a row; 1 min when absent
+  optional uint64 stable_after_ms = 5;      // a run this long clears the count of quick exits; 1 min when absent
+  optional uint32 give_up_after = 6;        // quick exits in a row after which the instance is left failed; never when absent
 }
 
 // What a deploy would do. With refusals nothing would be deployed.
@@ -1348,6 +1360,9 @@ message ServerInstance {
   uint32 pid = 2;                   // 0 while it waits to be started again
   string address = 3;               // where it listens, as an upstream names it
   uint64 started_unix_ms = 4;       // when its process was started; 0 when not known
+  string state = 5;                 // running, starting (not yet answering its readiness probe), backoff (waiting to be started again), exited or failed (not started again)
+  uint64 next_start_unix_ms = 6;    // for an instance in backoff, when its next start is due; 0 otherwise
+  uint32 quick_exits = 7;           // its exits and failed starts in a row, each within stable_after of its start
 }
 
 // A named mount of a release: a path served by another entrypoint in
@@ -1441,12 +1456,13 @@ message RestartReleaseResponse {
   string release = 2;
   repeated Worker workers = 3;      // the workers this call marked; for a cancel, those left as they were
   RestartStatus restart = 4;        // the restart under way as the answer is given; absent when none is
+  bool instances = 5;               // the release runs a managed HTTP server: the workers are its instances, restarted one at a time, with pid 0 for one that had no process
 }
 
 // A restart of every worker under way: how far it has got.
 message RestartStatus {
-  uint32 total = 1;                 // the workers marked
-  uint32 left = 2;                  // those not yet replaced
+  uint32 total = 1;                 // the workers marked, or a managed server's instances
+  uint32 left = 2;                  // those not yet replaced, or not yet restarted and answering
   uint64 started_unix_ms = 3;
   string group = 4;                 // the one group it restarts; every group when empty
 }

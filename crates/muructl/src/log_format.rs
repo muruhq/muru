@@ -165,10 +165,22 @@ mod tests {
             tracing::error!("recording an event failed");
         });
         let text = String::from_utf8(captured.0.lock().expect("poisoned").clone()).expect("utf-8");
-        let lines: Vec<&str> = text.lines().collect();
 
-        // The test's standard error is a pipe or a terminal, not a file,
-        // so no time is in front.
+        // The full time is in front when the test's standard error is a
+        // file, as when a run's output is kept, and not when it is a pipe
+        // or a terminal (issue 1000).
+
+        let lines: Vec<&str> = text
+            .lines()
+            .map(|line| match stamped(Stream::Stderr) {
+                true => {
+                    let (time, rest) = line.split_once(' ').expect("a time in front");
+                    assert!(time.ends_with('Z') && time.contains('T'), "{line}");
+                    rest
+                }
+                false => line,
+            })
+            .collect();
 
         assert_eq!(
             lines,

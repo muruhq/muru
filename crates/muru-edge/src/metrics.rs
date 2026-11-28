@@ -327,6 +327,11 @@ pub const FAMILIES: &[Family] = &[
         help: "Workers that exited, by reason: scaled_in, crashed or start_failed.",
     },
     Family {
+        name: "muru_server_exits_total",
+        kind: Kind::Counter,
+        help: "Instances of a managed HTTP server release that exited, by outcome: clean or failed.",
+    },
+    Family {
         name: "muru_connections_open",
         kind: Kind::Gauge,
         help: "Connections open on a listener.",
