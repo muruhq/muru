@@ -1550,7 +1550,30 @@ impl Admin for Service {
         // a release's output is its host's file, the current release's
         // when none is named.
 
-        let (app, release, path) = if request.edge {
+        let (app, release, path) = if !request.service.is_empty() {
+            // Section 9.13: a service's output is one file, every instance's.
+
+            let known = self
+                .handle
+                .store
+                .services()
+                .map_err(internal)?
+                .iter()
+                .any(|stored| stored.name == request.service);
+
+            if !known {
+                return Err(Status::not_found(format!(
+                    "there is no service named {}",
+                    request.service
+                )));
+            }
+
+            (
+                String::new(),
+                String::new(),
+                locations.service_log(&request.service),
+            )
+        } else if request.edge {
             (String::new(), String::new(), locations.edge_log())
         } else if request.daemon {
             (String::new(), String::new(), locations.daemon_log())
@@ -3224,6 +3247,98 @@ impl Admin for Service {
                     trust_muru_headers: upstream.trust_muru_headers,
                 })
                 .collect(),
+        }))
+    }
+
+    async fn list_services(
+        &self,
+        request: Request<pb::ListServicesRequest>,
+    ) -> Result<Response<pb::ListServicesResponse>, Status> {
+        let request = request.into_inner();
+        let owners = self.handle.store.ownership().map_err(internal)?;
+        let services: Vec<pb::ServiceStatus> = self
+            .handle
+            .info
+            .services
+            .lock()
+            .expect("services poisoned")
+            .iter()
+            .filter(|status| request.names.is_empty() || request.names.contains(&status.name))
+            .map(|status| service_status(status, &owners))
+            .collect();
+        let missing = request
+            .names
+            .iter()
+            .filter(|name| !services.iter().any(|service| &service.name == *name))
+            .cloned()
+            .collect();
+
+        Ok(Response::new(pb::ListServicesResponse {
+            services,
+            missing,
+        }))
+    }
+
+    async fn act_on_service(
+        &self,
+        request: Request<pb::ActOnServiceRequest>,
+    ) -> Result<Response<pb::ActOnServiceResponse>, Status> {
+        let request = request.into_inner();
+
+        let action = match request.action.as_str() {
+            "start" => crate::daemon::ServiceAction::Start,
+            "stop" => crate::daemon::ServiceAction::Stop {
+                timeout: request.timeout_ms.map(Duration::from_millis),
+                kill: request.kill,
+            },
+            "restart" => crate::daemon::ServiceAction::Restart {
+                rolling: request.rolling,
+            },
+            "signal" => crate::daemon::ServiceAction::Signal(request.signal.clone()),
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "{other:?} is not something done to a service: start, stop, restart or signal"
+                )));
+            }
+        };
+
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Service {
+                name: request.name.clone(),
+                index: request.index,
+                action,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let touched = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(|why| match why.starts_with("there is no service") {
+                true => Status::not_found(why),
+                false => Status::failed_precondition(why),
+            })?;
+
+        let owners = self.handle.store.ownership().map_err(internal)?;
+        let service = self
+            .handle
+            .info
+            .services
+            .lock()
+            .expect("services poisoned")
+            .iter()
+            .find(|status| status.name == request.name)
+            .map(|status| service_status(status, &owners));
+
+        Ok(Response::new(pb::ActOnServiceResponse {
+            name: request.name,
+            instances: touched
+                .into_iter()
+                .map(|(index, pid)| pb::ServiceTouched { index, pid })
+                .collect(),
+            service,
         }))
     }
 
@@ -5125,6 +5240,62 @@ pub fn refuse_host_request(op: &str) -> Result<(), String> {
         )),
         "surge" => Err("surge is not a debug operation".to_owned()),
         _ => Ok(()),
+    }
+}
+
+/// A service as the admin API gives it.
+fn service_status(
+    status: &crate::services::Status,
+    owners: &crate::deployments::Owners,
+) -> pb::ServiceStatus {
+    let table = &status.table;
+
+    pb::ServiceStatus {
+        name: status.name.clone(),
+        description: table.description.clone().unwrap_or_default(),
+        state: status.state.to_owned(),
+        since_unix_ms: status.since_unix_ms,
+        autostart: crate::services::autostart_of(table),
+        held: status.held,
+        instances: crate::services::instances_of(table),
+        running: status
+            .instances
+            .iter()
+            .filter(|instance| instance.state == "running")
+            .count() as u32,
+        restarts: status.restarts,
+        command: table.command.clone(),
+        cwd: status.cwd.display().to_string(),
+        user: table.user.clone().unwrap_or_default(),
+        restart: status.restart.clone(),
+        readiness: status.readiness.clone(),
+        stop_signal: table
+            .stop_signal
+            .clone()
+            .unwrap_or_else(|| "TERM".to_owned()),
+        stop_timeout_ms: crate::services::stop_timeout_of(table).as_millis() as u64,
+        log: status.log.display().to_string(),
+        deployment: owner_of(owners, Kind::Service, &status.name),
+        instance_list: status
+            .instances
+            .iter()
+            .map(|instance| pb::ServiceInstance {
+                index: instance.index,
+                pid: instance.pid,
+                state: instance.state.to_owned(),
+                started_unix_ms: instance.started_unix_ms,
+                next_start_unix_ms: instance.next_start_unix_ms,
+                quick_exits: instance.quick_exits,
+                exits: instance
+                    .exits
+                    .iter()
+                    .map(|(unix_ms, message)| pb::ServiceExit {
+                        unix_ms: *unix_ms,
+                        message: message.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 

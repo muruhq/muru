@@ -110,6 +110,12 @@ service Admin {
   // HTTP upstreams, as applied.
   rpc ListUpstreams(ListUpstreamsRequest) returns (ListUpstreamsResponse);
 
+  // Services, as applied, with what runs of each now.
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+
+  // Start, stop, restart or signal a service, or one instance of it.
+  rpc ActOnService(ActOnServiceRequest) returns (ActOnServiceResponse);
+
   // Declarative configuration: apply a document, compare
   // one with desired state, or export desired state as one.
   rpc ApplyConfig(ApplyConfigRequest) returns (ConfigReport);
@@ -1692,6 +1698,77 @@ message Route {
   string deployment = 23;           // the deployment that owns it (issue 943)
 }
 
+message ListServicesRequest {
+  repeated string names = 1;        // only these; every service when empty
+}
+
+message ListServicesResponse {
+  repeated ServiceStatus services = 1;
+  repeated string missing = 2;      // the names asked for that no service has
+}
+
+// A service: a named command the daemon keeps running.
+message ServiceStatus {
+  string name = 1;
+  string description = 2;
+  string state = 3;                 // the least healthy of its instances' states: failed, backoff, starting, stopping, exited, stopped or running
+  uint64 since_unix_ms = 4;         // when it came to be in that state
+  bool autostart = 5;               // whether it starts with the daemon
+  bool held = 6;                    // stopped by hand: it stays stopped until it is started by hand
+  uint32 instances = 7;             // the instances declared
+  uint32 running = 8;               // those running and ready
+  uint64 restarts = 9;              // starts that followed an exit the program made, since the daemon took the service up
+  repeated string command = 10;
+  string cwd = 11;
+  string user = 12;                 // whom the table names; empty for the service user
+  string restart = 13;              // the restart policy as a phrase
+  string readiness = 14;            // how an instance is known to be up, as a phrase
+  string stop_signal = 15;
+  uint64 stop_timeout_ms = 16;
+  string log = 17;                  // the file its instances' output is written to
+  string deployment = 18;           // the deployment that owns it
+  repeated ServiceInstance instance_list = 19;
+}
+
+// One instance of a service.
+message ServiceInstance {
+  uint32 index = 1;
+  uint32 pid = 2;                   // 0 without a process
+  string state = 3;                 // stopped, starting, running, backoff, stopping, exited or failed
+  uint64 started_unix_ms = 4;       // when its process was started; 0 without one
+  uint64 next_start_unix_ms = 5;    // for an instance in backoff, when its next start is due; 0 otherwise
+  uint32 quick_exits = 6;           // its exits and failed starts in a row, each within stable_after of its start
+  repeated ServiceExit exits = 7;   // its last exits, oldest first, as the daemon has seen them since it started
+}
+
+// An exit an instance made by itself.
+message ServiceExit {
+  uint64 unix_ms = 1;
+  string message = 2;               // how it ended and after how long
+}
+
+message ActOnServiceRequest {
+  string name = 1;
+  optional uint32 index = 2;        // one instance; every instance when absent
+  string action = 3;                // start, stop, restart or signal
+  optional uint64 timeout_ms = 4;   // for a stop: how long each instance has, in place of its stop_timeout
+  bool kill = 5;                    // for a stop: skip the stop signal
+  bool rolling = 6;                 // for a restart: one instance at a time, each ready before the next
+  string signal = 7;                // for a signal: its name, or reload for the service's reload_signal
+}
+
+message ActOnServiceResponse {
+  string name = 1;
+  repeated ServiceTouched instances = 2; // the instances it was done to
+  ServiceStatus service = 3;        // the service as the answer is given
+}
+
+// An instance a command acted on.
+message ServiceTouched {
+  uint32 index = 1;
+  uint32 pid = 2;                   // for a signal, the process it was sent to; 0 otherwise
+}
+
 message ListUpstreamsRequest {}
 
 message ListUpstreamsResponse {
@@ -1726,6 +1803,7 @@ message TailLogsRequest {
   string host = 6;                  // with access: the file a virtual host names for its own records, when it names one
   bool edge = 7;                    // the edge process's own log, edge.log, instead of a release
   bool daemon = 8;                  // the daemon's own log, daemon.log, instead of a release
+  string service = 9;               // a service's log instead of a release
 }
 
 message LogLine {
