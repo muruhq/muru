@@ -204,6 +204,51 @@ impl Drop for Starting {
     }
 }
 
+/// A restart of every instance by hand (issue 393), one at a time: each
+/// is taken out of service, stopped, started again and waited for until
+/// it answers its readiness probe before the next is touched.
+struct Rolling {
+    /// The instances still to restart, by their place.
+    queue: std::collections::VecDeque<usize>,
+    /// The one being restarted, and how far it has got.
+    current: Option<(usize, Phase)>,
+    /// How many the restart began with.
+    total: u32,
+    /// When it began, Unix milliseconds.
+    started_unix_ms: u64,
+    /// How long an instance asked to stop has before it is killed.
+    grace: Duration,
+}
+
+/// How far the restart of one instance has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// It is marked starting, out of service, and the edge is being
+    /// told; the next check stops it.
+    Marked,
+    /// Its process was asked to stop, or it had none: the supervisor
+    /// starts it.
+    Stopping,
+    /// The process with this pid was started in its place and is being
+    /// probed.
+    Probing(u32),
+}
+
+/// How far a restart of every instance has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartProgress {
+    /// The instances it began with.
+    pub total: u32,
+    /// Those not yet restarted and answering.
+    pub left: u32,
+    /// When it began, Unix milliseconds.
+    pub started_unix_ms: u64,
+}
+
+/// The events of a restart of every instance.
+const RESTART_STARTED: &str = "restart.started";
+const RESTART_FINISHED: &str = "restart.finished";
+
 /// The instances of one managed HTTP release: their processes, which a
 /// supervisor runs, and where each listens.
 pub struct Servers {
@@ -215,13 +260,21 @@ pub struct Servers {
     dirs: HostDirs,
     /// Each instance's address, in the supervisor's order.
     binds: Vec<Bind>,
-    supervisor: Supervisor,
+    /// Boxed so that what holds a release's servers is of a size with
+    /// what holds a host.
+    supervisor: Box<Supervisor>,
     /// Lines the instances' relays have dropped, across every relay.
     dropped: Arc<AtomicU64>,
     /// The program the command runs, as the process view names it.
     program: String,
     /// The instances' exits this daemon has seen, by outcome.
     exits: std::collections::BTreeMap<supervisor::Outcome, u64>,
+    /// The restart of every instance under way, if one is.
+    rolling: Option<Rolling>,
+    /// Why the last restart of every instance stopped early, if it did.
+    restart_failure: Option<String>,
+    /// What a restart has to report, for the next check to hand on.
+    pending: Vec<Report>,
 }
 
 impl Servers {
@@ -277,10 +330,13 @@ impl Servers {
             starting: binds.iter().map(|_| Starting::default()).collect(),
             dirs: dirs.clone(),
             binds,
-            supervisor,
+            supervisor: Box::new(supervisor),
             dropped,
             program: crate::processes::program_of(&spec.command).unwrap_or_default(),
             exits: std::collections::BTreeMap::new(),
+            rolling: None,
+            restart_failure: None,
+            pending: Vec::new(),
         })
     }
 
@@ -371,10 +427,13 @@ impl Servers {
             starting,
             dirs: dirs.clone(),
             binds,
-            supervisor,
+            supervisor: Box::new(supervisor),
             dropped,
             program: crate::processes::program_of(&spec.command).unwrap_or_default(),
             exits: std::collections::BTreeMap::new(),
+            rolling: None,
+            restart_failure: None,
+            pending: Vec::new(),
         })
     }
 
@@ -448,7 +507,8 @@ impl Servers {
     /// readiness timeout passes; `probed` hears how that ended, and
     /// `probed` here takes the answer (issue 917).
     pub async fn check(&mut self, probed: &Probed) -> Vec<Report> {
-        let reports = self.supervisor.check().await;
+        self.roll_on();
+        let mut reports = self.supervisor.check().await;
 
         for outcome in reports.iter().filter_map(|report| report.outcome) {
             *self.exits.entry(outcome).or_default() += 1;
@@ -492,7 +552,216 @@ impl Servers {
             }
         }
 
+        self.roll_after();
+        reports.append(&mut self.pending);
         reports
+    }
+
+    /// Restart every instance by hand, one at a time (issue 393), with
+    /// `grace` for each to stop in before it is killed. Gives each
+    /// instance's index and pid, 0 for one with no process, which is
+    /// started all the same. The next checks carry it out; `restart`
+    /// says how far it has got, and `restart_failure` why it stopped
+    /// early if it did. Refused while one is under way.
+    pub fn restart_all(&mut self, grace: Duration) -> Result<Vec<(u32, u32)>, String> {
+        if self.rolling.is_some() {
+            return Err("a restart of its instances is already under way".to_owned());
+        }
+
+        let instances: Vec<(u32, u32)> = self
+            .supervisor
+            .instances()
+            .map(|instance| (instance.index(), instance.pid().unwrap_or(0)))
+            .collect();
+
+        self.restart_failure = None;
+        self.rolling = Some(Rolling {
+            queue: (0..instances.len()).collect(),
+            current: None,
+            total: instances.len() as u32,
+            started_unix_ms: crate::model::now_unix_ms(),
+            grace,
+        });
+        self.pending.push(Report {
+            kind: RESTART_STARTED,
+            level: "info",
+            message: format!(
+                "restarting {} one at a time, each to answer its readiness probe before the \
+                 next is stopped",
+                counted(instances.len())
+            ),
+            outcome: None,
+        });
+
+        Ok(instances)
+    }
+
+    /// End the restart of every instance under way: the instances it
+    /// has not reached stay as they are, and the one it is at is still
+    /// started again. Gives the index and pid of each left; refused when
+    /// no restart is under way.
+    pub fn cancel_restart(&mut self) -> Result<Vec<(u32, u32)>, String> {
+        let Some(rolling) = self.rolling.take() else {
+            return Err("no restart of its instances is under way".to_owned());
+        };
+
+        let left: Vec<(u32, u32)> = self
+            .supervisor
+            .instances()
+            .enumerate()
+            .filter(|(position, _)| rolling.queue.contains(position))
+            .map(|(_, instance)| (instance.index(), instance.pid().unwrap_or(0)))
+            .collect();
+
+        // One only marked, not yet stopped, goes back into service.
+
+        if let Some((position, Phase::Marked)) = rolling.current {
+            self.starting[position] = Starting::default();
+        }
+
+        self.pending.push(Report {
+            kind: RESTART_FINISHED,
+            level: "warning",
+            message: format!(
+                "the restart was cancelled with {} left as {}",
+                counted(left.len()),
+                if left.len() == 1 {
+                    "it was"
+                } else {
+                    "they were"
+                }
+            ),
+            outcome: None,
+        });
+
+        Ok(left)
+    }
+
+    /// How far the restart of every instance under way has got; none
+    /// when there is none.
+    pub fn restart(&self) -> Option<RestartProgress> {
+        self.rolling.as_ref().map(|rolling| RestartProgress {
+            total: rolling.total,
+            left: rolling.queue.len() as u32 + u32::from(rolling.current.is_some()),
+            started_unix_ms: rolling.started_unix_ms,
+        })
+    }
+
+    /// Why the last restart of every instance stopped before it had
+    /// restarted them all, if it did.
+    pub fn restart_failure(&self) -> Option<&str> {
+        self.restart_failure.as_deref()
+    }
+
+    /// Take the restart of every instance a step on, before the
+    /// supervisor's check. The next instance is first marked starting,
+    /// which takes it out of service at the edge with the snapshot the
+    /// daemon pushes after this check, and only the check after that
+    /// asks its process to stop, so that no request is sent to an
+    /// instance that has been told to go.
+    fn roll_on(&mut self) {
+        let Some(rolling) = &mut self.rolling else {
+            return;
+        };
+
+        match rolling.current {
+            None => {
+                let Some(position) = rolling.queue.pop_front() else {
+                    self.rolling = None;
+                    self.pending.push(Report {
+                        kind: RESTART_FINISHED,
+                        level: "info",
+                        message: "every instance has been restarted and answers".to_owned(),
+                        outcome: None,
+                    });
+                    return;
+                };
+
+                let pid = self
+                    .supervisor
+                    .instances()
+                    .nth(position)
+                    .and_then(supervisor::Instance::pid);
+
+                self.starting[position] = Starting {
+                    marked: true,
+                    pid,
+                    probe: None,
+                };
+
+                // One with no process has nothing to take out of
+                // service, and is started at once.
+
+                if pid.is_none() {
+                    self.supervisor.restart(position, Instant::now());
+                    rolling.current = Some((position, Phase::Stopping));
+                } else {
+                    rolling.current = Some((position, Phase::Marked));
+                }
+            }
+            Some((position, Phase::Marked)) => {
+                self.supervisor
+                    .restart(position, Instant::now() + rolling.grace);
+                rolling.current = Some((position, Phase::Stopping));
+            }
+            Some((_, Phase::Stopping | Phase::Probing(_))) => {}
+        }
+    }
+
+    /// Look at the instance being restarted after the supervisor's
+    /// check: its new process is the one to wait for, and a start that
+    /// failed, or a new process that exited again, ends the restart,
+    /// since stopping the next instance would leave the release with
+    /// one fewer that serves.
+    fn roll_after(&mut self) {
+        let Some((position, phase)) = self.rolling.as_ref().and_then(|rolling| rolling.current)
+        else {
+            return;
+        };
+
+        let Some(instance) = self.supervisor.instances().nth(position) else {
+            return;
+        };
+
+        let index = instance.index();
+
+        match (phase, instance.pid()) {
+            (Phase::Stopping, Some(pid)) if !instance.stopping() => {
+                if let Some(rolling) = &mut self.rolling {
+                    rolling.current = Some((position, Phase::Probing(pid)));
+                }
+            }
+            (Phase::Stopping, None) if instance.quick_exits() > 0 => {
+                self.stop_rolling(format!("instance {index} could not be started again"));
+            }
+            (Phase::Probing(pid), now) if now != Some(pid) => {
+                self.stop_rolling(format!("instance {index} exited again before it answered"));
+            }
+            _ => {}
+        }
+    }
+
+    /// End the restart of every instance early, with why.
+    fn stop_rolling(&mut self, why: String) {
+        let Some(rolling) = self.rolling.take() else {
+            return;
+        };
+
+        self.pending.push(Report {
+            kind: RESTART_FINISHED,
+            level: "error",
+            message: format!(
+                "the restart stopped: {why}; {} left as {}",
+                counted(rolling.queue.len()),
+                if rolling.queue.len() == 1 {
+                    "it was"
+                } else {
+                    "they were"
+                }
+            ),
+            outcome: None,
+        });
+        self.restart_failure = Some(why);
     }
 
     /// Take the outcome of the probe of the instance at `index`, whose
@@ -515,6 +784,22 @@ impl Servers {
         }
 
         *starting = Starting::default();
+
+        // The restart of every instance waits on this probe: an answer
+        // lets it go on to the next, and none ends it.
+
+        if let Some(rolling) = &mut self.rolling
+            && rolling.current == Some((position, Phase::Probing(pid)))
+        {
+            if answered {
+                rolling.current = None;
+            } else {
+                self.stop_rolling(format!(
+                    "instance {index} did not answer its readiness probe within {}",
+                    muru_config::format_duration(self.readiness_timeout)
+                ));
+            }
+        }
 
         if answered {
             return Some(Report {
@@ -698,6 +983,11 @@ impl Servers {
     pub fn release(self) {
         self.supervisor.release();
     }
+}
+
+/// A count of instances as a phrase: `1 instance`, `3 instances`.
+fn counted(count: usize) -> String {
+    format!("{count} instance{}", if count == 1 { "" } else { "s" })
 }
 
 /// How long the release's instances get to be ready.

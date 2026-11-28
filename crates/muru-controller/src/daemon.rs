@@ -807,6 +807,19 @@ pub enum Command {
         /// What it said.
         message: HostMessage,
     },
+    /// Restart every instance of a managed server release by hand, one
+    /// at a time, or end such a restart (section 9.9, issue 393).
+    RestartServers {
+        /// The application.
+        app: String,
+        /// The release.
+        id: String,
+        /// End the restart under way instead of beginning one.
+        cancel: bool,
+        /// Answered with the index and pid of each instance to restart,
+        /// or for a cancel of each left as it was, or why not.
+        done: oneshot::Sender<Result<Vec<(u32, u32)>, String>>,
+    },
     /// Ask a release's workers something (section 11.7).
     Debug {
         /// The application.
@@ -1189,6 +1202,10 @@ pub struct Info {
     /// The instances of each managed server release (section 9.9), by
     /// application and release, as the daemon last checked them.
     pub servers: std::sync::Mutex<HashMap<(String, String), Vec<crate::servers::InstanceStatus>>>,
+    /// The restart by hand of each managed server release's instances
+    /// (issue 393): how far the one under way has got, or why the last
+    /// stopped early, as the daemon last checked them.
+    pub server_restarts: std::sync::Mutex<HashMap<(String, String), ServerRestart>>,
     /// Section 9.10 (issue 123): the conditions and their states, as of the
     /// last evaluation.
     pub conditions: std::sync::Mutex<Vec<crate::conditions::Status>>,
@@ -1239,6 +1256,15 @@ pub struct LiveRelease {
     pub surge: BTreeMap<String, crate::budget::Surge>,
     /// The restart of every worker under way, if one is (section 10.14).
     pub restart: Option<RestartProgress>,
+}
+
+/// The restart by hand of a managed server release's instances.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerRestart {
+    /// How far the one under way has got; none when none is.
+    pub progress: Option<RestartProgress>,
+    /// Why the last one stopped before every instance was restarted.
+    pub failure: Option<String>,
 }
 
 /// How far a restart of every worker of a release has got (section
@@ -2608,6 +2634,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         pass_env: std::sync::RwLock::new(settings.pass_env.clone()),
         service,
         servers: std::sync::Mutex::new(HashMap::new()),
+        server_restarts: std::sync::Mutex::new(HashMap::new()),
         conditions: std::sync::Mutex::new(Vec::new()),
         provisioning,
         started: std::sync::atomic::AtomicBool::new(false),
@@ -7478,6 +7505,40 @@ impl Daemon {
             } => {
                 let _ = done.send(self.prepare_command(&app, &id, request).await);
             }
+            Command::RestartServers {
+                app,
+                id,
+                cancel,
+                done,
+            } => {
+                let grace = self
+                    .store
+                    .release(&app, &id)
+                    .map_or(Duration::from_secs(10), |release| {
+                        Duration::from_millis(release.spec.timeouts.shutdown_timeout_ms)
+                    });
+
+                let answer = match self.running.get_mut(&(app.clone(), id.clone())) {
+                    Some(Running {
+                        backend: Backend::Servers(servers),
+                        ..
+                    }) if cancel => servers.cancel_restart(),
+                    Some(Running {
+                        backend: Backend::Servers(servers),
+                        ..
+                    }) => servers.restart_all(grace),
+                    Some(_) => Err(format!(
+                        "release {app}@{id} runs workers, not a managed HTTP server"
+                    )),
+                    None if self.starting.contains_key(&(app.clone(), id.clone())) => {
+                        Err(starting_refusal(&app, &id))
+                    }
+                    None => Err(format!("release {app}@{id} is not running")),
+                };
+
+                self.publish_servers();
+                let _ = done.send(answer.map_err(|why| format!("release {app}@{id}: {why}")));
+            }
             Command::Debug {
                 app,
                 id,
@@ -7558,6 +7619,16 @@ impl Daemon {
                     }
                     None if self.starting.contains_key(&(app.clone(), id.clone())) => {
                         let _ = done.send(Err(starting_refusal(&app, &id)));
+                    }
+                    None if self
+                        .running
+                        .get(&(app.clone(), id.clone()))
+                        .is_some_and(|running| running.backend.servers().is_some()) =>
+                    {
+                        let _ = done.send(Err(format!(
+                            "release {app}@{id} runs a managed HTTP server, which has no workers \
+                             to ask; muructl restart --all restarts its instances, one at a time"
+                        )));
                     }
                     None => {
                         let _ = done.send(Err(format!(
@@ -14172,6 +14243,30 @@ impl Daemon {
             })
             .collect();
         *self.info.servers.lock().expect("servers poisoned") = servers;
+
+        let restarts = self
+            .running
+            .iter()
+            .filter_map(|(key, running)| {
+                let servers = running.backend.servers()?;
+                let restart = ServerRestart {
+                    progress: servers.restart().map(|progress| RestartProgress {
+                        total: progress.total,
+                        left: progress.left,
+                        started_unix_ms: progress.started_unix_ms,
+                        group: String::new(),
+                    }),
+                    failure: servers.restart_failure().map(str::to_owned),
+                };
+
+                (restart != ServerRestart::default()).then(|| (key.clone(), restart))
+            })
+            .collect();
+        *self
+            .info
+            .server_restarts
+            .lock()
+            .expect("server restarts poisoned") = restarts;
     }
 
     /// Push a snapshot without the application's workers: its serving

@@ -2423,6 +2423,14 @@ impl Admin for Service {
     ) -> Result<Response<pb::RestartReleaseResponse>, Status> {
         let request = request.into_inner();
         let release = self.current_release(&request.app, &request.release)?;
+
+        // Section 9.9 (issue 393): a managed server has no host to ask,
+        // and its instances are restarted by the daemon's supervisor.
+
+        if self.is_managed(&request.app, &release) {
+            return self.restart_servers(request, release).await;
+        }
+
         let marked = self
             .ask_host(
                 &request.app,
@@ -2450,6 +2458,7 @@ impl Admin for Service {
             app: request.app,
             release,
             workers: marked,
+            instances: false,
         }))
     }
 
@@ -2459,20 +2468,27 @@ impl Admin for Service {
     ) -> Result<Response<pb::RestartReleaseResponse>, Status> {
         let request = request.into_inner();
         let release = self.current_release(&request.app, &request.release)?;
-        let left = self
-            .ask_host(
-                &request.app,
-                &release,
-                "restart_cancel",
-                serde_json::json!({}),
-            )
-            .await?;
+        let instances = self.is_managed(&request.app, &release);
+
+        let left = match instances {
+            true => self.ask_servers(&request.app, &release, true).await?,
+            false => {
+                self.ask_host(
+                    &request.app,
+                    &release,
+                    "restart_cancel",
+                    serde_json::json!({}),
+                )
+                .await?
+            }
+        };
 
         Ok(Response::new(pb::RestartReleaseResponse {
             restart: self.restart_of(&request.app, &release),
             app: request.app,
             release,
             workers: left,
+            instances,
         }))
     }
 
@@ -4635,6 +4651,103 @@ impl Service {
         Ok(release)
     }
 
+    /// Whether a release runs a managed HTTP server.
+    fn is_managed(&self, app: &str, release: &str) -> bool {
+        self.handle
+            .store
+            .release(app, release)
+            .is_ok_and(|release| release.spec.http.is_some())
+    }
+
+    /// Ask the daemon to restart a managed server release's instances
+    /// one at a time, or to end such a restart, and answer with the
+    /// instances it names as workers of the group `http`.
+    async fn ask_servers(
+        &self,
+        app: &str,
+        release: &str,
+        cancel: bool,
+    ) -> Result<Vec<pb::Worker>, Status> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::RestartServers {
+                app: app.to_owned(),
+                id: release.to_owned(),
+                cancel,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?;
+        let instances = done_rx
+            .await
+            .map_err(|_| Status::unavailable("the daemon is stopping"))?
+            .map_err(Status::failed_precondition)?;
+
+        Ok(instances
+            .into_iter()
+            .map(|(index, pid)| pb::Worker {
+                index,
+                pid,
+                group: "http".to_owned(),
+                ..pb::Worker::default()
+            })
+            .collect())
+    }
+
+    /// Section 9.9 (issue 393): every instance of a managed server
+    /// release restarted in turn by the daemon's supervisor, each
+    /// waiting for its readiness probe. A restart that stops early, an
+    /// instance not coming back, fails the call that waited for it.
+    async fn restart_servers(
+        &self,
+        request: pb::RestartReleaseRequest,
+        release: String,
+    ) -> Result<Response<pb::RestartReleaseResponse>, Status> {
+        if !request.group.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "release {}@{release} runs a managed HTTP server, which has no worker groups",
+                request.app
+            )));
+        }
+
+        let marked = self.ask_servers(&request.app, &release, false).await?;
+
+        if request.wait {
+            let deadline = tokio::time::Instant::now() + restart_wait(request.wait_timeout_ms);
+
+            while self.restart_of(&request.app, &release).is_some()
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(RESTART_POLL).await;
+            }
+
+            let failure = self
+                .handle
+                .info
+                .server_restarts
+                .lock()
+                .expect("server restarts poisoned")
+                .get(&(request.app.clone(), release.clone()))
+                .and_then(|restart| restart.failure.clone());
+
+            if let Some(why) = failure {
+                return Err(Status::aborted(format!(
+                    "the restart of {}@{release} stopped: {why}",
+                    request.app
+                )));
+            }
+        }
+
+        Ok(Response::new(pb::RestartReleaseResponse {
+            restart: self.restart_of(&request.app, &release),
+            app: request.app,
+            release,
+            workers: marked,
+            instances: true,
+        }))
+    }
+
     /// Ask a release's host something of its own (section 10.14), and
     /// answer with the workers it names.
     async fn ask_host(
@@ -4682,12 +4795,29 @@ impl Service {
     /// The restart of every worker a release's host has under way, as
     /// the daemon last published it.
     fn restart_of(&self, app: &str, release: &str) -> Option<pb::RestartStatus> {
+        let key = (app.to_owned(), release.to_owned());
+
+        // A managed server's restart is the daemon's own to report.
+
+        let servers = self
+            .handle
+            .info
+            .server_restarts
+            .lock()
+            .expect("server restarts poisoned")
+            .get(&key)
+            .and_then(|restart| restart.progress.as_ref().map(restart_status));
+
+        if servers.is_some() {
+            return servers;
+        }
+
         self.handle
             .info
             .live
             .lock()
             .expect("live poisoned")
-            .get(&(app.to_owned(), release.to_owned()))
+            .get(&key)
             .and_then(|live| live.restart.as_ref())
             .map(restart_status)
     }
@@ -5123,8 +5253,18 @@ fn release_message(release: Release, handle: &Handle) -> pb::Release {
         release.spec.swap()
     };
 
+    // A managed server's restart by hand is the daemon's own to report.
+
+    let server_restart = handle
+        .info
+        .server_restarts
+        .lock()
+        .expect("server restarts poisoned")
+        .get(&(release.app.clone(), release.id.clone()))
+        .and_then(|restart| restart.progress.as_ref().map(restart_status));
+
     pb::Release {
-        restart: live.restart.as_ref().map(restart_status),
+        restart: server_restart.or_else(|| live.restart.as_ref().map(restart_status)),
         max_surge,
         max_unavailable,
         surge_allowance: live

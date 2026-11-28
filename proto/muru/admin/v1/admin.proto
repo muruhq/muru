@@ -1456,12 +1456,13 @@ message RestartReleaseResponse {
   string release = 2;
   repeated Worker workers = 3;      // the workers this call marked; for a cancel, those left as they were
   RestartStatus restart = 4;        // the restart under way as the answer is given; absent when none is
+  bool instances = 5;               // the release runs a managed HTTP server: the workers are its instances, restarted one at a time, with pid 0 for one that had no process
 }
 
 // A restart of every worker under way: how far it has got.
 message RestartStatus {
-  uint32 total = 1;                 // the workers marked
-  uint32 left = 2;                  // those not yet replaced
+  uint32 total = 1;                 // the workers marked, or a managed server's instances
+  uint32 left = 2;                  // those not yet replaced, or not yet restarted and answering
   uint64 started_unix_ms = 3;
   string group = 4;                 // the one group it restarts; every group when empty
 }

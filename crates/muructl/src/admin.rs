@@ -5931,7 +5931,9 @@ pub struct RestartArgs {
     /// Every worker of the release, each in its turn: as many at once
     /// as the max_surge and max_unavailable of its group allow, one at a
     /// time by default, so capacity holds. The release's host takes the
-    /// turns, so the restart carries on if the daemon is stopped.
+    /// turns, so the restart carries on if the daemon is stopped. For a
+    /// managed HTTP server release, every instance, one at a time, each
+    /// answering its readiness probe before the next is stopped.
     #[arg(long, required_unless_present_any = ["worker", "pid", "group", "cancel"])]
     all: bool,
 
@@ -6121,10 +6123,15 @@ async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
             return print_answer(&answer);
         }
 
+        let (one, many) = match answer.instances {
+            true => ("instance", "instances"),
+            false => ("worker", "workers"),
+        };
+
         println!(
             "muru: the restart of {} is cancelled: {} left as {} {}",
             release_name(&answer.app, &answer.release),
-            counted(answer.workers.len(), "worker", "workers"),
+            counted(answer.workers.len(), one, many),
             if answer.workers.len() == 1 {
                 "it"
             } else {
@@ -6161,12 +6168,25 @@ async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
         anyhow::bail!("{name} has no worker{scope} to restart");
     }
 
+    // A managed server's instances are restarted one at a time by the
+    // daemon, each answering its readiness probe before the next.
+
+    let (one, many) = match answer.instances {
+        true => ("instance", "instances"),
+        false => ("worker", "workers"),
+    };
+
     if args.output.json {
         print_answer(&answer)?;
+    } else if answer.instances {
+        println!(
+            "muru: {} of {name} to be restarted, one at a time",
+            counted(answer.workers.len(), one, many),
+        );
     } else {
         println!(
             "muru: {}{scope} of {name} marked to be replaced, each in its turn",
-            counted(answer.workers.len(), "worker", "workers"),
+            counted(answer.workers.len(), one, many),
         );
     }
 
@@ -6174,7 +6194,7 @@ async fn restart_release(args: RestartArgs) -> anyhow::Result<()> {
         (Some(restart), false) => anyhow::bail!(
             "the restart of {name} is still under way: {} of {} left; muructl release show \
              says how far it has got, and muructl restart --cancel ends it",
-            counted(restart.left as usize, "worker", "workers"),
+            counted(restart.left as usize, one, many),
             restart.total
         ),
         (None, false) if !args.output.json => {
@@ -9199,6 +9219,18 @@ fn release_details(release: &pb::Release) -> Vec<(String, String)> {
                     "{}, {}",
                     instance_standing(instance, now_unix_ms()),
                     instance.address
+                ),
+            ));
+        }
+
+        if let Some(restart) = &release.restart {
+            lines.push((
+                "restart".to_owned(),
+                format!(
+                    "{} of {} still to be restarted, one at a time; muructl restart --cancel \
+                     leaves them",
+                    restart.left,
+                    counted(restart.total as usize, "instance", "instances"),
                 ),
             ));
         }

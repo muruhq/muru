@@ -235,6 +235,59 @@ release that fails that way in a deploy stays failed. One that fails
 when the daemon starts it after a reboot is [tried
 again](daemon.md#stopping-and-restarting) with the table's waits.
 
+### Restarting the instances
+
+`muructl restart APP --all` restarts every instance of the application's
+serving release, one at a time:
+
+```console
+$ muructl restart legacy --all
+muru: 2 instances of legacy@r1 to be restarted, one at a time
+muru: the restart of legacy@r1 has finished
+```
+
+Each instance in turn is taken out of service at the edge, sent its
+stop signal and given the release's `shutdown_timeout` to finish its
+requests before it is killed, started again at the same address, and
+waited for until it answers the readiness probe. Only then is the next
+one stopped, so a release with two or more instances serves throughout
+and no request is lost. With one instance, requests wait for it to
+answer, as they do after a crash.
+
+The start is made at once, with none of the waits an exit has, and the
+stop does not count as a quick exit. An instance that is in `backoff`,
+`exited` or `failed` is started too, with its count of quick exits
+cleared, which is how an instance that `give_up_after` left failed is
+brought back.
+
+The restart stops early if an instance does not come back: its start
+fails, it exits again before it answers, or it does not answer within
+the readiness timeout. The instances not yet reached are left running
+as they were, the instance that failed is supervised as after any exit,
+and the command fails with the reason:
+
+```
+muru: error: the restart of legacy@r1 stopped: instance 0 did not answer its readiness probe within 60s
+```
+
+The command waits for up to ten minutes, and `--no-wait` returns once
+the restart has begun. The daemon carries the restart out, so it goes
+on if the command is interrupted, and `muructl release show` says how
+far it has got:
+
+```
+restart      1 of 2 instances still to be restarted, one at a time; muructl restart --cancel leaves them
+```
+
+`muructl restart legacy --cancel` ends it: the instances not yet
+reached stay as they are, and the one being restarted is still started.
+The restart is a `restart.started` event and, when it ends,
+`restart.finished`, with each instance's `server.exited`,
+`server.started` and `server.ready` between them. A daemon that is
+stopped or upgraded part way leaves the instances not yet reached as
+they are. The flags that name one worker (`--worker`, `--pid`,
+`--group` and `--force`) do not apply to a managed server.
+
 Draining stops new requests at the edge, waits for those in flight, then
 sends the process of each instance the profile's stop signal (`TERM` for
 every profile unless `stop_signal` says otherwise). The signal goes to

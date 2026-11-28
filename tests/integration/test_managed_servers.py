@@ -284,6 +284,73 @@ def test_a_crash_loop_is_loud_and_ends_as_the_restart_table_says(
     time.sleep(2.5)
     assert len(events("server.started")) == 3
 
+    # A restart by hand starts the instance that was given up on.
+
+    broken.unlink()
+    daemon.muructl("restart", "legacy", "--all")
+    (back,) = instances(daemon, "legacy@r1")
+    assert (back["state"], back["quick_exits"]) == ("running", 0)
+    assert report(daemon)["pid"] == back["pid"]
+
+
+def test_a_restart_by_hand_restarts_the_instances_one_at_a_time(daemon: Daemon) -> None:
+    deploy_server(daemon, "legacy", "--bind", "port", "--instances", "2", "--readiness", "/healthz")
+    before = {instance["index"]: instance["pid"] for instance in instances(daemon, "legacy@r1")}
+
+    # A managed server has no workers to name, and nothing to cancel yet.
+
+    refused = daemon.muructl("restart", "legacy", "--worker", "0", check=False)
+    assert refused.returncode != 0
+    assert "muructl restart --all restarts its instances, one at a time" in refused.stderr
+    refused = daemon.muructl("restart", "legacy", "--cancel", check=False)
+    assert "no restart of its instances is under way" in refused.stderr
+
+    with Load(daemon.port, clients=4) as load:
+        restarted = daemon.muructl("restart", "legacy", "--all").stdout.splitlines()
+        time.sleep(0.5)
+
+    load.check("a restart of a managed server's instances", at_least=20)
+    assert restarted == [
+        "muru: 2 instances of legacy@r1 to be restarted, one at a time",
+        "muru: the restart of legacy@r1 has finished",
+    ]
+
+    # Every instance is a new process that serves, at the address it had.
+
+    after = instances(daemon, "legacy@r1")
+    assert [instance["state"] for instance in after] == ["running", "running"]
+    assert all(instance["pid"] not in before.values() for instance in after)
+    assert not any(alive(pid) for pid in before.values())
+    assert {report(daemon, f"/n/{n}")["pid"] for n in range(12)} == {
+        instance["pid"] for instance in after
+    }
+
+    # The second instance was not stopped until the first answered again.
+
+    lines = daemon.muructl("events").stdout.splitlines()
+    told = [
+        line.split(None, 5)[5]
+        for line in lines
+        if " restart." in line or (" server." in line and "instance" in line)
+    ]
+    assert told[0] == (
+        "restarting 2 instances one at a time, each to answer its readiness probe before the "
+        "next is stopped"
+    )
+    order = [
+        re.sub(r" \(.*\)$", "", line) for line in told[1:-1] if not line.startswith("instance 1 a")
+    ]
+    assert order[:4] == [
+        "instance 0 stopped for a restart",
+        "instance 0 started again",
+        "instance 0 answers and takes requests again",
+        "instance 1 stopped for a restart",
+    ], told
+    assert told[-1] == "every instance has been restarted and answers"
+    assert daemon.releases("legacy") == [
+        {"release": "legacy@r1", "state": "ready", "serving": "yes"}
+    ]
+
 
 def group_gone(pgid: int) -> bool:
     """Whether nothing is left of a process group; signal 0 sends nothing."""

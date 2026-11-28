@@ -233,6 +233,10 @@ restart      3 of 4 workers still to be replaced, each in its turn; muructl rest
 workers not yet replaced stay as they are, and a replacement that has
 started is finished.
 
+For a [managed HTTP server](managed-servers.md#restarting-the-instances)
+release, `--all` restarts its instances one at a time, each answering
+its readiness probe before the next is stopped.
+
 A worker that is replaced another way meanwhile, by a recycle or after
 a crash, or that a scale-in stops, has had its restart. A worker being
 debugged is left until its session ends. Giving the command again
