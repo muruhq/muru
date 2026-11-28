@@ -300,7 +300,26 @@ mod tests {
         assert!(refused.contains("is using the run directory"), "{refused}");
         drop(held);
 
-        Ownership::take(&both, &[]).expect("free again once dropped");
+        // Issue 999: the tests of this crate run as threads of one
+        // process, and some start processes. A child holds a copy of
+        // every descriptor of the process between its fork and its exec,
+        // the lock's among them, and with it the lock, for that moment
+        // after the owner here has let go. A daemon never lets go and
+        // takes again in one process, so only this test can see it, and
+        // it takes the locks once such a child has gone on to exec.
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        loop {
+            match Ownership::take(&both, &[]) {
+                Ok(_) => break,
+                Err(refused) if std::time::Instant::now() < deadline => {
+                    assert!(is_refusal(&refused), "{refused}");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(refused) => panic!("free again once dropped: {refused}"),
+            }
+        }
     }
 
     #[test]
