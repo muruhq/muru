@@ -4160,6 +4160,7 @@ fn adoption_message(adopted: &[(u32, crate::supervisor::Adopted)]) -> String {
                 match left {
                     crate::supervisor::Left::Exited => "exited",
                     crate::supervisor::Left::Failed => "failed",
+                    crate::supervisor::Left::Stopped => "been stopped",
                 }
             )),
             Adopted::Gone => gone.push(index.to_string()),

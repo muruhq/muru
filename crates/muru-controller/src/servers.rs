@@ -44,6 +44,9 @@ const EVENTS: EventNames = EventNames {
     failed: "server.failed",
     crash_looping: "server.crash_looping",
     gave_up: "server.gave_up",
+    stopped: "server.stopped",
+    killed: "server.killed",
+    daemonised: "server.daemonised",
 };
 
 /// Where one instance listens.
@@ -591,6 +594,8 @@ impl Servers {
                 counted(instances.len())
             ),
             outcome: None,
+            index: None,
+            change: supervisor::Change::None,
         });
 
         Ok(instances)
@@ -632,6 +637,8 @@ impl Servers {
                 }
             ),
             outcome: None,
+            index: None,
+            change: supervisor::Change::None,
         });
 
         Ok(left)
@@ -673,6 +680,8 @@ impl Servers {
                         level: "info",
                         message: "every instance has been restarted and answers".to_owned(),
                         outcome: None,
+                        index: None,
+                        change: supervisor::Change::None,
                     });
                     return;
                 };
@@ -760,6 +769,8 @@ impl Servers {
                 }
             ),
             outcome: None,
+            index: None,
+            change: supervisor::Change::None,
         });
         self.restart_failure = Some(why);
     }
@@ -807,6 +818,8 @@ impl Servers {
                 level: "info",
                 message: format!("instance {index} answers and takes requests again"),
                 outcome: None,
+                index: None,
+                change: supervisor::Change::None,
             });
         }
 
@@ -823,6 +836,8 @@ impl Servers {
                     .unwrap_or_default()
             ),
             outcome: None,
+            index: None,
+            change: supervisor::Change::None,
         })
     }
 
@@ -910,8 +925,11 @@ impl Servers {
             .zip(&self.starting)
             .map(|((instance, bind), starting)| {
                 let (state, next_start_unix_ms) = match instance.state() {
-                    supervisor::State::Running if starting.marked => ("starting", 0),
-                    supervisor::State::Running => ("running", 0),
+                    supervisor::State::Running | supervisor::State::Stopping if starting.marked => {
+                        ("starting", 0)
+                    }
+                    supervisor::State::Running | supervisor::State::Stopping => ("running", 0),
+                    supervisor::State::Stopped => ("failed", 0),
                     supervisor::State::Backoff { wait } => {
                         ("backoff", now_unix_ms + wait.as_millis() as u64)
                     }

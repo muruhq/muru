@@ -1249,6 +1249,8 @@ impl RestartSpec {
             max_delay: std::time::Duration::from_millis(self.max_delay_ms),
             stable_after: std::time::Duration::from_millis(self.stable_after_ms),
             give_up_after: self.give_up_after,
+            jitter: 0.0,
+            foreground: false,
         }
     }
 
